@@ -276,13 +276,17 @@ mod tests {
     use super::*;
 
     fn tmp_store() -> (FileStore, PathBuf) {
+        // A counter, not just the clock: macOS time has ~1 µs granularity, so parallel
+        // tests could get the same directory and delete each other's files.
+        static COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "janus-store-test-{}-{:?}",
+            "janus-store-test-{}-{:?}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
-                .as_nanos()
+                .as_nanos(),
+            COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
         ));
         (FileStore::open(&dir).unwrap(), dir)
     }

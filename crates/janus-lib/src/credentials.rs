@@ -131,19 +131,21 @@ fn read_file(path: &Path) -> std::io::Result<Option<SmbCredentials>> {
     }))
 }
 
-/// Atomic write: a tmp file with mode 0600 + rename.
+/// Atomic write: a tmp file + rename; mode 0600 on Unix (elsewhere the directory's ACLs apply).
 fn write_file(path: &Path, c: &SmbCredentials) -> std::io::Result<()> {
-    use std::os::unix::fs::OpenOptionsExt;
     if let Some(dir) = path.parent() {
         std::fs::create_dir_all(dir)?;
     }
     let tmp = path.with_extension("tmp");
     let _ = std::fs::remove_file(&tmp);
-    let mut f = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(&tmp)?;
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        opts.mode(0o600);
+    }
+    let mut f = opts.open(&tmp)?;
     writeln!(f, "{}:{}", c.user, c.password)?;
     f.sync_all()?;
     std::fs::rename(&tmp, path)
@@ -152,7 +154,6 @@ fn write_file(path: &Path, c: &SmbCredentials) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::os::unix::fs::PermissionsExt;
 
     fn tmpdir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!("janus-cred-{name}-{}", std::process::id()));
@@ -191,8 +192,12 @@ mod tests {
         let c = s.get().unwrap();
         assert_eq!(c.user, GENERATED_USER);
         assert_eq!(c.password.len(), 32);
-        let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o600);
+        }
         // a repeated call changes nothing
         assert!(!s.ensure_generated().unwrap());
         assert_eq!(s.get().unwrap(), c);

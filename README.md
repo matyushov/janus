@@ -91,9 +91,11 @@ janus-cli smbd configure --endpoint … --client-cert … --client-key … --ca 
 
 J1 is done: SMB 3.1.1 (the only dialect, signing mandatory), NEGOTIATE with preauth
 integrity, SESSION_SETUP over SPNEGO/NTLMv2, TREE_CONNECT/TREE_DISCONNECT/LOGOFF/ECHO,
-credits, a virtual empty share root; a real macOS client (`mount_smbfs`) mounts the
-share (details and the run are in `crates/smb-core/README.md`). Next (J2) is the file model:
-CREATE of files, READ/WRITE/FLUSH and so on, then the backends.
+credits. J2 is done: the file model (CREATE, CLOSE, READ, WRITE, FLUSH, QUERY_INFO,
+QUERY_DIRECTORY, SET_INFO) over `StorageBackend`, with `LocalFsBackend` as the first backend; a
+real macOS client (`mount_smbfs`) mounts the share, copies files both ways and the hashes
+match (details and the run are in `crates/smb-core/README.md`). Next (J3) is `GrpcBackend` with
+the journal and the uploader.
 Business logic marked `todo!()` is tied to the architecture sections below.
 
 ## License

@@ -3,26 +3,23 @@
 //! without sockets; sockets live only in `server`.
 //!
 //! J1: NEGOTIATE 3.1.1 → SESSION_SETUP (SPNEGO/NTLMv2, 2 steps) → TREE_CONNECT /
-//! TREE_DISCONNECT / LOGOFF / ECHO. The remaining commands get `STATUS_NOT_IMPLEMENTED`
-//! (signed). Signing is mandatory: after SESSION_SETUP, frames without a valid
+//! TREE_DISCONNECT / LOGOFF / ECHO. J2: the file commands (CREATE, CLOSE, READ, WRITE, FLUSH,
+//! QUERY_INFO, QUERY_DIRECTORY, SET_INFO) run on a `StorageBackend` (see `files`). The
+//! remaining commands get `STATUS_NOT_IMPLEMENTED` (signed). Signing is mandatory: after SESSION_SETUP, frames without a valid
 //! signature are rejected and replies are signed.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
 use janus_lib::profile::CompatCaps;
+use janus_lib::vfs::StorageBackend;
 use smb_wire::auth::{self, OID_NTLMSSP, SpnegoToken};
 use smb_wire::bytes::{Reader, Writer};
-use smb_wire::create::{
-    ACTION_OPENED, ATTR_DIRECTORY, CreateContext, CreateReq, CreateResp, FILE_ID_RELATED,
-    disposition,
-};
+use smb_wire::create::{CreateReq, FILE_ID_RELATED};
 use smb_wire::crypto;
-use smb_wire::fileinfo::{
-    CloseReq, QueryDirectoryReq, QueryInfoReq, VolumeInfo, encode_close_resp,
-    encode_query_info_resp, fs_info, info_type, root_dir_info,
-};
+use smb_wire::fileinfo::{CloseReq, QueryDirectoryReq, QueryInfoReq, SetInfoReq};
 use smb_wire::header::{Header, SMB2_TRANSFORM_MAGIC, flags};
+use smb_wire::io::{FlushReq, ReadReq, WriteReq};
 use smb_wire::messages::{
     ACCESS_ALL, HASH_SHA512, NegotiateReq, NegotiateResp, SessionSetupReq, SessionSetupResp,
     TreeConnectReq, TreeConnectResp, decode_simple_req, encode_simple_resp, security_mode,
@@ -32,6 +29,7 @@ use smb_wire::ntlm::{ChallengeParams, Credentials, NtlmServer};
 use smb_wire::{Command, Message, WireError};
 
 use crate::conn::{ConnState, MAX_AUTH_FAILURES, MAX_PENDING_SESSIONS};
+use crate::files;
 use crate::session::{PendingAuth, Session, SessionState};
 
 /// Result of handling a packet.
@@ -53,6 +51,13 @@ pub mod status {
     pub const INVALID_INFO_CLASS: u32 = 0xC000_0003;
     pub const INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
     pub const NO_SUCH_FILE: u32 = 0xC000_000F;
+    pub const END_OF_FILE: u32 = 0xC000_0011;
+    pub const OBJECT_PATH_NOT_FOUND: u32 = 0xC000_003A;
+    pub const DISK_FULL: u32 = 0xC000_007F;
+    pub const DIRECTORY_NOT_EMPTY: u32 = 0xC000_0101;
+    pub const NOT_A_DIRECTORY: u32 = 0xC000_0103;
+    pub const UNEXPECTED_NETWORK_ERROR: u32 = 0xC000_00C4;
+    pub const UNEXPECTED_IO_ERROR: u32 = 0xC000_00E9;
     pub const OBJECT_NAME_NOT_FOUND: u32 = 0xC000_0034;
     pub const OBJECT_NAME_COLLISION: u32 = 0xC000_0035;
     pub const FILE_IS_A_DIRECTORY: u32 = 0xC000_00BA;
@@ -115,9 +120,6 @@ impl Element {
     }
 }
 
-/// CreateOptions: FILE_NON_DIRECTORY_FILE.
-const OPT_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
-
 /// Maximum number of elements in a compound chain.
 const MAX_COMPOUND: usize = 32;
 
@@ -131,10 +133,11 @@ impl Dispatcher {
     /// F_FULLFSYNC, POSIX-ext, ADS probes. The dispatcher does not branch on "platforms".
     ///
     /// `Err` is a protocol violation; the connection is closed without a reply.
-    pub fn handle(
+    pub async fn handle<B: StorageBackend>(
         payload: &[u8],
         conn: &mut ConnState,
         ctx: &ServerCtx<'_>,
+        backend: &B,
     ) -> Result<Reply, WireError> {
         if smb_wire::messages::is_smb1(payload) {
             return Self::smb1_negotiate(payload, conn, ctx);
@@ -147,6 +150,7 @@ impl Dispatcher {
 
         let mut elements: Vec<Element> = Vec::with_capacity(parts.len());
         let (mut prev_session, mut prev_tree) = (0u64, 0u32);
+        let mut create_error: Option<u32> = None;
         conn.compound_file = None;
         for raw in parts {
             let mut msg = Message::decode_single(raw)?;
@@ -163,10 +167,14 @@ impl Dispatcher {
                 }
             }
             (prev_session, prev_tree) = (msg.header.session_id, msg.header.tree_id);
-            let related_failed = (msg.header.flags & flags::RELATED_OPERATIONS != 0)
-                .then(|| elements.last().map(|e| e.header.status))
-                .flatten()
-                .filter(|&st| st != status::SUCCESS);
+            // MS-SMB2 §3.3.5.2.7.2: only a failed CREATE poisons the rest of a related chain
+            // (there is no FileId to inherit). Other failures, such as NO_MORE_FILES from a
+            // QUERY_DIRECTORY, leave the FileId usable: the trailing CLOSE must still run,
+            // or every enumeration would leak a handle.
+            if msg.header.flags & flags::RELATED_OPERATIONS == 0 {
+                create_error = None;
+            }
+            let related_failed = create_error;
 
             if conn.credits.charge(msg.header.credit_charge).is_err() {
                 return Err(WireError::Malformed("insufficient credits"));
@@ -180,8 +188,12 @@ impl Dispatcher {
                     return Err(WireError::Malformed("command before NEGOTIATE"));
                 }
                 Command::SessionSetup => Self::session_setup(raw, &msg, conn, ctx)?,
-                _ => Self::authenticated(raw, &msg, conn, ctx, related_failed)?,
+                _ => Self::authenticated(raw, &msg, conn, ctx, backend, related_failed).await?,
             };
+            if msg.header.command == Command::Create {
+                create_error =
+                    (element.header.status != status::SUCCESS).then_some(element.header.status);
+            }
             elements.push(element);
         }
         Ok(Reply::Now(assemble(elements)))
@@ -474,11 +486,12 @@ impl Dispatcher {
 
     // --- Commands of an established session -------------------------------
 
-    fn authenticated(
+    async fn authenticated<B: StorageBackend>(
         raw: &[u8],
         msg: &Message,
         conn: &mut ConnState,
         ctx: &ServerCtx<'_>,
+        backend: &B,
         related_failed: Option<u32>,
     ) -> Result<Element, WireError> {
         let h = &msg.header;
@@ -506,8 +519,13 @@ impl Dispatcher {
             .get_mut(&h.session_id)
             .expect("session found above");
         let out = match h.command {
-            Command::Echo | Command::Logoff => {
+            Command::Echo => {
                 decode_simple_req(&mut Reader::new(&msg.body))?;
+                Out::ok(simple_body())
+            }
+            Command::Logoff => {
+                decode_simple_req(&mut Reader::new(&msg.body))?;
+                files::close_all(backend, session.take_all_opens()).await;
                 Out::ok(simple_body())
             }
             Command::TreeConnect => {
@@ -528,49 +546,69 @@ impl Dispatcher {
             Command::TreeDisconnect => {
                 decode_simple_req(&mut Reader::new(&msg.body))?;
                 if session.trees.remove(&h.tree_id).is_some() {
-                    session.opens.retain(|_, o| o.tree_id != h.tree_id);
+                    files::close_all(backend, session.take_tree_opens(h.tree_id)).await;
                     Out::ok(simple_body())
                 } else {
                     Out::err(status::NETWORK_NAME_DELETED)
                 }
             }
+            // File commands: everything below needs a connected tree.
+            cmd @ (Command::Create
+            | Command::Close
+            | Command::Read
+            | Command::Write
+            | Command::Flush
+            | Command::QueryInfo
+            | Command::QueryDirectory
+            | Command::SetInfo)
+                if !session.trees.contains_key(&h.tree_id) =>
+            {
+                // Decode anyway so that a malformed request is still a protocol error.
+                let _ = cmd;
+                Out::err(status::NETWORK_NAME_DELETED)
+            }
             Command::Create => {
                 let req = CreateReq::decode(&mut Reader::new(&msg.body))?;
-                Self::create(&req, h.tree_id, session, ctx)
-            }
-            Command::QueryInfo => {
-                let req = QueryInfoReq::decode(&mut Reader::new(&msg.body))?;
-                let fid = resolve_file_id(req.file_id, compound_file);
-                match session.open_mut(&fid, h.tree_id) {
-                    Some(_) => Self::query_info(&req, ctx),
-                    None => Out::err(status::FILE_CLOSED),
-                }
-            }
-            Command::QueryDirectory => {
-                let req = QueryDirectoryReq::decode(&mut Reader::new(&msg.body))?;
-                let fid = resolve_file_id(req.file_id, compound_file);
-                match session.open_mut(&fid, h.tree_id) {
-                    // The root is empty: the first query finds no matches, then the enumeration is over.
-                    Some(open) if !open.enumerated => {
-                        open.enumerated = true;
-                        Out::err(status::NO_SUCH_FILE)
-                    }
-                    Some(_) => Out::err(status::NO_MORE_FILES),
-                    None => Out::err(status::FILE_CLOSED),
-                }
+                files::create(backend, &req, h.tree_id, session, ctx).await
             }
             Command::Close => {
                 let req = CloseReq::decode(&mut Reader::new(&msg.body))?;
                 let fid = resolve_file_id(req.file_id, compound_file);
-                if session.close(&fid, h.tree_id) {
-                    let mut w = Writer::new();
-                    encode_close_resp(&mut w);
-                    Out::ok(w.into_vec())
-                } else {
-                    Out::err(status::FILE_CLOSED)
-                }
+                files::close(backend, &req, fid, h.tree_id, session).await
             }
-            // READ/WRITE/FLUSH/IOCTL/... — J2.
+            Command::Read => {
+                let req = ReadReq::decode(&mut Reader::new(&msg.body))?;
+                let fid = resolve_file_id(req.file_id, compound_file);
+                files::read(backend, &req, fid, h.tree_id, session).await
+            }
+            Command::Write => {
+                let req = WriteReq::decode(&mut Reader::new(&msg.body))?;
+                let fid = resolve_file_id(req.file_id, compound_file);
+                files::write(backend, &req, fid, h.tree_id, session).await
+            }
+            Command::Flush => {
+                let req = FlushReq::decode(&mut Reader::new(&msg.body))?;
+                let fid = resolve_file_id(req.file_id, compound_file);
+                files::flush(backend, &req, fid, h.tree_id, session, ctx).await
+            }
+            Command::QueryInfo => {
+                let req = QueryInfoReq::decode(&mut Reader::new(&msg.body))?;
+                let fid = resolve_file_id(req.file_id, compound_file);
+                files::query_info(backend, ctx, &req, fid, h.tree_id, session).await
+            }
+            Command::QueryDirectory => {
+                let req = QueryDirectoryReq::decode(&mut Reader::new(&msg.body))?;
+                let fid = resolve_file_id(req.file_id, compound_file);
+                files::query_directory(backend, ctx, &req, fid, h.tree_id, session).await
+            }
+            Command::SetInfo => {
+                let req = SetInfoReq::decode(&mut Reader::new(&msg.body))?;
+                let fid = resolve_file_id(req.file_id, compound_file);
+                files::set_info(backend, &req, fid, h.tree_id, session).await
+            }
+            // Unknown FSCTLs (macOS probes the network interface list): the usual answer.
+            Command::Ioctl => Out::err(status::NOT_SUPPORTED),
+            // LOCK/CHANGE_NOTIFY/CANCEL/OPLOCK_BREAK: not implemented yet.
             _ => Out::err(status::NOT_IMPLEMENTED),
         };
 
@@ -588,85 +626,25 @@ impl Dispatcher {
         Ok(elem)
     }
 
-    /// CREATE: only the share root (empty path) is served for now, as a virtual empty directory.
-    fn create(req: &CreateReq, tree_id: u32, session: &mut Session, ctx: &ServerCtx<'_>) -> Out {
-        if !session.trees.contains_key(&tree_id) {
-            return Out::err(status::NETWORK_NAME_DELETED);
-        }
-        let is_root = req.path.trim_matches('\\').is_empty();
-        if !is_root {
-            return match req.create_disposition {
-                disposition::OPEN | disposition::OVERWRITE => {
-                    Out::err(status::OBJECT_NAME_NOT_FOUND)
-                }
-                _ => Out::err(status::NOT_IMPLEMENTED), // file creation is J2
-            };
-        }
-        match req.create_disposition {
-            disposition::OPEN | disposition::OPEN_IF => {}
-            disposition::CREATE => return Out::err(status::OBJECT_NAME_COLLISION),
-            _ => return Out::err(status::ACCESS_DENIED),
-        }
-        if req.create_options & OPT_NON_DIRECTORY_FILE != 0 {
-            return Out::err(status::FILE_IS_A_DIRECTORY);
-        }
-        let file_id = session.open_root(tree_id);
-        let v = volume_info(ctx);
-        let mut w = Writer::new();
-        CreateResp {
-            create_action: ACTION_OPENED,
-            creation_time: v.created,
-            last_access_time: v.now,
-            last_write_time: v.now,
-            change_time: v.created,
-            allocation_size: 0,
-            end_of_file: 0,
-            file_attributes: ATTR_DIRECTORY,
-            file_id,
-            maximal_access: req
-                .contexts
-                .iter()
-                .any(|c| matches!(c, CreateContext::QueryMaximalAccess))
-                .then_some(ACCESS_ALL),
-        }
-        .encode(&mut w);
-        Out {
-            created_file: Some(file_id),
-            ..Out::ok(w.into_vec())
-        }
-    }
-
-    fn query_info(req: &QueryInfoReq, ctx: &ServerCtx<'_>) -> Out {
-        let v = volume_info(ctx);
-        let data = match req.info_type {
-            info_type::FILESYSTEM => fs_info(req.class, &v),
-            info_type::FILE => root_dir_info(req.class, &v),
-            _ => return Out::err(status::NOT_SUPPORTED),
-        };
-        match data {
-            None => Out::err(status::INVALID_INFO_CLASS),
-            Some(d) if d.len() > req.output_buffer_length as usize => {
-                Out::err(status::INFO_LENGTH_MISMATCH)
-            }
-            Some(d) => {
-                let mut w = Writer::new();
-                encode_query_info_resp(&mut w, &d);
-                Out::ok(w.into_vec())
-            }
+    /// Close every handle still open on a connection that is going away. The backend
+    /// performs pending delete-on-close.
+    pub async fn cleanup<B: StorageBackend>(conn: &mut ConnState, backend: &B) {
+        for session in conn.sessions.values_mut() {
+            files::close_all(backend, session.take_all_opens()).await;
         }
     }
 }
 
 /// Result of handling a command, before the header is assembled.
-struct Out {
-    status: u32,
-    body: Vec<u8>,
-    new_tree: Option<u32>,
-    created_file: Option<[u8; 16]>,
+pub(crate) struct Out {
+    pub(crate) status: u32,
+    pub(crate) body: Vec<u8>,
+    pub(crate) new_tree: Option<u32>,
+    pub(crate) created_file: Option<[u8; 16]>,
 }
 
 impl Out {
-    fn ok(body: Vec<u8>) -> Out {
+    pub(crate) fn ok(body: Vec<u8>) -> Out {
         Out {
             status: status::SUCCESS,
             body,
@@ -675,7 +653,7 @@ impl Out {
         }
     }
 
-    fn err(status: u32) -> Out {
+    pub(crate) fn err(status: u32) -> Out {
         Out {
             status,
             body: error_body(),
@@ -697,16 +675,6 @@ fn resolve_file_id(requested: [u8; 16], compound_file: Option<[u8; 16]>) -> [u8;
         compound_file.unwrap_or(FILE_ID_RELATED)
     } else {
         requested
-    }
-}
-
-fn volume_info(ctx: &ServerCtx<'_>) -> VolumeInfo {
-    VolumeInfo {
-        total_bytes: ctx.volume_bytes,
-        free_bytes: ctx.volume_bytes, // the root is empty
-        created: ctx.started_filetime,
-        now: ctx.filetime,
-        case_sensitive_names: ctx.caps.case_sensitive_names,
     }
 }
 
@@ -849,10 +817,13 @@ mod tests {
     use crate::conn::AUTH_TIMEOUT;
     use janus_lib::profile::ClientProfile;
     use smb_wire::auth::NegState;
+    use smb_wire::create::disposition;
     use smb_wire::testclient::{
-        Client, Response, close_body, create_body, frame, negotiate_body, query_directory_body,
-        query_info_body, request_header, session_setup_body, sign_frame, simple_body,
-        smb1_negotiate, split_compound, tree_connect_body,
+        Client, Response, basic_info, close_body, close_body_ex, create_body, create_body_ex,
+        create_reply_file_id, dir_entry_names, disposition_info, eof_info, flush_body, frame,
+        negotiate_body, query_directory_body_ex, query_info_body, read_body, read_reply_data,
+        rename_info, request_header, session_setup_body, set_info_body, sign_frame, simple_body,
+        smb1_negotiate, split_compound, tree_connect_body, write_body,
     };
     use std::time::Duration;
 
@@ -865,20 +836,46 @@ mod tests {
         }
     }
 
+    /// A scratch directory removed on drop.
+    struct TmpDir(std::path::PathBuf);
+
+    impl TmpDir {
+        fn new() -> TmpDir {
+            let mut r = [0u8; 8];
+            getrandom::fill(&mut r).unwrap();
+            TmpDir(std::env::temp_dir().join(format!("janus-dispatch-{}", u64::from_le_bytes(r))))
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     struct Fixture {
         next_session: AtomicU64,
         conn: ConnState,
         creds: Option<Credentials>,
         now: Instant,
+        backend: janus_lib::vfs::LocalFsBackend,
+        dir: TmpDir,
+        rt: tokio::runtime::Runtime,
     }
 
     impl Fixture {
         fn new() -> Self {
+            let dir = TmpDir::new();
             Fixture {
                 next_session: AtomicU64::new(0x1_0000_0001),
                 conn: ConnState::default(),
                 creds: Some(Credentials::from_password(USER, PASSWORD)),
                 now: Instant::now(),
+                backend: janus_lib::vfs::LocalFsBackend::new(&dir.0).unwrap(),
+                dir,
+                rt: tokio::runtime::Builder::new_current_thread()
+                    .build()
+                    .unwrap(),
             }
         }
 
@@ -896,7 +893,12 @@ mod tests {
                 now: self.now,
                 random: det_random,
             };
-            match Dispatcher::handle(payload, &mut self.conn, &ctx)? {
+            match self.rt.block_on(Dispatcher::handle(
+                payload,
+                &mut self.conn,
+                &ctx,
+                &self.backend,
+            ))? {
                 Reply::Now(b) => Ok(b),
                 _ => panic!("expected Reply::Now"),
             }
@@ -1512,10 +1514,10 @@ mod tests {
     }
 
     #[test]
-    fn file_commands_are_not_implemented_but_still_signed() {
+    fn unimplemented_commands_are_not_implemented_but_still_signed() {
         let (mut fx, mut c) = logged_in();
         let r = fx
-            .send(&c.signed_request(Command::Read, 1, &[49, 0, 0, 0]))
+            .send(&c.signed_request(Command::Lock, 1, &[48, 0, 0, 0]))
             .unwrap();
         assert!(c.verify_response(&r));
         assert_eq!(
@@ -1829,7 +1831,7 @@ mod tests {
                 tid,
                 create_body("", disposition::OVERWRITE_IF, 0, false)
             ),
-            status::ACCESS_DENIED
+            status::FILE_IS_A_DIRECTORY
         );
         assert_eq!(
             create(
@@ -1847,7 +1849,7 @@ mod tests {
                 tid,
                 create_body("a/b", disposition::CREATE, 0, false)
             ),
-            status::NOT_IMPLEMENTED
+            status::OBJECT_PATH_NOT_FOUND
         );
         // a tree that does not exist
         assert_eq!(
@@ -1904,17 +1906,25 @@ mod tests {
     }
 
     #[test]
-    fn empty_directory_listing_then_no_more_files() {
+    fn empty_directory_lists_only_dot_entries_then_no_more_files() {
         let (mut fx, mut c, tid) = connected();
         let (_, fid) = create_root(&mut fx, &mut c, tid);
-        let mut list = || {
+        let mut list = |pattern: &str, flags: u8| {
             let r = fx
-                .send(&c.signed_request(Command::QueryDirectory, tid, &query_directory_body(fid)))
+                .send(&c.signed_request(
+                    Command::QueryDirectory,
+                    tid,
+                    &query_directory_body_ex(fid, 37, flags, pattern, 65536),
+                ))
                 .unwrap();
-            Response::parse(&r).unwrap().status()
+            Response::parse(&r).unwrap()
         };
-        assert_eq!(list(), status::NO_SUCH_FILE);
-        assert_eq!(list(), status::NO_MORE_FILES);
+        let first = list("*", 1);
+        assert_eq!(first.status(), status::SUCCESS);
+        assert_eq!(dir_entry_names(&first.message.body, 37), [".", ".."]);
+        assert_eq!(list("*", 0).status(), status::NO_MORE_FILES);
+        // a pattern that matches nothing in a fresh scan is NO_SUCH_FILE
+        assert_eq!(list("zzz*", 1).status(), status::NO_SUCH_FILE);
     }
 
     #[test]
@@ -1967,5 +1977,1067 @@ mod tests {
         assert_eq!(share_of("\\\\\\share"), None);
         assert_eq!(share_of("//host/share"), None);
         assert_eq!(share_of("\\\\host\\a\\b"), None);
+    }
+
+    // === J2: the file model ===================================================
+
+    /// Read, write, append, attributes and DELETE.
+    const RW: u32 = 0x0013_019F;
+    const RO: u32 = 0x0012_0089;
+    const WO: u32 = 0x0012_0116;
+    const OPT_DIR: u32 = 0x1;
+    const OPT_FILE: u32 = 0x40;
+    const OPT_DELETE_ON_CLOSE: u32 = 0x1000;
+
+    fn call(fx: &mut Fixture, c: &mut Client, tid: u32, cmd: Command, body: &[u8]) -> Response {
+        let r = fx.send(&c.signed_request(cmd, tid, body)).unwrap();
+        assert!(c.verify_response(&r), "{cmd:?}: reply signature");
+        Response::parse(&r).unwrap()
+    }
+
+    fn open_obj(
+        fx: &mut Fixture,
+        c: &mut Client,
+        tid: u32,
+        path: &str,
+        access: u32,
+        disp: u32,
+        opts: u32,
+    ) -> Response {
+        call(
+            fx,
+            c,
+            tid,
+            Command::Create,
+            &create_body_ex(path, access, 0x80, disp, opts, false),
+        )
+    }
+
+    /// Open (must succeed) and return the FileId.
+    fn open_ok(
+        fx: &mut Fixture,
+        c: &mut Client,
+        tid: u32,
+        path: &str,
+        access: u32,
+        disp: u32,
+        opts: u32,
+    ) -> [u8; 16] {
+        let r = open_obj(fx, c, tid, path, access, disp, opts);
+        assert_eq!(r.status(), status::SUCCESS, "open {path}");
+        create_reply_file_id(&r.message.body)
+    }
+
+    fn write_at(
+        fx: &mut Fixture,
+        c: &mut Client,
+        tid: u32,
+        fid: [u8; 16],
+        off: u64,
+        d: &[u8],
+    ) -> u32 {
+        call(fx, c, tid, Command::Write, &write_body(fid, off, d, 0)).status()
+    }
+
+    fn read_at(
+        fx: &mut Fixture,
+        c: &mut Client,
+        tid: u32,
+        fid: [u8; 16],
+        off: u64,
+        len: u32,
+    ) -> Response {
+        call(fx, c, tid, Command::Read, &read_body(fid, len, off))
+    }
+
+    fn close_fid(fx: &mut Fixture, c: &mut Client, tid: u32, fid: [u8; 16]) -> u32 {
+        call(fx, c, tid, Command::Close, &close_body(fid)).status()
+    }
+
+    fn set_info(
+        fx: &mut Fixture,
+        c: &mut Client,
+        tid: u32,
+        fid: [u8; 16],
+        class: u8,
+        buf: &[u8],
+    ) -> u32 {
+        call(
+            fx,
+            c,
+            tid,
+            Command::SetInfo,
+            &set_info_body(class, fid, buf),
+        )
+        .status()
+    }
+
+    fn query_file_info(
+        fx: &mut Fixture,
+        c: &mut Client,
+        tid: u32,
+        fid: [u8; 16],
+        class: u8,
+    ) -> Vec<u8> {
+        let r = call(
+            fx,
+            c,
+            tid,
+            Command::QueryInfo,
+            &query_info_body(1, class, 4096, fid),
+        );
+        assert_eq!(r.status(), status::SUCCESS, "class {class}");
+        let b = &r.message.body;
+        let len = u32::from_le_bytes(b[4..8].try_into().unwrap()) as usize;
+        b[8..8 + len].to_vec()
+    }
+
+    fn list_dir(fx: &mut Fixture, c: &mut Client, tid: u32, path: &str) -> Vec<String> {
+        let fid = open_ok(fx, c, tid, path, RO, disposition::OPEN, OPT_DIR);
+        let r = call(
+            fx,
+            c,
+            tid,
+            Command::QueryDirectory,
+            &query_directory_body_ex(fid, 37, 1, "*", 65536),
+        );
+        let mut names = match r.status() {
+            status::SUCCESS => dir_entry_names(&r.message.body, 37),
+            st => {
+                assert_eq!(st, status::NO_SUCH_FILE);
+                Vec::new()
+            }
+        };
+        names.retain(|n| n != "." && n != "..");
+        close_fid(fx, c, tid, fid);
+        names
+    }
+
+    /// Cheap deterministic pseudo-random bytes.
+    fn pattern_bytes(n: usize, seed: u8) -> Vec<u8> {
+        (0..n)
+            .map(|i| {
+                (i as u8)
+                    .wrapping_mul(31)
+                    .wrapping_add(seed ^ (i >> 8) as u8)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn create_write_read_close_roundtrips_a_multi_chunk_file() {
+        let (mut fx, mut c, tid) = connected();
+        let data = pattern_bytes(300_000, 7);
+        let fid = open_ok(
+            &mut fx,
+            &mut c,
+            tid,
+            "big.bin",
+            RW,
+            disposition::CREATE,
+            OPT_FILE,
+        );
+        for (i, chunk) in data.chunks(65536).enumerate() {
+            assert_eq!(
+                write_at(&mut fx, &mut c, tid, fid, (i * 65536) as u64, chunk),
+                0
+            );
+        }
+        assert_eq!(close_fid(&mut fx, &mut c, tid, fid), status::SUCCESS);
+        assert_eq!(std::fs::read(fx.dir.0.join("big.bin")).unwrap(), data);
+
+        let fid = open_ok(
+            &mut fx,
+            &mut c,
+            tid,
+            "big.bin",
+            RO,
+            disposition::OPEN,
+            OPT_FILE,
+        );
+        let mut got = Vec::new();
+        loop {
+            let r = read_at(&mut fx, &mut c, tid, fid, got.len() as u64, 65536);
+            if r.status() == status::END_OF_FILE {
+                break;
+            }
+            assert_eq!(r.status(), status::SUCCESS);
+            got.extend(read_reply_data(&r.message.body));
+        }
+        assert_eq!(got, data);
+        close_fid(&mut fx, &mut c, tid, fid);
+    }
+
+    #[test]
+    fn write_reply_counts_and_read_replies_are_signed() {
+        let (mut fx, mut c, tid) = connected();
+        let fid = open_ok(&mut fx, &mut c, tid, "f", RW, disposition::CREATE, OPT_FILE);
+        let r = call(
+            &mut fx,
+            &mut c,
+            tid,
+            Command::Write,
+            &write_body(fid, 0, b"hello", 0),
+        );
+        assert_eq!(
+            u32::from_le_bytes(r.message.body[4..8].try_into().unwrap()),
+            5
+        );
+        let r = read_at(&mut fx, &mut c, tid, fid, 1, 100);
+        assert_eq!(read_reply_data(&r.message.body), b"ello");
+        // a write-through write is flushed and still succeeds
+        let r = call(
+            &mut fx,
+            &mut c,
+            tid,
+            Command::Write,
+            &write_body(fid, 5, b"!", 1),
+        );
+        assert_eq!(r.status(), status::SUCCESS);
+        assert_eq!(std::fs::read(fx.dir.0.join("f")).unwrap(), b"hello!");
+    }
+
+    #[test]
+    fn create_actions_and_dispositions() {
+        let (mut fx, mut c, tid) = connected();
+        let action = |r: &Response| u32::from_le_bytes(r.message.body[4..8].try_into().unwrap());
+        let eof = |r: &Response| u64::from_le_bytes(r.message.body[48..56].try_into().unwrap());
+        let r = open_obj(&mut fx, &mut c, tid, "a", RW, disposition::OPEN, OPT_FILE);
+        assert_eq!(r.status(), status::OBJECT_NAME_NOT_FOUND);
+        let r = open_obj(&mut fx, &mut c, tid, "a", RW, disposition::CREATE, OPT_FILE);
+        assert_eq!((r.status(), action(&r)), (0, 2), "FILE_CREATED");
+        let fid = create_reply_file_id(&r.message.body);
+        write_at(&mut fx, &mut c, tid, fid, 0, b"12345");
+        close_fid(&mut fx, &mut c, tid, fid);
+        let r = open_obj(&mut fx, &mut c, tid, "a", RW, disposition::CREATE, OPT_FILE);
+        assert_eq!(r.status(), status::OBJECT_NAME_COLLISION);
+        let r = open_obj(
+            &mut fx,
+            &mut c,
+            tid,
+            "a",
+            RW,
+            disposition::OPEN_IF,
+            OPT_FILE,
+        );
+        assert_eq!((r.status(), action(&r)), (0, 1), "FILE_OPENED");
+        assert_eq!(eof(&r), 5);
+        assert_eq!(
+            u64::from_le_bytes(r.message.body[40..48].try_into().unwrap()),
+            4096,
+            "AllocationSize"
+        );
+        close_fid(&mut fx, &mut c, tid, create_reply_file_id(&r.message.body));
+        let r = open_obj(
+            &mut fx,
+            &mut c,
+            tid,
+            "a",
+            RW,
+            disposition::OVERWRITE_IF,
+            OPT_FILE,
+        );
+        assert_eq!((r.status(), action(&r)), (0, 3), "FILE_OVERWRITTEN");
+        assert_eq!(eof(&r), 0);
+        close_fid(&mut fx, &mut c, tid, create_reply_file_id(&r.message.body));
+        let r = open_obj(
+            &mut fx,
+            &mut c,
+            tid,
+            "a",
+            RW,
+            disposition::SUPERSEDE,
+            OPT_FILE,
+        );
+        assert_eq!((r.status(), action(&r)), (0, 0), "FILE_SUPERSEDED");
+        close_fid(&mut fx, &mut c, tid, create_reply_file_id(&r.message.body));
+        let r = open_obj(&mut fx, &mut c, tid, "a", RW, 9, OPT_FILE);
+        assert_eq!(r.status(), status::INVALID_PARAMETER, "bad disposition");
+        let r = open_obj(
+            &mut fx,
+            &mut c,
+            tid,
+            "a",
+            RW,
+            disposition::OPEN,
+            OPT_FILE | OPT_DIR,
+        );
+        assert_eq!(r.status(), status::INVALID_PARAMETER, "file and directory");
+        let r = open_obj(&mut fx, &mut c, tid, "a", RW, disposition::OPEN, OPT_DIR);
+        assert_eq!(r.status(), status::NOT_A_DIRECTORY);
+        let r = open_obj(
+            &mut fx,
+            &mut c,
+            tid,
+            "x/y",
+            RW,
+            disposition::CREATE,
+            OPT_FILE,
+        );
+        assert_eq!(r.status(), status::OBJECT_PATH_NOT_FOUND);
+    }
+
+    #[test]
+    fn directories_are_created_listed_and_removed() {
+        let (mut fx, mut c, tid) = connected();
+        let d = open_ok(&mut fx, &mut c, tid, "d", RW, disposition::CREATE, OPT_DIR);
+        close_fid(&mut fx, &mut c, tid, d);
+        for name in ["d\\one.txt", "d\\two.log", "d\\three"] {
+            let f = open_ok(
+                &mut fx,
+                &mut c,
+                tid,
+                name,
+                RW,
+                disposition::CREATE,
+                OPT_FILE,
+            );
+            close_fid(&mut fx, &mut c, tid, f);
+        }
+        let mut names = list_dir(&mut fx, &mut c, tid, "d");
+        names.sort();
+        assert_eq!(names, ["one.txt", "three", "two.log"]);
+        assert_eq!(list_dir(&mut fx, &mut c, tid, ""), ["d"]);
+        let r = open_obj(&mut fx, &mut c, tid, "d", RO, disposition::OPEN, OPT_FILE);
+        assert_eq!(r.status(), status::FILE_IS_A_DIRECTORY);
+
+        // every directory class parses, with the names in the right place
+        let fid = open_ok(&mut fx, &mut c, tid, "d", RO, disposition::OPEN, OPT_DIR);
+        for class in [1u8, 2, 3, 12, 37, 38] {
+            let r = call(
+                &mut fx,
+                &mut c,
+                tid,
+                Command::QueryDirectory,
+                &query_directory_body_ex(fid, class, 1, "*", 65536),
+            );
+            assert_eq!(r.status(), status::SUCCESS, "class {class}");
+            let mut n = dir_entry_names(&r.message.body, class);
+            n.sort();
+            assert_eq!(
+                n,
+                [".", "..", "one.txt", "three", "two.log"],
+                "class {class}"
+            );
+        }
+        // unsupported class
+        let r = call(
+            &mut fx,
+            &mut c,
+            tid,
+            Command::QueryDirectory,
+            &query_directory_body_ex(fid, 99, 1, "*", 65536),
+        );
+        assert_eq!(r.status(), status::INVALID_INFO_CLASS);
+        close_fid(&mut fx, &mut c, tid, fid);
+    }
+
+    #[test]
+    fn query_directory_paging_patterns_restart_and_single_entry() {
+        let (mut fx, mut c, tid) = connected();
+        for i in 0..10 {
+            let name = format!("f{i}.txt");
+            let f = open_ok(
+                &mut fx,
+                &mut c,
+                tid,
+                &name,
+                RW,
+                disposition::CREATE,
+                OPT_FILE,
+            );
+            close_fid(&mut fx, &mut c, tid, f);
+        }
+        let f = open_ok(
+            &mut fx,
+            &mut c,
+            tid,
+            "other.bin",
+            RW,
+            disposition::CREATE,
+            OPT_FILE,
+        );
+        close_fid(&mut fx, &mut c, tid, f);
+        let fid = open_ok(&mut fx, &mut c, tid, "", RO, disposition::OPEN, OPT_DIR);
+        // a small buffer returns a few entries per call; together they are complete and unique
+        let mut seen = Vec::new();
+        let mut flags = 1u8;
+        loop {
+            let r = call(
+                &mut fx,
+                &mut c,
+                tid,
+                Command::QueryDirectory,
+                &query_directory_body_ex(fid, 37, flags, "*", 400),
+            );
+            flags = 0;
+            if r.status() == status::NO_MORE_FILES {
+                break;
+            }
+            assert_eq!(r.status(), status::SUCCESS);
+            let names = dir_entry_names(&r.message.body, 37);
+            assert!(names.len() < 13, "buffer limit respected");
+            seen.extend(names);
+        }
+        seen.sort();
+        let mut want: Vec<String> = (0..10).map(|i| format!("f{i}.txt")).collect();
+        want.extend([".".into(), "..".into(), "other.bin".into()]);
+        want.sort();
+        assert_eq!(seen, want);
+        // a buffer too small for any entry
+        let r = call(
+            &mut fx,
+            &mut c,
+            tid,
+            Command::QueryDirectory,
+            &query_directory_body_ex(fid, 37, 1, "*", 40),
+        );
+        assert_eq!(r.status(), status::INFO_LENGTH_MISMATCH);
+        // restart with a pattern, single entry at a time
+        let mut got = Vec::new();
+        let mut flags = 1u8 | 2;
+        loop {
+            let r = call(
+                &mut fx,
+                &mut c,
+                tid,
+                Command::QueryDirectory,
+                &query_directory_body_ex(fid, 37, flags, "f?.txt", 65536),
+            );
+            flags = 2;
+            if r.status() != status::SUCCESS {
+                assert_eq!(r.status(), status::NO_MORE_FILES);
+                break;
+            }
+            let n = dir_entry_names(&r.message.body, 37);
+            assert_eq!(n.len(), 1, "RETURN_SINGLE_ENTRY");
+            got.extend(n);
+        }
+        got.sort();
+        assert_eq!(got.len(), 10);
+        assert_eq!(got[0], "f0.txt");
+        // an exact name lookup (how clients probe for a file)
+        let r = call(
+            &mut fx,
+            &mut c,
+            tid,
+            Command::QueryDirectory,
+            &query_directory_body_ex(fid, 37, 1, "other.bin", 65536),
+        );
+        assert_eq!(dir_entry_names(&r.message.body, 37), ["other.bin"]);
+        // not a directory
+        let f = open_ok(
+            &mut fx,
+            &mut c,
+            tid,
+            "other.bin",
+            RO,
+            disposition::OPEN,
+            OPT_FILE,
+        );
+        let r = call(
+            &mut fx,
+            &mut c,
+            tid,
+            Command::QueryDirectory,
+            &query_directory_body_ex(f, 37, 1, "*", 65536),
+        );
+        assert_eq!(r.status(), status::NOT_A_DIRECTORY);
+    }
+
+    #[test]
+    fn io_access_and_size_checks() {
+        let (mut fx, mut c, tid) = connected();
+        let fid = open_ok(&mut fx, &mut c, tid, "f", RW, disposition::CREATE, OPT_FILE);
+        write_at(&mut fx, &mut c, tid, fid, 0, b"abc");
+        close_fid(&mut fx, &mut c, tid, fid);
+
+        let ro = open_ok(&mut fx, &mut c, tid, "f", RO, disposition::OPEN, OPT_FILE);
+        assert_eq!(
+            write_at(&mut fx, &mut c, tid, ro, 0, b"x"),
+            status::ACCESS_DENIED
+        );
+        assert_eq!(
+            set_info(&mut fx, &mut c, tid, ro, 20, &eof_info(1)),
+            status::ACCESS_DENIED
+        );
+        assert_eq!(
+            read_at(&mut fx, &mut c, tid, ro, 0, 3).status(),
+            status::SUCCESS
+        );
+        assert_eq!(
+            read_at(&mut fx, &mut c, tid, ro, 3, 3).status(),
+            status::END_OF_FILE
+        );
+        assert_eq!(
+            read_at(&mut fx, &mut c, tid, ro, 100, 3).status(),
+            status::END_OF_FILE
+        );
+        assert_eq!(
+            read_at(&mut fx, &mut c, tid, ro, 0, 65537).status(),
+            status::INVALID_PARAMETER
+        );
+        assert_eq!(
+            read_at(&mut fx, &mut c, tid, ro, u64::MAX, 10).status(),
+            status::INVALID_PARAMETER
+        );
+        // MinimumCount larger than what is there
+        let mut body = read_body(ro, 10, 0);
+        body[32..36].copy_from_slice(&10u32.to_le_bytes());
+        assert_eq!(
+            call(&mut fx, &mut c, tid, Command::Read, &body).status(),
+            status::END_OF_FILE
+        );
+        let mut body = read_body(ro, 10, 0);
+        body[36..40].copy_from_slice(&1u32.to_le_bytes()); // Channel
+        assert_eq!(
+            call(&mut fx, &mut c, tid, Command::Read, &body).status(),
+            status::INVALID_PARAMETER
+        );
+        close_fid(&mut fx, &mut c, tid, ro);
+
+        let wo = open_ok(&mut fx, &mut c, tid, "f", WO, disposition::OPEN, OPT_FILE);
+        assert_eq!(
+            read_at(&mut fx, &mut c, tid, wo, 0, 3).status(),
+            status::ACCESS_DENIED
+        );
+        assert_eq!(
+            write_at(&mut fx, &mut c, tid, wo, 0, &vec![0u8; 65537]),
+            status::INVALID_PARAMETER
+        );
+        assert_eq!(write_at(&mut fx, &mut c, tid, wo, 0, b"Z"), 0);
+        close_fid(&mut fx, &mut c, tid, wo);
+        assert_eq!(std::fs::read(fx.dir.0.join("f")).unwrap(), b"Zbc");
+
+        let d = open_ok(&mut fx, &mut c, tid, "", RW, disposition::OPEN, OPT_DIR);
+        assert_eq!(
+            read_at(&mut fx, &mut c, tid, d, 0, 1).status(),
+            status::FILE_IS_A_DIRECTORY
+        );
+        assert_eq!(
+            write_at(&mut fx, &mut c, tid, d, 0, b"x"),
+            status::FILE_IS_A_DIRECTORY
+        );
+        // a stale FileId
+        assert_eq!(
+            read_at(&mut fx, &mut c, tid, [9; 16], 0, 1).status(),
+            status::FILE_CLOSED
+        );
+    }
+
+    #[test]
+    fn flush_works_with_and_without_the_fullfsync_marker() {
+        let (mut fx, mut c, tid) = connected();
+        let fid = open_ok(&mut fx, &mut c, tid, "f", RW, disposition::CREATE, OPT_FILE);
+        write_at(&mut fx, &mut c, tid, fid, 0, b"x");
+        for full in [false, true] {
+            let r = call(&mut fx, &mut c, tid, Command::Flush, &flush_body(fid, full));
+            assert_eq!(r.status(), status::SUCCESS);
+            assert_eq!(r.message.body, [4, 0, 0, 0]);
+        }
+        let r = call(
+            &mut fx,
+            &mut c,
+            tid,
+            Command::Flush,
+            &flush_body([8; 16], false),
+        );
+        assert_eq!(r.status(), status::FILE_CLOSED);
+        // a directory can be flushed too
+        let d = open_ok(&mut fx, &mut c, tid, "", RO, disposition::OPEN, OPT_DIR);
+        let r = call(&mut fx, &mut c, tid, Command::Flush, &flush_body(d, false));
+        assert_eq!(r.status(), status::SUCCESS);
+    }
+
+    #[test]
+    fn rename_replace_and_collisions() {
+        let (mut fx, mut c, tid) = connected();
+        for (name, content) in [("a", &b"A"[..]), ("b", &b"B"[..])] {
+            let f = open_ok(
+                &mut fx,
+                &mut c,
+                tid,
+                name,
+                RW,
+                disposition::CREATE,
+                OPT_FILE,
+            );
+            write_at(&mut fx, &mut c, tid, f, 0, content);
+            close_fid(&mut fx, &mut c, tid, f);
+        }
+        let fid = open_ok(&mut fx, &mut c, tid, "a", RW, disposition::OPEN, OPT_FILE);
+        assert_eq!(
+            set_info(&mut fx, &mut c, tid, fid, 10, &rename_info("b", false)),
+            status::OBJECT_NAME_COLLISION
+        );
+        let d = open_ok(
+            &mut fx,
+            &mut c,
+            tid,
+            "dir",
+            RW,
+            disposition::CREATE,
+            OPT_DIR,
+        );
+        close_fid(&mut fx, &mut c, tid, d);
+        assert_eq!(
+            set_info(
+                &mut fx,
+                &mut c,
+                tid,
+                fid,
+                10,
+                &rename_info("dir\\moved.txt", false)
+            ),
+            0
+        );
+        assert_eq!(std::fs::read(fx.dir.0.join("dir/moved.txt")).unwrap(), b"A");
+        assert!(!fx.dir.0.join("a").exists());
+        // the open follows the rename
+        let n = query_file_info(&mut fx, &mut c, tid, fid, 9);
+        let units: Vec<u16> = n[4..]
+            .chunks(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        assert_eq!(String::from_utf16(&units).unwrap(), "\\dir\\moved.txt");
+        assert_eq!(
+            set_info(&mut fx, &mut c, tid, fid, 10, &rename_info("b", true)),
+            0
+        );
+        assert_eq!(std::fs::read(fx.dir.0.join("b")).unwrap(), b"A");
+        close_fid(&mut fx, &mut c, tid, fid);
+        // renaming into a missing directory, and the root itself
+        let fid = open_ok(&mut fx, &mut c, tid, "b", RW, disposition::OPEN, OPT_FILE);
+        assert_eq!(
+            set_info(
+                &mut fx,
+                &mut c,
+                tid,
+                fid,
+                10,
+                &rename_info("nodir\\x", false)
+            ),
+            status::OBJECT_PATH_NOT_FOUND
+        );
+        let root = open_ok(&mut fx, &mut c, tid, "", RW, disposition::OPEN, OPT_DIR);
+        assert_eq!(
+            set_info(&mut fx, &mut c, tid, root, 10, &rename_info("x", false)),
+            status::ACCESS_DENIED
+        );
+    }
+
+    #[test]
+    fn delete_via_disposition_info_and_non_empty_directory() {
+        let (mut fx, mut c, tid) = connected();
+        let d = open_ok(&mut fx, &mut c, tid, "d", RW, disposition::CREATE, OPT_DIR);
+        let f = open_ok(
+            &mut fx,
+            &mut c,
+            tid,
+            "d\\f",
+            RW,
+            disposition::CREATE,
+            OPT_FILE,
+        );
+        assert_eq!(
+            set_info(&mut fx, &mut c, tid, d, 13, &disposition_info(true)),
+            status::DIRECTORY_NOT_EMPTY
+        );
+        assert_eq!(
+            set_info(&mut fx, &mut c, tid, f, 13, &disposition_info(true)),
+            0
+        );
+        // the open reports the pending delete
+        let std = query_file_info(&mut fx, &mut c, tid, f, 5);
+        assert_eq!(std[20], 1, "DeletePending");
+        // undo and redo
+        assert_eq!(
+            set_info(&mut fx, &mut c, tid, f, 13, &disposition_info(false)),
+            0
+        );
+        assert_eq!(query_file_info(&mut fx, &mut c, tid, f, 5)[20], 0);
+        assert_eq!(
+            set_info(&mut fx, &mut c, tid, f, 13, &disposition_info(true)),
+            0
+        );
+        close_fid(&mut fx, &mut c, tid, f);
+        assert!(!fx.dir.0.join("d/f").exists());
+        assert_eq!(
+            set_info(&mut fx, &mut c, tid, d, 13, &disposition_info(true)),
+            0
+        );
+        close_fid(&mut fx, &mut c, tid, d);
+        assert!(!fx.dir.0.join("d").exists());
+        // the root cannot be deleted; DELETE access is required
+        let root = open_ok(&mut fx, &mut c, tid, "", RW, disposition::OPEN, OPT_DIR);
+        assert_eq!(
+            set_info(&mut fx, &mut c, tid, root, 13, &disposition_info(true)),
+            status::ACCESS_DENIED
+        );
+        let f = open_ok(&mut fx, &mut c, tid, "g", RW, disposition::CREATE, OPT_FILE);
+        close_fid(&mut fx, &mut c, tid, f);
+        let f = open_ok(&mut fx, &mut c, tid, "g", RO, disposition::OPEN, OPT_FILE);
+        assert_eq!(
+            set_info(&mut fx, &mut c, tid, f, 13, &disposition_info(true)),
+            status::ACCESS_DENIED
+        );
+    }
+
+    #[test]
+    fn delete_on_close_option_and_cleanup_of_leaked_handles() {
+        let (mut fx, mut c, tid) = connected();
+        let doc = OPT_FILE | OPT_DELETE_ON_CLOSE;
+        let r = open_obj(&mut fx, &mut c, tid, "tmp", RO, disposition::CREATE, doc);
+        assert_eq!(r.status(), status::ACCESS_DENIED, "DELETE access needed");
+        let f = open_ok(&mut fx, &mut c, tid, "tmp", RW, disposition::CREATE, doc);
+        assert!(fx.dir.0.join("tmp").exists());
+        close_fid(&mut fx, &mut c, tid, f);
+        assert!(!fx.dir.0.join("tmp").exists());
+
+        // TREE_DISCONNECT closes (and so deletes) what the client left open
+        open_ok(&mut fx, &mut c, tid, "leak1", RW, disposition::CREATE, doc);
+        call(
+            &mut fx,
+            &mut c,
+            tid,
+            Command::TreeDisconnect,
+            &simple_body(),
+        );
+        assert!(!fx.dir.0.join("leak1").exists());
+
+        // so does LOGOFF
+        let tid = tree_connect(&mut fx, &mut c, "\\\\h\\backup")
+            .header()
+            .tree_id;
+        open_ok(&mut fx, &mut c, tid, "leak2", RW, disposition::CREATE, doc);
+        call(&mut fx, &mut c, 0, Command::Logoff, &simple_body());
+        assert!(!fx.dir.0.join("leak2").exists());
+    }
+
+    #[test]
+    fn connection_cleanup_closes_all_backend_handles() {
+        let (mut fx, mut c, tid) = connected();
+        let doc = OPT_FILE | OPT_DELETE_ON_CLOSE;
+        open_ok(&mut fx, &mut c, tid, "gone", RW, disposition::CREATE, doc);
+        assert!(fx.dir.0.join("gone").exists());
+        fx.rt
+            .block_on(Dispatcher::cleanup(&mut fx.conn, &fx.backend));
+        assert!(!fx.dir.0.join("gone").exists());
+        assert!(fx.conn.sessions.values().all(|s| s.opens.is_empty()));
+    }
+
+    #[test]
+    fn truncate_and_times_via_set_info() {
+        let (mut fx, mut c, tid) = connected();
+        let fid = open_ok(&mut fx, &mut c, tid, "f", RW, disposition::CREATE, OPT_FILE);
+        write_at(&mut fx, &mut c, tid, fid, 0, b"0123456789");
+        assert_eq!(set_info(&mut fx, &mut c, tid, fid, 20, &eof_info(4)), 0);
+        assert_eq!(std::fs::read(fx.dir.0.join("f")).unwrap(), b"0123");
+        assert_eq!(set_info(&mut fx, &mut c, tid, fid, 20, &eof_info(6)), 0);
+        assert_eq!(std::fs::read(fx.dir.0.join("f")).unwrap(), b"0123\0\0");
+        assert_eq!(
+            set_info(&mut fx, &mut c, tid, fid, 19, &eof_info(1 << 20)),
+            0,
+            "allocation is a hint"
+        );
+        // 2020-09-13T12:26:40Z
+        let unix_ns = 1_600_000_000_000_000_000i64;
+        let ft = smb_wire::fileinfo::filetime_from_unix_ns(unix_ns);
+        assert_eq!(
+            set_info(
+                &mut fx,
+                &mut c,
+                tid,
+                fid,
+                4,
+                &basic_info(ft, ft + 10_000_000)
+            ),
+            0
+        );
+        let net = query_file_info(&mut fx, &mut c, tid, fid, 34);
+        let t = |at: usize| u64::from_le_bytes(net[at..at + 8].try_into().unwrap());
+        assert_eq!(t(8), ft, "LastAccessTime");
+        assert_eq!(t(16), ft + 10_000_000, "LastWriteTime");
+        assert_eq!(t(40), 6, "EndOfFile");
+        // unsupported / malformed
+        assert_eq!(
+            set_info(&mut fx, &mut c, tid, fid, 99, &[0; 8]),
+            status::INVALID_INFO_CLASS
+        );
+        assert_eq!(
+            set_info(&mut fx, &mut c, tid, fid, 20, &[0; 4]),
+            status::INFO_LENGTH_MISMATCH
+        );
+        assert_eq!(
+            set_info(&mut fx, &mut c, tid, [5; 16], 20, &eof_info(0)),
+            status::FILE_CLOSED
+        );
+        // directories have no size
+        let d = open_ok(&mut fx, &mut c, tid, "", RW, disposition::OPEN, OPT_DIR);
+        assert_eq!(
+            set_info(&mut fx, &mut c, tid, d, 20, &eof_info(0)),
+            status::FILE_IS_A_DIRECTORY
+        );
+    }
+
+    #[test]
+    fn file_information_classes_describe_a_real_file() {
+        let (mut fx, mut c, tid) = connected();
+        let fid = open_ok(
+            &mut fx,
+            &mut c,
+            tid,
+            "dir_file.txt",
+            RW,
+            disposition::CREATE,
+            OPT_FILE,
+        );
+        write_at(&mut fx, &mut c, tid, fid, 0, &[1u8; 5000]);
+        for (class, size) in [
+            (4u8, 40usize),
+            (5, 24),
+            (6, 8),
+            (7, 4),
+            (8, 4),
+            (14, 8),
+            (16, 4),
+            (17, 4),
+            (34, 56),
+            (35, 8),
+        ] {
+            assert_eq!(
+                query_file_info(&mut fx, &mut c, tid, fid, class).len(),
+                size,
+                "class {class}"
+            );
+        }
+        let std = query_file_info(&mut fx, &mut c, tid, fid, 5);
+        assert_eq!(u64::from_le_bytes(std[0..8].try_into().unwrap()), 8192);
+        assert_eq!(u64::from_le_bytes(std[8..16].try_into().unwrap()), 5000);
+        assert_eq!(std[21], 0, "not a directory");
+        let all = query_file_info(&mut fx, &mut c, tid, fid, 18);
+        let name_len = u32::from_le_bytes(all[96..100].try_into().unwrap()) as usize;
+        assert_eq!(name_len, "\\dir_file.txt".len() * 2);
+        assert_eq!(all.len(), 100 + name_len);
+        assert_eq!(
+            query_file_info(&mut fx, &mut c, tid, fid, 22).len(),
+            24 + 14,
+            "streams"
+        );
+        let basic = query_file_info(&mut fx, &mut c, tid, fid, 4);
+        assert_eq!(
+            u32::from_le_bytes(basic[32..36].try_into().unwrap()),
+            0x20,
+            "ARCHIVE"
+        );
+        // unknown class and a too small buffer
+        let r = call(
+            &mut fx,
+            &mut c,
+            tid,
+            Command::QueryInfo,
+            &query_info_body(1, 99, 4096, fid),
+        );
+        assert_eq!(r.status(), status::INVALID_INFO_CLASS);
+        let r = call(
+            &mut fx,
+            &mut c,
+            tid,
+            Command::QueryInfo,
+            &query_info_body(1, 18, 10, fid),
+        );
+        assert_eq!(r.status(), status::INFO_LENGTH_MISMATCH);
+    }
+
+    #[test]
+    fn close_can_return_the_final_attributes() {
+        let (mut fx, mut c, tid) = connected();
+        let fid = open_ok(&mut fx, &mut c, tid, "f", RW, disposition::CREATE, OPT_FILE);
+        write_at(&mut fx, &mut c, tid, fid, 0, b"12345678");
+        let r = call(&mut fx, &mut c, tid, Command::Close, &close_body_ex(fid, 1));
+        assert_eq!(r.status(), status::SUCCESS);
+        let b = &r.message.body;
+        assert_eq!(u16::from_le_bytes([b[2], b[3]]), 1, "flags echoed");
+        assert_eq!(u64::from_le_bytes(b[48..56].try_into().unwrap()), 8);
+        assert_ne!(u64::from_le_bytes(b[8..16].try_into().unwrap()), 0);
+    }
+
+    #[test]
+    fn volume_numbers_follow_the_backend_usage() {
+        let (mut fx, mut c, tid) = connected();
+        let fid = open_ok(&mut fx, &mut c, tid, "f", RW, disposition::CREATE, OPT_FILE);
+        write_at(&mut fx, &mut c, tid, fid, 0, &vec![1u8; 40960]);
+        let r = call(
+            &mut fx,
+            &mut c,
+            tid,
+            Command::QueryInfo,
+            &query_info_body(2, 3, 4096, fid),
+        );
+        let d = &r.message.body[8..];
+        let total = u64::from_le_bytes(d[0..8].try_into().unwrap());
+        let free = u64::from_le_bytes(d[8..16].try_into().unwrap());
+        assert_eq!(total, (1u64 << 40) / 4096);
+        assert_eq!(total - free, 10, "ten 4 KiB units used");
+    }
+
+    #[test]
+    fn paths_that_climb_out_of_the_share_are_refused() {
+        let (mut fx, mut c, tid) = connected();
+        for p in ["..\\escape", "a\\..\\..\\escape", "..", "d\\.\\x"] {
+            let r = open_obj(&mut fx, &mut c, tid, p, RW, disposition::CREATE, OPT_FILE);
+            assert_eq!(r.status(), status::ACCESS_DENIED, "{p}");
+        }
+        assert!(!fx.dir.0.parent().unwrap().join("escape").exists());
+    }
+
+    #[test]
+    fn macos_style_compound_create_write_flush_close_works() {
+        let (mut fx, mut c, tid) = connected();
+        let sid = c.session_id;
+        let rel = flags::RELATED_OPERATIONS;
+        let chain = signed_chain(
+            &mut c,
+            &[
+                (
+                    Command::Create,
+                    create_body_ex("note.txt", RW, 0x80, disposition::CREATE, OPT_FILE, false),
+                    0,
+                    sid,
+                    tid,
+                ),
+                (
+                    Command::Write,
+                    write_body(RELATED, 0, b"compound", 0),
+                    rel,
+                    u64::MAX,
+                    u32::MAX,
+                ),
+                (
+                    Command::Flush,
+                    flush_body(RELATED, false),
+                    rel,
+                    u64::MAX,
+                    u32::MAX,
+                ),
+                (Command::Close, close_body(RELATED), rel, u64::MAX, u32::MAX),
+            ],
+        );
+        let resp = fx.send(&chain).unwrap();
+        assert_eq!(statuses(&resp), vec![status::SUCCESS; 4]);
+        for p in split_compound(&resp) {
+            assert!(c.verify_response(p));
+        }
+        assert_eq!(
+            std::fs::read(fx.dir.0.join("note.txt")).unwrap(),
+            b"compound"
+        );
+        assert!(fx.conn.sessions[&c.session_id].opens.is_empty());
+    }
+
+    #[test]
+    fn commands_on_a_missing_tree_are_network_name_deleted() {
+        let (mut fx, mut c, _tid) = connected();
+        let r = call(
+            &mut fx,
+            &mut c,
+            77,
+            Command::Read,
+            &read_body([1; 16], 1, 0),
+        );
+        assert_eq!(r.status(), status::NETWORK_NAME_DELETED);
+        let r = call(
+            &mut fx,
+            &mut c,
+            77,
+            Command::SetInfo,
+            &set_info_body(20, [1; 16], &eof_info(0)),
+        );
+        assert_eq!(r.status(), status::NETWORK_NAME_DELETED);
+    }
+
+    #[test]
+    fn failed_query_directory_in_a_chain_does_not_stop_the_close() {
+        let (mut fx, mut c, tid) = connected();
+        let sid = c.session_id;
+        let rel = flags::RELATED_OPERATIONS;
+        let chain = signed_chain(
+            &mut c,
+            &[
+                (
+                    Command::Create,
+                    create_body_ex("", RO, 0x80, disposition::OPEN, OPT_DIR, false),
+                    0,
+                    sid,
+                    tid,
+                ),
+                (
+                    Command::QueryDirectory,
+                    query_directory_body_ex(RELATED, 37, 1, "nothing*", 4096),
+                    rel,
+                    u64::MAX,
+                    u32::MAX,
+                ),
+                (Command::Close, close_body(RELATED), rel, u64::MAX, u32::MAX),
+            ],
+        );
+        let resp = fx.send(&chain).unwrap();
+        assert_eq!(
+            statuses(&resp),
+            [status::SUCCESS, status::NO_SUCH_FILE, status::SUCCESS]
+        );
+        assert!(fx.conn.sessions[&c.session_id].opens.is_empty(), "no leak");
+
+        // a failed SET_INFO (non-empty directory) is handled the same way
+        let d = open_ok(&mut fx, &mut c, tid, "d", RW, disposition::CREATE, OPT_DIR);
+        let f = open_ok(
+            &mut fx,
+            &mut c,
+            tid,
+            "d\\f",
+            RW,
+            disposition::CREATE,
+            OPT_FILE,
+        );
+        close_fid(&mut fx, &mut c, tid, f);
+        close_fid(&mut fx, &mut c, tid, d);
+        let chain = signed_chain(
+            &mut c,
+            &[
+                (
+                    Command::Create,
+                    create_body_ex("d", RW, 0x10, disposition::OPEN, OPT_DIR, false),
+                    0,
+                    sid,
+                    tid,
+                ),
+                (
+                    Command::SetInfo,
+                    set_info_body(13, RELATED, &disposition_info(true)),
+                    rel,
+                    u64::MAX,
+                    u32::MAX,
+                ),
+                (Command::Close, close_body(RELATED), rel, u64::MAX, u32::MAX),
+            ],
+        );
+        let resp = fx.send(&chain).unwrap();
+        assert_eq!(
+            statuses(&resp),
+            [
+                status::SUCCESS,
+                status::DIRECTORY_NOT_EMPTY,
+                status::SUCCESS
+            ]
+        );
+        assert!(fx.conn.sessions[&c.session_id].opens.is_empty());
+        assert!(fx.dir.0.join("d/f").exists());
+    }
+
+    #[test]
+    fn ioctl_is_not_supported() {
+        let (mut fx, mut c, tid) = connected();
+        let r = call(&mut fx, &mut c, tid, Command::Ioctl, &[57, 0, 0, 0]);
+        assert_eq!(r.status(), status::NOT_SUPPORTED);
     }
 }

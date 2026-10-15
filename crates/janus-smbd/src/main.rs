@@ -24,6 +24,7 @@ use std::sync::Arc;
 
 use janus_lib::control::{ControlService, DaemonState, WriteGate};
 use janus_lib::credentials::CredentialStore;
+use janus_lib::vfs::LocalFsBackend;
 use janus_proto::v1::smb_front_control_server::SmbFrontControlServer;
 use smb_core::server::{DevServer, ServerConfig};
 use tokio::sync::Mutex;
@@ -39,6 +40,8 @@ const SMB_PORT: u16 = 4445;
 /// Overrides for dev setups and tests.
 const CONTROL_ADDR_ENV: &str = "JANUS_CLIENT_ADDR";
 const SMB_ADDR_ENV: &str = "JANUS_SMB_ADDR";
+/// Directory served by the local backend (dev, until the gRPC backend lands in J3).
+const LOCAL_ROOT_ENV: &str = "JANUS_SMB_LOCAL_ROOT";
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -71,6 +74,7 @@ fn print_usage() {
          janus-cli client configure --endpoint <host:port> --client-cert <pem> \\\n    \
          --client-key <pem> --ca <pem> [--share <name>] [--port <n>]\n\n\
          Address overrides (dev): {CONTROL_ADDR_ENV}, {SMB_ADDR_ENV}.\n\
+         Share directory (dev): {LOCAL_ROOT_ENV} (default: <tmp>/janus-dev-share).\n\
          SMB user: JANUS_SMB_USER/JANUS_SMB_PASSWORD or the JANUS_SMB_CREDS_FILE file."
     );
 }
@@ -132,10 +136,28 @@ fn run(dev: bool) {
         if dev {
             eprintln!("janus-smbd: dev mode; configure with: janus-cli client configure …");
         }
+        let local_root = std::env::var_os(LOCAL_ROOT_ENV)
+            .map(std::path::PathBuf::from)
+            .unwrap_or_else(|| std::env::temp_dir().join("janus-dev-share"));
+        let backend = match LocalFsBackend::new(&local_root) {
+            Ok(b) => Arc::new(b),
+            Err(e) => {
+                eprintln!(
+                    "janus-smbd: cannot use {} as the share directory: {e}",
+                    local_root.display()
+                );
+                std::process::exit(1);
+            }
+        };
+        eprintln!(
+            "janus-smbd: share directory {} (override with {LOCAL_ROOT_ENV})",
+            local_root.display()
+        );
         let smb_server = Arc::new(DevServer::new(
             ServerConfig::default(),
             Arc::clone(&state),
             Arc::clone(&credentials),
+            backend,
         ));
         let smb = tokio::spawn(async move { smb_server.serve(smb_listener).await });
 

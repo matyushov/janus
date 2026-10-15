@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use janus_lib::control::DaemonState;
 use janus_lib::credentials::CredentialStore;
+use janus_lib::vfs::LocalFsBackend;
 use smb_core::server::{DevServer, ServerConfig};
 use smb_core::transport::{read_message, write_message};
 use smb_wire::Command;
@@ -21,6 +22,17 @@ const USER: &str = "janus";
 const PASSWORD: &str = "integration-test-password";
 
 async fn start_server() -> std::net::SocketAddr {
+    start_server_in(&scratch_dir("handshake")).await
+}
+
+/// A fresh scratch directory (left to the OS temp cleaner).
+fn scratch_dir(tag: &str) -> std::path::PathBuf {
+    let mut r = [0u8; 8];
+    getrandom::fill(&mut r).unwrap();
+    std::env::temp_dir().join(format!("janus-{tag}-{}", u64::from_le_bytes(r)))
+}
+
+async fn start_server_in(root: &std::path::Path) -> std::net::SocketAddr {
     let creds = Arc::new(CredentialStore::load(
         Some(USER.into()),
         Some(PASSWORD.into()),
@@ -30,6 +42,7 @@ async fn start_server() -> std::net::SocketAddr {
         ServerConfig::default(),
         Arc::new(Mutex::new(DaemonState::default())),
         creds,
+        Arc::new(LocalFsBackend::new(root).unwrap()),
     ));
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();

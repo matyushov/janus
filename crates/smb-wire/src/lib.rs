@@ -19,6 +19,9 @@ pub mod error;
 pub mod fileinfo;
 pub mod frame;
 pub mod header;
+pub mod io;
+#[cfg(test)]
+mod macos_vectors;
 pub mod messages;
 /// Published Microsoft test vectors (for the smb-wire and smb-core tests).
 #[doc(hidden)]

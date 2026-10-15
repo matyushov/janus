@@ -15,6 +15,8 @@ pub mod config;
 pub mod control;
 pub mod credentials;
 pub mod journal;
+#[cfg(feature = "backend-local")]
+pub mod local_backend;
 pub mod model;
 pub mod observability;
 pub mod profile;

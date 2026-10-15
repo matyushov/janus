@@ -246,6 +246,18 @@ pub fn tree_connect_body(path: &str) -> Vec<u8> {
 
 /// CREATE body: path, disposition, options, optionally the MxAc context.
 pub fn create_body(path: &str, disposition: u32, options: u32, mxac: bool) -> Vec<u8> {
+    create_body_ex(path, 0x0010_0080, 0x10, disposition, options, mxac)
+}
+
+/// CREATE body with explicit access mask and file attributes.
+pub fn create_body_ex(
+    path: &str,
+    access: u32,
+    attributes: u32,
+    disposition: u32,
+    options: u32,
+    mxac: bool,
+) -> Vec<u8> {
     let name = utf16le(path);
     let mut w = Writer::new();
     w.u16(57);
@@ -253,8 +265,8 @@ pub fn create_body(path: &str, disposition: u32, options: u32, mxac: bool) -> Ve
     w.u8(0);
     w.u32(2); // Impersonation
     w.zeros(16);
-    w.u32(0x0010_0080); // DesiredAccess
-    w.u32(0x10);
+    w.u32(access); // DesiredAccess
+    w.u32(attributes);
     w.u32(7);
     w.u32(disposition);
     w.u32(options);
@@ -283,6 +295,100 @@ pub fn create_body(path: &str, disposition: u32, options: u32, mxac: bool) -> Ve
     w.into_vec()
 }
 
+/// READ body (no channel).
+pub fn read_body(file_id: [u8; 16], length: u32, offset: u64) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.u16(49);
+    w.u8(0x50);
+    w.u8(0);
+    w.u32(length);
+    w.u64(offset);
+    w.bytes(&file_id);
+    w.u32(0); // MinimumCount
+    w.u32(0); // Channel
+    w.u32(0); // RemainingBytes
+    w.u16(0);
+    w.u16(0);
+    w.u8(0); // Buffer
+    w.into_vec()
+}
+
+/// WRITE body; data right after the 48 fixed bytes (offset 112).
+pub fn write_body(file_id: [u8; 16], offset: u64, data: &[u8], write_flags: u32) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.u16(49);
+    w.u16(112);
+    w.u32(data.len() as u32);
+    w.u64(offset);
+    w.bytes(&file_id);
+    w.u32(0); // Channel
+    w.u32(0); // RemainingBytes
+    w.u16(0);
+    w.u16(0);
+    w.u32(write_flags);
+    w.bytes(data);
+    w.into_vec()
+}
+
+/// FLUSH body; `fullfsync` sets Apple's Reserved1 = 0xFFFF.
+pub fn flush_body(file_id: [u8; 16], fullfsync: bool) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.u16(24);
+    w.u16(if fullfsync { 0xFFFF } else { 0 });
+    w.u32(0);
+    w.bytes(&file_id);
+    w.into_vec()
+}
+
+/// SET_INFO body for InfoType FILE.
+pub fn set_info_body(class: u8, file_id: [u8; 16], buffer: &[u8]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.u16(33);
+    w.u8(0x01);
+    w.u8(class);
+    w.u32(buffer.len() as u32);
+    w.u16(96);
+    w.u16(0);
+    w.u32(0);
+    w.bytes(&file_id);
+    w.bytes(buffer);
+    w.into_vec()
+}
+
+/// FileRenameInformation payload (class 10).
+pub fn rename_info(target: &str, replace: bool) -> Vec<u8> {
+    let name = utf16le(target);
+    let mut w = Writer::new();
+    w.u8(replace as u8);
+    w.zeros(7);
+    w.u64(0);
+    w.u32(name.len() as u32);
+    w.bytes(&name);
+    w.into_vec()
+}
+
+/// FileEndOfFileInformation payload (class 20).
+pub fn eof_info(len: u64) -> Vec<u8> {
+    len.to_le_bytes().to_vec()
+}
+
+/// FileDispositionInformation payload (class 13).
+pub fn disposition_info(delete: bool) -> Vec<u8> {
+    vec![delete as u8]
+}
+
+/// FileBasicInformation payload (class 4): only access and write times are set.
+pub fn basic_info(accessed: u64, written: u64) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.u64(0);
+    w.u64(accessed);
+    w.u64(written);
+    w.u64(0);
+    w.u32(0);
+    w.u32(0);
+    w.into_vec()
+}
+
 pub fn query_info_body(info_type: u8, class: u8, out_len: u32, file_id: [u8; 16]) -> Vec<u8> {
     let mut w = Writer::new();
     w.u16(41);
@@ -299,26 +405,86 @@ pub fn query_info_body(info_type: u8, class: u8, out_len: u32, file_id: [u8; 16]
 }
 
 pub fn close_body(file_id: [u8; 16]) -> Vec<u8> {
+    close_body_ex(file_id, 0)
+}
+
+/// CLOSE body with flags (1 = return attributes).
+pub fn close_body_ex(file_id: [u8; 16], flags: u16) -> Vec<u8> {
     let mut w = Writer::new();
     w.u16(24);
-    w.u16(0);
+    w.u16(flags);
     w.u32(0);
     w.bytes(&file_id);
     w.into_vec()
 }
 
 pub fn query_directory_body(file_id: [u8; 16]) -> Vec<u8> {
+    query_directory_body_ex(file_id, 1, 0, "*", 65536)
+}
+
+/// QUERY_DIRECTORY body.
+pub fn query_directory_body_ex(
+    file_id: [u8; 16],
+    class: u8,
+    flags: u8,
+    pattern: &str,
+    out_len: u32,
+) -> Vec<u8> {
+    let p = utf16le(pattern);
     let mut w = Writer::new();
     w.u16(33);
-    w.u8(1); // FileDirectoryInformation
-    w.u8(0);
+    w.u8(class);
+    w.u8(flags);
     w.u32(0);
     w.bytes(&file_id);
     w.u16(96);
-    w.u16(2);
-    w.u32(65536);
-    w.bytes(&utf16le("*"));
+    w.u16(p.len() as u16);
+    w.u32(out_len);
+    w.bytes(&p);
     w.into_vec()
+}
+
+/// Names from a QUERY_DIRECTORY reply body of the given FileInformationClass.
+pub fn dir_entry_names(body: &[u8], class: u8) -> Vec<String> {
+    let len = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
+    let buf = &body[8..8 + len];
+    let (len_at, name_at) = match class {
+        1 => (60, 64),
+        2 => (60, 68),
+        3 => (60, 94),
+        12 => (8, 12),
+        37 => (60, 104),
+        38 => (60, 80),
+        _ => panic!("not a directory class"),
+    };
+    let mut out = Vec::new();
+    let mut at = 0usize;
+    loop {
+        let e = &buf[at..];
+        let nl = u32::from_le_bytes(e[len_at..len_at + 4].try_into().unwrap()) as usize;
+        let next = u32::from_le_bytes(e[0..4].try_into().unwrap()) as usize;
+        let units: Vec<u16> = e[name_at..name_at + nl]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect();
+        out.push(String::from_utf16(&units).unwrap());
+        if next == 0 {
+            return out;
+        }
+        at += next;
+    }
+}
+
+/// FileId from a CREATE reply body.
+pub fn create_reply_file_id(body: &[u8]) -> [u8; 16] {
+    body[64..80].try_into().unwrap()
+}
+
+/// Data from a READ reply body.
+pub fn read_reply_data(body: &[u8]) -> Vec<u8> {
+    let len = u32::from_le_bytes(body[4..8].try_into().unwrap()) as usize;
+    let off = body[2] as usize - 64;
+    body[off..off + len].to_vec()
 }
 
 pub fn simple_body() -> Vec<u8> {

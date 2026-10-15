@@ -6,6 +6,8 @@
 use std::collections::HashMap;
 use std::time::Instant;
 
+use janus_lib::vfs::BackendHandle;
+use smb_wire::fileinfo::DirEntry;
 use smb_wire::ntlm::NtlmServer;
 
 /// Unfinished authentication (between the first SESSION_SETUP and AUTHENTICATE).
@@ -29,17 +31,34 @@ pub struct Session {
     pub session_id: u64,
     pub state: SessionState,
     pub trees: HashMap<u32, TreeConnect>,
-    /// Open objects keyed by the volatile part of the FileId. Only the share root for now.
-    pub opens: HashMap<u64, OpenRoot>,
+    /// Open objects keyed by the volatile part of the FileId.
+    pub opens: HashMap<u64, Open>,
     next_tree_id: u32,
     next_file_id: u64,
 }
 
-/// The open share root directory (virtual and empty until there is a file model, J2).
-pub struct OpenRoot {
+/// An open file or directory (the SMB side of a backend handle).
+pub struct Open {
     pub tree_id: u32,
-    /// The (empty) listing has already been returned; afterwards `STATUS_NO_MORE_FILES`.
-    pub enumerated: bool,
+    /// Path relative to the share root, `/`-separated (empty for the root).
+    pub rel_path: String,
+    pub handle: BackendHandle,
+    pub directory: bool,
+    /// Granted access with generic bits expanded.
+    pub access: u32,
+    /// Delete-on-close is set (CREATE option or FileDispositionInformation).
+    pub delete_pending: bool,
+    /// Directory enumeration state (QUERY_DIRECTORY).
+    pub scan: Option<DirScan>,
+}
+
+/// A directory listing snapshotted when the enumeration starts: the client sees a stable
+/// view even while files are created, and the backend is asked once per scan.
+pub struct DirScan {
+    pub entries: Vec<DirEntry>,
+    pub pos: usize,
+    /// At least one entry has been returned in this scan (decides NO_SUCH_FILE vs NO_MORE_FILES).
+    pub returned: bool,
 }
 
 impl Session {
@@ -78,41 +97,54 @@ impl Session {
 }
 
 impl Session {
-    /// Open the share root on tree `tree_id`; FileId = (persistent, volatile) with the same number.
-    pub fn open_root(&mut self, tree_id: u32) -> [u8; 16] {
+    /// Register an open; FileId = (persistent, volatile) with the same number.
+    pub fn add_open(&mut self, open: Open) -> [u8; 16] {
         let id = self.next_file_id;
         self.next_file_id += 1;
-        self.opens.insert(
-            id,
-            OpenRoot {
-                tree_id,
-                enumerated: false,
-            },
-        );
+        self.opens.insert(id, open);
         let mut file_id = [0u8; 16];
         file_id[..8].copy_from_slice(&id.to_le_bytes());
         file_id[8..].copy_from_slice(&id.to_le_bytes());
         file_id
     }
 
-    /// Find an open object by FileId on the given tree.
-    pub fn open_mut(&mut self, file_id: &[u8; 16], tree_id: u32) -> Option<&mut OpenRoot> {
+    fn open_key(file_id: &[u8; 16]) -> Option<u64> {
         let persistent = u64::from_le_bytes(file_id[..8].try_into().expect("8 bytes"));
         let volatile = u64::from_le_bytes(file_id[8..].try_into().expect("8 bytes"));
-        if persistent != volatile {
-            return None;
-        }
-        self.opens
-            .get_mut(&volatile)
-            .filter(|o| o.tree_id == tree_id)
+        (persistent == volatile).then_some(volatile)
     }
 
-    pub fn close(&mut self, file_id: &[u8; 16], tree_id: u32) -> bool {
-        if self.open_mut(file_id, tree_id).is_none() {
-            return false;
+    /// Find an open object by FileId on the given tree.
+    pub fn open_mut(&mut self, file_id: &[u8; 16], tree_id: u32) -> Option<&mut Open> {
+        let key = Self::open_key(file_id)?;
+        self.opens.get_mut(&key).filter(|o| o.tree_id == tree_id)
+    }
+
+    /// Remove an open from the table (the caller closes the backend handle).
+    pub fn take_open(&mut self, file_id: &[u8; 16], tree_id: u32) -> Option<Open> {
+        let key = Self::open_key(file_id)?;
+        if self.opens.get(&key)?.tree_id != tree_id {
+            return None;
         }
-        let volatile = u64::from_le_bytes(file_id[8..].try_into().expect("8 bytes"));
-        self.opens.remove(&volatile).is_some()
+        self.opens.remove(&key)
+    }
+
+    /// Remove all opens of a tree (TREE_DISCONNECT).
+    pub fn take_tree_opens(&mut self, tree_id: u32) -> Vec<Open> {
+        let keys: Vec<u64> = self
+            .opens
+            .iter()
+            .filter(|(_, o)| o.tree_id == tree_id)
+            .map(|(k, _)| *k)
+            .collect();
+        keys.into_iter()
+            .filter_map(|k| self.opens.remove(&k))
+            .collect()
+    }
+
+    /// Remove every open (LOGOFF, connection drop).
+    pub fn take_all_opens(&mut self) -> Vec<Open> {
+        self.opens.drain().map(|(_, o)| o).collect()
     }
 }
 

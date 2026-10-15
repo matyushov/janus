@@ -8,8 +8,9 @@
 //!
 //! Design: README.md (Architecture), §2.2–2.4.
 //!
-//! Implementation status (MILESTONE 1/J1): transport → dispatch → conn/session: NEGOTIATE 3.1.1,
-//! SESSION_SETUP (NTLMv2, signing), TREE_CONNECT/DISCONNECT, LOGOFF, ECHO.
+//! Implementation status (J1/J2): transport → dispatch → conn/session: NEGOTIATE 3.1.1,
+//! SESSION_SETUP (NTLMv2, signing), TREE_CONNECT/DISCONNECT, LOGOFF, ECHO, and the file model
+//! (`files`: CREATE/CLOSE/READ/WRITE/FLUSH/QUERY_INFO/QUERY_DIRECTORY/SET_INFO) on a backend.
 //! Modules of the full architecture (`shared`/`handle`/`lease`/`apple`) are a typed groundwork
 //! for UPGRADE, enabled as commands get implemented.
 
@@ -17,6 +18,7 @@
 
 pub mod conn;
 pub mod dispatch;
+pub mod files;
 pub mod server;
 pub mod session;
 pub mod transport;

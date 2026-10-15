@@ -17,6 +17,7 @@ use std::time::Instant;
 use janus_lib::control::DaemonState;
 use janus_lib::credentials::CredentialStore;
 use janus_lib::profile::ClientProfile;
+use janus_lib::vfs::StorageBackend;
 use smb_wire::messages::filetime_now;
 use smb_wire::ntlm::Credentials;
 use tokio::net::{TcpListener, TcpStream};
@@ -54,8 +55,10 @@ impl Default for ServerConfig {
     }
 }
 
-pub struct DevServer {
+pub struct DevServer<B: StorageBackend> {
     config: Arc<ServerConfig>,
+    /// Storage behind the share.
+    backend: Arc<B>,
     /// Share configuration (name, profile) from the control plane.
     daemon: Arc<Mutex<DaemonState>>,
     credentials: Arc<CredentialStore>,
@@ -67,14 +70,16 @@ pub struct DevServer {
     started_filetime: u64,
 }
 
-impl DevServer {
+impl<B: StorageBackend> DevServer<B> {
     pub fn new(
         config: ServerConfig,
         daemon: Arc<Mutex<DaemonState>>,
         credentials: Arc<CredentialStore>,
+        backend: Arc<B>,
     ) -> Self {
         DevServer {
             config: Arc::new(config),
+            backend,
             daemon,
             credentials,
             next_conn: AtomicU64::new(1),
@@ -109,11 +114,23 @@ impl DevServer {
     async fn serve_conn(&self, mut stream: TcpStream, conn_id: ConnId) -> std::io::Result<()> {
         let mut conn = ConnState::default();
         eprintln!("janus: conn {conn_id:?} established");
+        let result = self.conn_loop(&mut stream, &mut conn, conn_id).await;
+        // Whatever ended the connection, release the backend handles it still holds.
+        Dispatcher::cleanup(&mut conn, &*self.backend).await;
+        eprintln!("janus: conn {conn_id:?} closed");
+        result
+    }
 
+    async fn conn_loop(
+        &self,
+        stream: &mut TcpStream,
+        conn: &mut ConnState,
+        conn_id: ConnId,
+    ) -> std::io::Result<()> {
         loop {
             // While authentication is in progress, wait for the next packet only for a bounded time.
             let next = if conn.has_pending_auth() {
-                match tokio::time::timeout(AUTH_TIMEOUT, read_message(&mut stream)).await {
+                match tokio::time::timeout(AUTH_TIMEOUT, read_message(stream)).await {
                     Ok(r) => r?,
                     Err(_) => {
                         eprintln!("janus: conn {conn_id:?} auth timeout; closing");
@@ -121,7 +138,7 @@ impl DevServer {
                     }
                 }
             } else {
-                read_message(&mut stream).await?
+                read_message(stream).await?
             };
             let Some(raw) = next else { break };
 
@@ -167,7 +184,7 @@ impl DevServer {
                 random: system_random,
             };
 
-            let result = Dispatcher::handle(&raw, &mut conn, &ctx);
+            let result = Dispatcher::handle(&raw, conn, &ctx, &*self.backend).await;
             if self.trace > 0 {
                 trace_exchange(conn_id, &raw, &result);
             }
@@ -176,7 +193,7 @@ impl DevServer {
                 eprintln!("janus: conn {conn_id:?} raw → {hex}");
             }
             match result {
-                Ok(Reply::Now(bytes)) => write_message(&mut stream, &bytes).await?,
+                Ok(Reply::Now(bytes)) => write_message(stream, &bytes).await?,
                 Ok(Reply::None) => {}
                 Ok(Reply::Async { .. }) => {
                     // UPGRADE: the interim STATUS_PENDING has already been sent, the final reply comes later.
@@ -191,7 +208,6 @@ impl DevServer {
                 break;
             }
         }
-        eprintln!("janus: conn {conn_id:?} closed");
         Ok(())
     }
 }

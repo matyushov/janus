@@ -1,9 +1,11 @@
 # smb-core
 
-The janus SMB server core. State as of J1: **SMB 3.1.1 (the only dialect), SESSION_SETUP
+The janus SMB server core. State as of J2: **SMB 3.1.1 (the only dialect), SESSION_SETUP
 (SPNEGO/NTLMv2), mandatory AES-128-CMAC signing, TREE_CONNECT / TREE_DISCONNECT /
-LOGOFF / ECHO, credits**, plus a virtual empty share root so that macOS can mount the share.
-File commands (READ/WRITE/…) return a signed `STATUS_NOT_IMPLEMENTED`; the file model is J2.
+LOGOFF / ECHO, credits**, and the **file model** on top of `janus_lib::vfs::StorageBackend`:
+CREATE (files and directories, all dispositions), CLOSE, READ, WRITE, FLUSH, QUERY_INFO,
+QUERY_DIRECTORY and SET_INFO. LOCK, CHANGE_NOTIFY, CANCEL and OPLOCK_BREAK return a signed
+`STATUS_NOT_IMPLEMENTED`, IOCTL `STATUS_NOT_SUPPORTED`.
 
 ## Guarantees
 
@@ -64,19 +66,36 @@ JANUS_CLIENT_ADDR=127.0.0.1:50061 target/debug/janus-cli client shutdown
 the request hex. If the client drops the connection, use
 `sudo tcpdump -i lo0 port 4445 -w janus.pcap` and Wireshark.
 
+The share directory of `janus-smbd` is `JANUS_SMB_LOCAL_ROOT` (default
+`<tmp>/janus-dev-share`) until the gRPC backend lands in J3.
+
 Result (macOS, `mount_smbfs`): SMB1 wildcard → NEGOTIATE 3.1.1 → NTLMv2 (with MIC) →
-signed TREE_CONNECT → a compound CREATE(root) + QUERY_INFO + CLOSE → **the mount succeeds**:
-`mount` shows `//janus@127.0.0.1:4445/backup (smbfs…)`, `smbutil statshares -a` shows
+signed TREE_CONNECT → **the mount succeeds**: `smbutil statshares -a` shows
 `SMB_VERSION SMB_3.1.1`, `SMB_CURR_SIGN_ALGORITHM AES_128_CMAC`, `SMB_CURR_ENCRYPT_ALGORITHM
-OFF`, and `df` shows 1.0 TiB (the share quota, 1 TiB by default). `ls` gives an empty
-directory, `touch` gives "Operation not supported" (the file model is J2).
+OFF`, and `df` shows the share quota (1 TiB by default). `touch`, `echo > f`, `cp` in both
+directions, `mv`, `mkdir`, `rm` and `rm -r` work; a 5 MB file copied onto the share and back
+has the same SHA-256 on the client, in the mount and in the share directory.
 
-## Virtual root (J1-lite)
+## File model (J2)
 
-So that a client can mount the share, only its root is served, as an empty directory:
-CREATE of the empty path (OPEN/OPEN_IF; the MxAc context), QUERY_INFO
-(FileFs{Volume,Size,Device,Attribute,FullSize}, File{Basic,Standard,Internal,All,NetworkOpen}),
-QUERY_DIRECTORY (`NO_SUCH_FILE`, then `NO_MORE_FILES`) and CLOSE; related operations in a
-compound inherit the FileId and the error of the previous one. CREATE of any other path:
-OPEN → `OBJECT_NAME_NOT_FOUND`, creation → `NOT_IMPLEMENTED`; READ/WRITE/FLUSH/IOCTL/… →
-`NOT_IMPLEMENTED`.
+- `files.rs` holds one handler per command; `dispatch.rs` decodes, resolves the FileId
+  (related compound operations inherit the FileId of the CREATE) and signs the reply. The
+  dispatcher is generic over `B: StorageBackend` and `async`; the tests drive it without sockets.
+- Opens live in the session table (`session::Open`); the SMB FileId is `(n, n)`. TREE_DISCONNECT,
+  LOGOFF and the end of the TCP connection close every backend handle that is still open, so a
+  delete-on-close file does not outlive a dead client.
+- QUERY_DIRECTORY snapshots the listing when the scan starts (`.` and `..` first), filters it
+  with the SMB wildcard rules (`*`, `?`, and the DOS `<` `>` `"`; case-sensitivity from
+  `CompatCaps`), and returns as many entries as fit the client's buffer. Classes: Directory,
+  FullDirectory, BothDirectory, Names, IdBothDirectory, IdFullDirectory.
+- Only a failed CREATE poisons the rest of a related chain (MS-SMB2 §3.3.5.2.7.2); a failed
+  QUERY_DIRECTORY or SET_INFO still lets the trailing CLOSE run.
+- Backend errors map to NTSTATUS in `files::status_of`; `NoSpace` → `STATUS_DISK_FULL`.
+- FileFsSizeInformation comes from `StorageBackend::statfs` (quota and usage).
+- READ/WRITE are limited to 64 KiB (no LARGE_MTU yet); the channel fields (RDMA) must be 0.
+
+Known gaps: no LOCK (macOS sends an exclusive whole-file `LOCK` with FAIL_IMMEDIATELY after
+every open; it copes with the error), no durable handles/leases/AAPL (J4), no
+`FileRenameInformationEx`, other opens under a renamed directory keep their old path, no
+STATUS_DELETE_PENDING for new opens of a file marked for deletion, SET_INFO of security and
+file attributes (read-only, hidden) is not applied.

@@ -7,6 +7,9 @@ pub struct CreateReq {
     /// Path relative to the share root, UTF-16 in the frame.
     pub path: String,
     pub desired_access: u32,
+    /// FileAttributes requested for a new object.
+    pub file_attributes: u32,
+    pub share_access: u32,
     pub create_disposition: u32,
     pub create_options: u32,
     pub contexts: Vec<CreateContext>,
@@ -85,8 +88,63 @@ pub mod disposition {
 pub const OPT_DIRECTORY_FILE: u32 = 0x0000_0001;
 /// FILE_ATTRIBUTE_DIRECTORY.
 pub const ATTR_DIRECTORY: u32 = 0x0000_0010;
-/// CreateAction: FILE_OPENED.
+/// CreateAction values (§2.2.14).
+pub const ACTION_SUPERSEDED: u32 = 0;
 pub const ACTION_OPENED: u32 = 1;
+pub const ACTION_CREATED: u32 = 2;
+pub const ACTION_OVERWRITTEN: u32 = 3;
+
+/// CreateOptions bits used by the file model.
+pub const OPT_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+pub const OPT_DELETE_ON_CLOSE: u32 = 0x0000_1000;
+
+/// FILE_ATTRIBUTE_* values.
+pub const ATTR_READONLY: u32 = 0x0000_0001;
+pub const ATTR_ARCHIVE: u32 = 0x0000_0020;
+pub const ATTR_NORMAL: u32 = 0x0000_0080;
+
+/// DesiredAccess bits (§2.2.13.1) that mean "will write file data".
+pub const ACCESS_WRITE_DATA: u32 = 0x0000_0002;
+pub const ACCESS_APPEND_DATA: u32 = 0x0000_0004;
+pub const ACCESS_DELETE: u32 = 0x0001_0000;
+pub const ACCESS_GENERIC_ALL: u32 = 0x1000_0000;
+pub const ACCESS_GENERIC_WRITE: u32 = 0x4000_0000;
+
+pub const ACCESS_MAXIMUM_ALLOWED: u32 = 0x0200_0000;
+pub const ACCESS_GENERIC_READ: u32 = 0x8000_0000;
+pub const ACCESS_GENERIC_EXECUTE: u32 = 0x2000_0000;
+pub const ACCESS_READ_DATA: u32 = 0x0000_0001;
+pub const ACCESS_EXECUTE: u32 = 0x0000_0020;
+
+/// Replace generic and MAXIMUM_ALLOWED bits with the specific rights they stand for
+/// (MS-SMB2 §2.2.13.1, generic mapping of files). The share grants everything.
+pub fn expand_access(desired: u32) -> u32 {
+    use crate::messages::ACCESS_ALL;
+    let mut a = desired & 0x01FF_FFFF;
+    if desired & (ACCESS_GENERIC_ALL | ACCESS_MAXIMUM_ALLOWED) != 0 {
+        return ACCESS_ALL;
+    }
+    if desired & ACCESS_GENERIC_READ != 0 {
+        a |= 0x0012_0089;
+    }
+    if desired & ACCESS_GENERIC_WRITE != 0 {
+        a |= 0x0012_0116;
+    }
+    if desired & ACCESS_GENERIC_EXECUTE != 0 {
+        a |= 0x0012_00A0;
+    }
+    a
+}
+
+/// Whether an (expanded) access mask allows writing file data.
+pub fn access_wants_write(access: u32) -> bool {
+    access & (ACCESS_WRITE_DATA | ACCESS_APPEND_DATA) != 0
+}
+
+/// Whether an (expanded) access mask allows reading file data.
+pub fn access_wants_read(access: u32) -> bool {
+    access & (ACCESS_READ_DATA | ACCESS_EXECUTE) != 0
+}
 
 /// FileId: persistent + volatile, 8 bytes each.
 pub type FileId = [u8; 16];
@@ -107,8 +165,8 @@ impl CreateReq {
         let _create_flags = r.u64()?;
         let _reserved = r.u64()?;
         let desired_access = r.u32()?;
-        let _file_attributes = r.u32()?;
-        let _share_access = r.u32()?;
+        let file_attributes = r.u32()?;
+        let share_access = r.u32()?;
         let create_disposition = r.u32()?;
         let create_options = r.u32()?;
         let name_off = r.u16()? as usize;
@@ -153,6 +211,8 @@ impl CreateReq {
         Ok(CreateReq {
             path,
             desired_access,
+            file_attributes,
+            share_access,
             create_disposition,
             create_options,
             contexts,
@@ -322,5 +382,19 @@ mod tests {
             u32::from_le_bytes(b[88 + 28..88 + 32].try_into().unwrap()),
             0x001F_01FF
         );
+    }
+
+    #[test]
+    fn access_expansion() {
+        use crate::messages::ACCESS_ALL;
+        assert_eq!(expand_access(ACCESS_GENERIC_ALL), ACCESS_ALL);
+        assert_eq!(expand_access(ACCESS_MAXIMUM_ALLOWED), ACCESS_ALL);
+        assert_eq!(expand_access(0x0012_0089), 0x0012_0089);
+        let r = expand_access(ACCESS_GENERIC_READ);
+        assert!(access_wants_read(r) && !access_wants_write(r));
+        let w = expand_access(ACCESS_GENERIC_WRITE);
+        assert!(access_wants_write(w) && !access_wants_read(w));
+        assert!(!access_wants_write(0x0000_0080)); // attributes only
+        assert_eq!(expand_access(ACCESS_DELETE) & ACCESS_DELETE, ACCESS_DELETE);
     }
 }

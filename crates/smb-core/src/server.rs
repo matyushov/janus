@@ -192,11 +192,6 @@ impl<B: StorageBackend> DevServer<B> {
                 let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
                 eprintln!("janus: conn {conn_id:?} raw → {hex}");
             }
-            // H1-EXPERIMENT: JANUS_SMB_DOWN_STATUS=DROP closes the connection without a reply.
-            if crate::files::take_drop_request() {
-                eprintln!("janus: conn {conn_id:?} H1 drop; closing");
-                break;
-            }
             match result {
                 Ok(Reply::Now(bytes)) => write_message(stream, &bytes).await?,
                 Ok(Reply::None) => {}

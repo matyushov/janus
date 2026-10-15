@@ -1,0 +1,50 @@
+[Unit]
+Description=janus SMB gateway (loopback SMB → backend)
+Documentation=https://github.com/amatyushov/janus
+After=network.target
+
+[Service]
+Type=exec
+User=janus
+Group=janus
+# The daemon takes no configuration parameters: the receiving server and share
+# parameters are set with `janus-cli client configure`. Only addresses are read from
+# the environment (JANUS_CLIENT_ADDR / JANUS_SMB_ADDR), usually the defaults.
+EnvironmentFile=-/etc/janus/smbd.env
+ExecStart=/usr/bin/janus-smbd
+Restart=on-failure
+RestartSec=2s
+
+# Port 445 is privileged. Two options:
+#  1) listen on a high port (the config default): no capability is needed;
+#  2) listen on 445: CAP_NET_BIND_SERVICE is needed (uncomment below).
+# AmbientCapabilities=CAP_NET_BIND_SERVICE
+# CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+# --- Permission hardening ---
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/janus
+StateDirectory=janus
+StateDirectoryMode=0700
+ConfigurationDirectory=janus
+ConfigurationDirectoryMode=0750
+RuntimeDirectory=janus
+RuntimeDirectoryMode=0750
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

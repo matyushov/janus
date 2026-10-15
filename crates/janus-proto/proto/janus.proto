@@ -1,0 +1,231 @@
+// The janus contract. Source: the design doc
+// .claude/ideas/macos-janus-smbd.md, Appendix A (the current version is there,
+// it is moved here as it stabilizes).
+//
+// Agreements:
+// 1) all writes are idempotent (offset-based): retries without deduplication;
+// 2) the machine's store is NOT addressed by the client: it is determined by the mTLS identity,
+//    requests carry only paths INSIDE the bundle;
+// 3) secrets are passed by reference (a Keychain ref), not by value.
+
+syntax = "proto3";
+package janus.v1;
+
+// ============================================================================
+// Service 1: BandTransport: janus-smbd (client, Mac) → janus-receiverd (server,
+// appliance). Channel: gRPC + mTLS over the network.
+// ============================================================================
+
+service BandTransport {
+  rpc Ping(PingRequest) returns (PingReply);
+  rpc StatFs(StatFsRequest) returns (StatFsReply);
+  rpc WriteRange(WriteRangeRequest) returns (WriteRangeReply);
+  rpc ReadRange(ReadRangeRequest) returns (ReadRangeReply);
+  rpc Fsync(FsyncRequest) returns (FsyncReply);
+  rpc BundleOp(BundleOpRequest) returns (BundleOpReply);
+}
+
+message FileRef { string rel_path = 1; }
+
+message PingRequest  { string client_version = 1; }
+message PingReply    { string server_version = 1; uint32 proto_rev = 2; }
+
+message StatFsRequest {}
+message StatFsReply {
+  uint64 quota_bytes = 1;
+  uint64 used_bytes  = 2;
+}
+
+message WriteRangeRequest {
+  FileRef file     = 1;
+  uint64  offset   = 2;
+  bytes   data     = 3; // <= 1 MiB per call
+  uint64  write_id = 4;
+}
+message WriteRangeReply { }
+
+message ReadRangeRequest { FileRef file = 1; uint64 offset = 2; uint32 length = 3; }
+message ReadRangeReply   { bytes data = 1; bool eof = 2; }
+
+message FsyncRequest {
+  oneof scope {
+    FileRef file       = 1;
+    bool    all_bundle = 2;
+  }
+}
+message FsyncReply { }
+
+message BundleOpRequest {
+  oneof op {
+    CreateOp   create   = 1;
+    DeleteOp   delete   = 2;
+    RenameOp   rename   = 3;
+    TruncateOp truncate = 4;
+    ListOp     list     = 5;
+    StatOp     stat     = 6;
+  }
+}
+message CreateOp   { FileRef file = 1; bool directory = 2; bool exclusive = 3; }
+message DeleteOp   { FileRef file = 1; }
+message RenameOp   { FileRef from = 1; FileRef to = 2; bool replace = 3; }
+message TruncateOp { FileRef file = 1; uint64 new_length = 2; }
+message ListOp     { string rel_dir = 1; }
+message StatOp     { FileRef file = 1; }
+
+message FileStat {
+  string rel_path      = 1;
+  uint64 size          = 2;
+  bool   directory     = 3;
+  int64  mtime_unix_ns = 4;
+}
+message DirListing { repeated FileStat entries = 1; }
+message BundleOpReply {
+  oneof result {
+    bool       ok      = 1;
+    DirListing listing = 2;
+    FileStat   stat    = 3;
+  }
+}
+
+// ============================================================================
+// Service 2: SmbFrontControl: the orchestrator agent (any gRPC client) → janus-smbd (server).
+// Channel: gRPC over the unix socket /var/run/janus/janus-smbd.sock (0600 root).
+// ============================================================================
+
+service SmbFrontControl {
+  rpc Configure(ConfigureRequest) returns (Ack);
+  rpc EnsureReady(Empty) returns (Readiness);
+  rpc Status(Empty) returns (StatusReply);
+  rpc Drain(DrainRequest) returns (DrainReply);
+  rpc Quiesce(Empty) returns (Ack);
+  rpc Resume(Empty) returns (Ack);
+  rpc WatchEvents(Empty) returns (stream Event);
+  rpc RotateCredentials(RotateRequest) returns (Ack);
+  rpc GetDiagnostics(Empty) returns (DiagnosticsBundle);
+  rpc Shutdown(ShutdownRequest) returns (Ack);
+}
+
+message Empty {}
+message Ack { bool ok = 1; string error = 2; }
+
+enum FlushPolicy {
+  FLUSH_POLICY_UNSPECIFIED = 0;
+  SYNC_THROUGH  = 1;
+  LOCAL_JOURNAL = 2;
+}
+
+// The client compatibility profile of the share. Determines name case semantics, AAPL,
+// POSIX extensions and behaviour on Windows metadata probes (see janus-lib::profile).
+enum ClientProfile {
+  CLIENT_PROFILE_UNSPECIFIED = 0;
+  TIME_MACHINE    = 1; // macOS backupd: case-sensitive, AAPL, F_FULLFSYNC
+  WINDOWS_GENERIC = 2; // case-insensitive, no AAPL, empty replies to ADS/SD probes
+  POSIX_GENERIC   = 3; // Linux cifs.ko: case-sensitive, POSIX extensions
+}
+
+message ConfigureRequest {
+  string appliance_endpoint = 1;
+  // mTLS identity. Production: tls_identity_ref is a Keychain reference (the secret does not
+  // leak through the API). Dev/file mode: client_cert_path/client_key_path are
+  // PEM paths on disk (the daemon reads them itself). Set EITHER the ref OR the paths.
+  string tls_identity_ref   = 2;
+  string client_cert_path   = 11;
+  string client_key_path    = 12;
+  bytes  ca_pem             = 3;
+  // Mount point: smb://127.0.0.1:{mount_port}/{share_name}. The host is always
+  // loopback (a model invariant). 0 = default (445; a high port in dev).
+  string share_name         = 4;
+  uint32 mount_port         = 13;
+  string smb_user           = 5;
+  string smb_password_ref   = 6;
+  uint64 quota_bytes        = 7;
+  FlushPolicy flush_policy  = 8;
+  bool   advertise_bonjour  = 9;
+  ClientProfile profile     = 10; // UNSPECIFIED is treated as TIME_MACHINE
+}
+
+message Readiness {
+  bool   ready   = 1;
+  string blocker = 2;
+}
+
+message StatusReply {
+  uint32 smb_sessions               = 1;
+  uint32 open_handles               = 2;
+  uint32 durable_handles_parked     = 3;
+  uint64 journal_backlog_bytes      = 4;
+  uint64 uploaded_bytes_total       = 5;
+  uint32 upload_errors              = 6;
+  int64  last_appliance_ack_unix_ms = 7;
+  string version                    = 8;
+}
+
+message DrainRequest { uint32 timeout_sec = 1; }
+message DrainReply   { bool drained = 1; uint64 remaining_bytes = 2; }
+
+message Event {
+  int64 unix_ms = 1;
+  oneof kind {
+    string session_up         = 2;
+    string session_down       = 3;
+    bool   validation_passed  = 4;
+    string validation_failed  = 5;
+    string upload_error       = 6;
+    uint64 journal_high_water = 7;
+  }
+}
+
+message RotateRequest {
+  string smb_user         = 1;
+  string smb_password_ref = 2;
+  string tls_identity_ref = 3;
+}
+
+message DiagnosticsBundle { bytes tarball = 1; }
+message ShutdownRequest   { bool drain_first = 1; }
+
+// ============================================================================
+// Service 3: ReceiverControl: management of janus-receiverd (the appliance).
+// Clients: janus-cli, appliance orchestration. Channel: gRPC over a unix socket
+// /var/run/janus/janus-receiverd.sock (0600 root); the control plane is
+// NOT exposed to the network (the network port belongs only to BandTransport/mTLS).
+// ============================================================================
+
+service ReceiverControl {
+  rpc Status(Empty) returns (ReceiverStatusReply);
+  rpc ListMachines(Empty) returns (MachineList);
+  rpc WatchEvents(Empty) returns (stream ReceiverEvent);
+  rpc GetDiagnostics(Empty) returns (DiagnosticsBundle);
+  rpc Shutdown(Empty) returns (Ack); // drain is not needed: the receiver has no WAL of its own,
+                                     // unfinished RPCs are answered to completion (grace)
+}
+
+message ReceiverStatusReply {
+  uint32 active_workers        = 1; // live StoreWorkers
+  uint32 machines_known        = 2; // machines in the IdentityMap
+  uint32 grpc_sessions         = 3; // active mTLS connections
+  uint64 received_bytes_total  = 4;
+  uint32 write_errors          = 5;
+  string version               = 6;
+}
+
+message MachineInfo {
+  string machine_id      = 1;
+  string store_path      = 2; // per-machine storage directory for bands
+  uint64 quota_bytes     = 3;
+  uint64 used_bytes      = 4;
+  bool   worker_active   = 5;
+  int64  last_activity_unix_ms = 6;
+}
+message MachineList { repeated MachineInfo machines = 1; }
+
+message ReceiverEvent {
+  int64 unix_ms = 1;
+  oneof kind {
+    string worker_spawned  = 2; // machine_id
+    string worker_stopped  = 3;
+    string auth_rejected   = 4; // fingerprint of an unknown cert
+    string write_error     = 5;
+    string quota_exceeded  = 6; // machine_id; TM will start thinning
+  }
+}

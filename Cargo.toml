@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+publish = false
+license = "MIT"
+
+[workspace.dependencies]
+# Contract / gRPC
+tonic = "0.12"
+prost = "0.13"
+tonic-build = "0.12"
+protoc-bin-vendored = "3"
+# Async runtime (smb-core actors, uploader, servers)
+tokio = { version = "1", features = ["rt-multi-thread", "net", "macros", "sync", "io-util", "time", "signal"] }
+# TODO as things get implemented: cap-std (the receiver's confined FS).
+# Crypto (sha2/cmac/aes) for smb-wire is done; sspi was evaluated and rejected.

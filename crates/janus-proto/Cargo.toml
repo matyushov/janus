@@ -1,0 +1,15 @@
+[package]
+name = "janus-proto"
+description = "Общий protobuf-контракт: BandTransport, SmbFrontControl, ReceiverControl. Один контракт — несколько потребителей (Rust-демоны, CLI, C++ агента)."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+tonic = { workspace = true }
+prost = { workspace = true }
+
+[build-dependencies]
+tonic-build = { workspace = true }
+protoc-bin-vendored = { workspace = true }

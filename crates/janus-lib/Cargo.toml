@@ -1,0 +1,24 @@
+[package]
+name = "janus-lib"
+description = "Слой хранения (vfs/journal/uploader/sparsebundle-model) и слой управления (control/config/bonjour/observability) мак-стороны."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+janus-proto = { path = "../janus-proto" }
+tonic = { workspace = true }
+tokio = { workspace = true }
+tokio-stream = { version = "0.1" }
+getrandom = "0.3"
+# aws-sdk-s3 is enabled ONLY with the backend-s3 feature (the main build does not pull it in).
+aws-sdk-s3 = { version = "1", optional = true }
+aws-config = { version = "1", optional = true }
+
+[features]
+# Storage backends (implementations of the StorageBackend trait). local is always available.
+default = ["backend-local"]
+backend-local = []
+backend-grpc = []
+backend-s3 = ["dep:aws-sdk-s3", "dep:aws-config"]

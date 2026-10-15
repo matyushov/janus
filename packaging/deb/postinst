@@ -1,0 +1,35 @@
+#!/bin/sh
+# postinst for janus-receiverd: create the user and directories.
+# The service is NOT enabled automatically; see packaging/README.md.
+set -e
+
+case "$1" in
+    configure)
+        # User and directories are declarative (files from the package).
+        if [ -x /usr/bin/systemd-sysusers ]; then
+            systemd-sysusers /usr/lib/sysusers.d/janus.conf >/dev/null 2>&1 || true
+        elif ! getent passwd janus >/dev/null; then
+            # Fallback for systems without systemd-sysusers.
+            adduser --system --group --home /var/lib/janus \
+                    --no-create-home --quiet janus || true
+        fi
+
+        if [ -x /usr/bin/systemd-tmpfiles ]; then
+            systemd-tmpfiles --create /usr/lib/tmpfiles.d/janus.conf >/dev/null 2>&1 || true
+        fi
+
+        # The config may contain sensitive parameters.
+        if [ -f /etc/janus/receiverd.env ]; then
+            chown root:janus /etc/janus/receiverd.env 2>/dev/null || true
+            chmod 640 /etc/janus/receiverd.env 2>/dev/null || true
+        fi
+
+        echo "janus-receiverd установлен. Дальше:"
+        echo "  1) отредактируйте /etc/janus/receiverd.env"
+        echo "  2) systemctl enable --now janus-receiverd"
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

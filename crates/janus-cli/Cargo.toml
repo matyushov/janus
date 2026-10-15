@@ -1,0 +1,14 @@
+[package]
+name = "janus-cli"
+description = "CLI управления демоном janus-smbd: тот же control-контракт (SmbFrontControl), что у агента-оркестратора, поверх unix-сокета."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+janus-proto = { path = "../janus-proto" }
+tonic = { workspace = true }
+tokio = { workspace = true }
+# TODO(UDS): tonic over a unix socket for production mode; clap if the hand-written
+# parser becomes cramped.

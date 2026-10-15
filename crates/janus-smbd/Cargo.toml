@@ -1,0 +1,17 @@
+[package]
+name = "janus-smbd"
+description = "macOS LaunchDaemon: локальный SMB-эндпоинт Time Machine. Только склейка — вся логика в janus-lib/smb-core."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+smb-core = { path = "../smb-core" }
+janus-lib = { path = "../janus-lib" }
+janus-proto = { path = "../janus-proto" }
+smb-wire = { path = "../smb-wire" }
+tokio = { workspace = true }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { workspace = true }
+# TODO: launchd check-in (raw fd), tracing

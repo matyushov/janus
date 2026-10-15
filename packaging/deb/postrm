@@ -1,0 +1,23 @@
+#!/bin/sh
+# postrm for janus-receiverd.
+#
+# IMPORTANT: /var/lib/janus (the store) is NOT removed even on purge, because it holds the
+# backup data. Cleaning is manual and deliberate only.
+set -e
+
+case "$1" in
+    purge)
+        # We remove the config, not the data.
+        rm -f /etc/janus/receiverd.env
+        rmdir /etc/janus 2>/dev/null || true
+
+        if [ -d /var/lib/janus ]; then
+            echo "janus-receiverd: данные сохранены в /var/lib/janus"
+            echo "  удалить вручную: rm -rf /var/lib/janus"
+        fi
+        ;;
+esac
+
+#DEBHELPER#
+
+exit 0

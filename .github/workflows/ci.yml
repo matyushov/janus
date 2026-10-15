@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+    branches: [develop]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # Fast checks, once, on Linux.
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      # protoc is not needed: janus-proto pulls protoc-bin-vendored in build.rs.
+      - run: cargo fmt --all --check
+      - run: cargo clippy --workspace --all-targets
+
+  # Build and tests across a platform matrix (mac will be added once the Apple layer appears).
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo build --workspace
+      - run: cargo test --workspace
+
+  # The smb-wire fuzz targets compile (we do not run them long in PR CI).
+  # TODO: enable once fuzz targets exist (cargo-fuzz, nightly).

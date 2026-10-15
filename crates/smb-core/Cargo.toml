@@ -1,0 +1,13 @@
+[package]
+name = "smb-core"
+description = "Ядро SMB-сервера: коннекты, сессии, handle-таблицы, durable/lease-семантика, Apple-расширения. Всё состояние протокола и I/O."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+smb-wire = { path = "../smb-wire" }
+janus-lib = { path = "../janus-lib" }
+tokio = { workspace = true }
+getrandom = "0.3"

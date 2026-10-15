@@ -1,0 +1,22 @@
+[package]
+name = "smb-wire"
+description = "SMB2/3 wire codec: байты ↔ типы. Ноль I/O, ноль долгоживущего состояния."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+# TODO (smb-rs audit): candidates to replace our structures: smb-msg / smb-dtyp / smb-fscc
+# TODO (done): crypto crates (sha2, cmac, aes) are in use; sspi was evaluated and rejected, see below
+sha2 = "0.10"
+hmac = "0.12"
+aes = "0.8"
+cmac = "0.7"
+subtle = "2"
+# NTLMv2 (MS-NLMP): MD4 for the NT hash, HMAC-MD5, RC4 for KEY_EXCH.
+# `sspi` evaluated and rejected: ~420 nodes in the tree, aws-lc-rs (C build), Kerberos/network.
+md4 = "0.10"
+md-5 = "0.10"
+rc4 = "0.1"
+getrandom = "0.3"

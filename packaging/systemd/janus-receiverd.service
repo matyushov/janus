@@ -1,0 +1,44 @@
+[Unit]
+Description=janus receiver (gRPC → store)
+Documentation=https://github.com/amatyushov/janus
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=janus
+Group=janus
+# Parameters are read from the environment (JANUS_LISTEN / JANUS_STORE / JANUS_QUOTA),
+# no flags are needed: the daemon takes them itself.
+EnvironmentFile=-/etc/janus/receiverd.env
+ExecStart=/usr/bin/janus-receiverd
+Restart=on-failure
+RestartSec=2s
+
+# --- Permission hardening (the service can write only to its store) ---
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/janus
+StateDirectory=janus
+StateDirectoryMode=0700
+# /etc/janus is created by tmpfiles with mode 0750 root:janus; the mode must
+# match, otherwise systemd warns on every start.
+ConfigurationDirectory=janus
+ConfigurationDirectoryMode=0750
+PrivateTmp=true
+PrivateDevices=true
+NoNewPrivileges=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+RestrictNamespaces=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

@@ -66,8 +66,9 @@ JANUS_CLIENT_ADDR=127.0.0.1:50061 target/debug/janus-cli client shutdown
 the request hex. If the client drops the connection, use
 `sudo tcpdump -i lo0 port 4445 -w janus.pcap` and Wireshark.
 
-The share directory of `janus-smbd` is `JANUS_SMB_LOCAL_ROOT` (default
-`<tmp>/janus-dev-share`) until the gRPC backend lands in J3.
+`janus-smbd` serves the share from the receiver (`GrpcBackend` over mTLS), configured with
+`janus-cli client configure`. For a run without a receiver set `JANUS_SMB_LOCAL_ROOT=<dir>` to
+serve a plain local folder instead (dev only).
 
 Result (macOS, `mount_smbfs`): SMB1 wildcard → NEGOTIATE 3.1.1 → NTLMv2 (with MIC) →
 signed TREE_CONNECT → **the mount succeeds**: `smbutil statshares -a` shows

@@ -8,7 +8,7 @@
 //! - NTLM authentication, no guest access.
 
 /// Who the client of this share is. Set in Configure (janus.v1.ClientProfile).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub enum ClientProfile {
     /// macOS backupd (Time Machine), the most demanding client.
     #[default]

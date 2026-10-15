@@ -1,9 +1,5 @@
 //! StorageBackend is the only door through which smb-core sees storage.
-//! Implementations: `GrpcBackend` (production) and `LocalFsBackend` (tests / a reference against Samba).
-
-use crate::journal::Journal;
-use crate::model::SparsebundleModel;
-use crate::uploader::UploaderHandle;
+//! Implementations: `GrpcBackend` (production, `backend-grpc`) and `LocalFsBackend` (tests / a reference against Samba).
 
 /// Handle of an open file on the backend side.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -167,15 +163,7 @@ pub trait StorageBackend: Send + Sync + 'static {
     fn statfs(&self) -> impl Future<Output = Result<FsStats>> + Send;
 }
 
-/// Production backend: WAL + uploader + gRPC to the appliance.
-/// READ answers through `Journal::read_overlay` (read-your-writes), reading through
-/// the missing ranges by `ReadRange` from the appliance.
-pub struct GrpcBackend {
-    model: SparsebundleModel,
-    journal: Journal,
-    uploader: UploaderHandle,
-    // remote: BandTransportClient will appear with janus-proto/tonic
-}
-
+#[cfg(feature = "backend-grpc")]
+pub use crate::grpc_backend::GrpcBackend;
 #[cfg(feature = "backend-local")]
 pub use crate::local_backend::LocalFsBackend;

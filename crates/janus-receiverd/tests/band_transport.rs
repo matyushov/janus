@@ -12,7 +12,7 @@ async fn ping_returns_server_version() {
     let mut srv = TestServer::start("ping", 0).await.expect("server up");
     let reply = srv.client.ping().await.expect("ping ok");
     assert!(!reply.server_version.is_empty());
-    assert_eq!(reply.proto_rev, 1);
+    assert_eq!(reply.proto_rev, 2);
 }
 
 #[tokio::test]

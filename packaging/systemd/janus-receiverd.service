@@ -8,8 +8,9 @@ Wants=network-online.target
 Type=exec
 User=janus
 Group=janus
-# Parameters are read from the environment (JANUS_LISTEN / JANUS_STORE / JANUS_QUOTA),
-# no flags are needed: the daemon takes them itself.
+# Parameters are read from the environment (JANUS_LISTEN / JANUS_STORE / JANUS_QUOTA and the
+# mTLS settings JANUS_TLS_CERT / JANUS_TLS_KEY / JANUS_TLS_CA / JANUS_MACHINES), no flags are
+# needed: the daemon takes them itself. Without the TLS settings it does not start.
 EnvironmentFile=-/etc/janus/receiverd.env
 ExecStart=/usr/bin/janus-receiverd
 Restart=on-failure

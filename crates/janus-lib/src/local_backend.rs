@@ -333,7 +333,9 @@ impl StorageBackend for LocalFsBackend {
         let e = self.entry(h)?;
         blocking(move || {
             let f = e.file.as_ref().ok_or(BackendError::IsADirectory)?;
-            let mut buf = vec![0u8; len as usize];
+            // A range that would pass u64::MAX is simply short, never wrapped around.
+            let len = (len as u64).min(u64::MAX - offset) as usize;
+            let mut buf = vec![0u8; len];
             let mut filled = 0;
             while filled < buf.len() {
                 let n = read_at(f, &mut buf[filled..], offset + filled as u64).map_err(map_io)?;
@@ -353,6 +355,9 @@ impl StorageBackend for LocalFsBackend {
         let data = data.to_vec();
         blocking(move || {
             let f = e.file.as_ref().ok_or(BackendError::IsADirectory)?;
+            if offset.checked_add(data.len() as u64).is_none() {
+                return Err(BackendError::Io(std::io::ErrorKind::InvalidInput.into()));
+            }
             let mut done = 0;
             while done < data.len() {
                 let n = write_at(f, &data[done..], offset + done as u64).map_err(map_io)?;

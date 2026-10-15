@@ -14,6 +14,8 @@ pub mod bonjour;
 pub mod config;
 pub mod control;
 pub mod credentials;
+#[cfg(feature = "backend-grpc")]
+pub mod grpc_backend;
 pub mod journal;
 #[cfg(feature = "backend-local")]
 pub mod local_backend;
@@ -21,6 +23,8 @@ pub mod model;
 pub mod observability;
 pub mod profile;
 pub mod remote;
+#[cfg(feature = "backend-grpc")]
+pub mod switch_backend;
 pub mod uploader;
 pub mod vfs;
 

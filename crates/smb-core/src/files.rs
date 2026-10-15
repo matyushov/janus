@@ -38,6 +38,66 @@ pub const MAX_OPENS_PER_SESSION: usize = 16384;
 /// Allocation granularity reported to clients.
 const ALLOCATION_UNIT: u64 = 4096;
 
+// H1-EXPERIMENT: `JANUS_SMB_DOWN_STATUS` selects the NTSTATUS returned for `RemoteUnavailable`
+// (a name from the table below, or a number like 0xC00000C4). The value `DROP` makes the
+// server close the TCP connection instead of replying (see `take_drop_request`).
+static DOWN_STATUS: std::sync::OnceLock<Option<u32>> = std::sync::OnceLock::new();
+static DROP_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+const DOWN_STATUS_TABLE: &[(&str, u32)] = &[
+    ("UNEXPECTED_NETWORK_ERROR", 0xC000_00C4),
+    ("IO_DEVICE_ERROR", 0xC000_0185),
+    ("DISK_FULL", 0xC000_007F),
+    ("INSUFFICIENT_RESOURCES", 0xC000_009A),
+    ("CONNECTION_DISCONNECTED", 0xC000_020C),
+    ("CONNECTION_RESET", 0xC000_020D),
+    ("CONNECTION_ABORTED", 0xC000_0241),
+    ("NETWORK_UNREACHABLE", 0xC000_023C),
+    ("HOST_UNREACHABLE", 0xC000_023D),
+    ("REMOTE_NOT_LISTENING", 0xC000_00BC),
+    ("NETWORK_BUSY", 0xC000_00BF),
+    ("DEVICE_NOT_READY", 0xC000_00A3),
+    ("DEVICE_OFF_LINE", 0xC000_00B5),
+    ("BAD_NETWORK_PATH", 0xC000_00BE),
+    ("SERVER_DISABLED", 0xC000_0080),
+    ("RETRY", 0xC000_022D),
+    ("NOT_SUPPORTED", 0xC000_00BB),
+    ("NETWORK_NAME_DELETED", 0xC000_00C9),
+    ("USER_SESSION_DELETED", 0xC000_0203),
+];
+
+fn down_status() -> u32 {
+    let chosen = DOWN_STATUS.get_or_init(|| {
+        let v = std::env::var("JANUS_SMB_DOWN_STATUS").ok()?;
+        let v = v.trim().trim_start_matches("STATUS_").to_ascii_uppercase();
+        if v == "DROP" {
+            return None;
+        }
+        if let Some(hex) = v.strip_prefix("0X") {
+            return u32::from_str_radix(hex, 16).ok();
+        }
+        DOWN_STATUS_TABLE
+            .iter()
+            .find(|(n, _)| *n == v)
+            .map(|(_, c)| *c)
+    });
+    match chosen {
+        Some(c) => *c,
+        None => {
+            if std::env::var("JANUS_SMB_DOWN_STATUS").is_ok_and(|v| v.eq_ignore_ascii_case("drop"))
+            {
+                DROP_REQUESTED.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+            status::UNEXPECTED_NETWORK_ERROR
+        }
+    }
+}
+
+/// H1-EXPERIMENT: true once if the last handled request asked to drop the connection.
+pub fn take_drop_request() -> bool {
+    DROP_REQUESTED.swap(false, std::sync::atomic::Ordering::SeqCst)
+}
+
 /// NTSTATUS for a backend failure. `NoSpace` → DISK_FULL is the Time Machine thinning signal.
 pub fn status_of(e: &BackendError) -> u32 {
     match e {
@@ -51,7 +111,7 @@ pub fn status_of(e: &BackendError) -> u32 {
         BackendError::AccessDenied => status::ACCESS_DENIED,
         BackendError::BadHandle => status::FILE_CLOSED,
         BackendError::Busy => status::INSUFFICIENT_RESOURCES,
-        BackendError::RemoteUnavailable => status::UNEXPECTED_NETWORK_ERROR,
+        BackendError::RemoteUnavailable => down_status(),
         BackendError::Io(_) => status::UNEXPECTED_IO_ERROR,
     }
 }

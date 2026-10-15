@@ -1,10 +1,33 @@
 //! Configuration: a persistent file + a push from the agent (`Configure`).
 //! The agent is the source of truth; the file exists so that socket activation does not depend
 //! on a live agent. Secrets are references only (Keychain), not values.
+//!
+//! File format: JSON (`serde_json`), one object `{"version":1,"share":{..}}`. JSON over TOML
+//! because the same data already travels as protobuf/JSON-shaped fields, the dependency is
+//! tiny and pure Rust, and the file is machine-written (never hand-edited). Unknown fields are
+//! ignored, missing ones default, so older and newer daemons can read each other's files.
+//! Location: `JANUS_CONFIG`, else `<state-dir>/config` (`~/.config/janus/config`).
 
-use std::sync::{Arc, RwLock};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, RwLock};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+use serde::{Deserialize, Serialize};
+
+/// Override of the config file path.
+pub const FILE_ENV: &str = "JANUS_CONFIG";
+const FORMAT_VERSION: u32 = 1;
+
+/// Default file path (`FILE_ENV` or `<state-dir>/config`).
+pub fn default_path() -> Option<PathBuf> {
+    if let Some(p) = std::env::var_os(FILE_ENV).filter(|p| !p.is_empty()) {
+        return Some(PathBuf::from(p));
+    }
+    let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+    Some(PathBuf::from(home).join(".config/janus/config"))
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum FlushPolicy {
     #[default]
     Unspecified,
@@ -14,7 +37,8 @@ pub enum FlushPolicy {
     LocalJournal,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
 pub struct ShareConfig {
     pub appliance_endpoint: String,
     /// mTLS identity. Production: `tls_identity_ref` (Keychain). Dev/file
@@ -22,7 +46,12 @@ pub struct ShareConfig {
     pub tls_identity_ref: String,
     pub client_cert_path: String,
     pub client_key_path: String,
+    /// CA certificate(s) that sign the receiver's server certificate (PEM; public, not a secret).
+    #[serde(with = "pem_text")]
+    pub ca_pem: Vec<u8>,
     pub share_name: String,
+    /// SMB listener port of the share; 0 = daemon default.
+    pub mount_port: u32,
     pub smb_user: String,
     pub smb_password_ref: String,
     /// Ceiling → the "volume size" for backupd (TM thinning decisions).
@@ -34,26 +63,291 @@ pub struct ShareConfig {
     pub profile: crate::profile::ClientProfile,
 }
 
+mod pem_text {
+    use serde::{Deserialize, Deserializer, Serializer};
+
+    pub fn serialize<S: Serializer>(v: &[u8], s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&String::from_utf8_lossy(v))
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        Ok(String::deserialize(d)?.into_bytes())
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct FileFormat {
+    version: u32,
+    share: ShareConfig,
+}
+
+fn invalid(msg: impl Into<String>) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, msg.into())
+}
+
+impl ShareConfig {
+    /// Semantic validation shared by `apply` and `load`.
+    pub fn validate(&self) -> std::io::Result<()> {
+        if self.appliance_endpoint.trim().is_empty() {
+            return Err(invalid("appliance_endpoint is required"));
+        }
+        if self.flush_policy == FlushPolicy::LocalJournal {
+            return Err(invalid("flush policy LOCAL_JOURNAL is not supported yet"));
+        }
+        if self.client_cert_path.is_empty() != self.client_key_path.is_empty() {
+            return Err(invalid(
+                "client_cert_path and client_key_path must be set together",
+            ));
+        }
+        if self.mount_port > u16::MAX as u32 {
+            return Err(invalid("mount_port out of range"));
+        }
+        Ok(())
+    }
+}
+
 /// Config store. `Configure` is the only writer; hot-path readers
 /// get an Arc without waiting for a write (TODO: replace RwLock with arc-swap).
 #[derive(Debug, Default)]
 pub struct ConfigStore {
     current: RwLock<Arc<ShareConfig>>,
+    /// Where `apply` persists; `None` = in-memory only.
+    path: Option<PathBuf>,
+    /// Whether any configuration was ever loaded/applied.
+    configured: std::sync::atomic::AtomicBool,
+    /// Serializes writers (tmp file + rename).
+    write_lock: Mutex<()>,
 }
 
 impl ConfigStore {
+    /// In-memory store (tests, dev).
+    pub fn in_memory() -> ConfigStore {
+        ConfigStore::default()
+    }
+
     /// Load the persistent file at startup. A missing file is NOT an error
     /// (first start before the agent): the daemon lives without a share and waits for Configure.
-    pub fn load(_path: &std::path::Path) -> std::io::Result<ConfigStore> {
-        todo!("read + validate")
+    pub fn load(path: &Path) -> std::io::Result<ConfigStore> {
+        let store = ConfigStore {
+            path: Some(path.to_path_buf()),
+            ..Default::default()
+        };
+        match std::fs::read(path) {
+            Ok(bytes) => {
+                let f: FileFormat = serde_json::from_slice(&bytes)
+                    .map_err(|e| invalid(format!("{}: {e}", path.display())))?;
+                if f.version > FORMAT_VERSION {
+                    return Err(invalid(format!(
+                        "{}: unsupported config version {}",
+                        path.display(),
+                        f.version
+                    )));
+                }
+                f.share.validate()?;
+                *store.current.write().expect("config lock poisoned") = Arc::new(f.share);
+                store
+                    .configured
+                    .store(true, std::sync::atomic::Ordering::Release);
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+        Ok(store)
     }
 
     /// Validation → atomic persist (tmp+rename, 0600) → publication.
-    pub fn apply(&self, _new: ShareConfig) -> std::io::Result<()> {
-        todo!("persist + swap; rebuilding dependents is the caller's job (control)")
+    pub fn apply(&self, new: ShareConfig) -> std::io::Result<()> {
+        new.validate()?;
+        let _w = self.write_lock.lock().expect("config write lock poisoned");
+        if let Some(path) = &self.path {
+            let body = serde_json::to_vec_pretty(&FileFormat {
+                version: FORMAT_VERSION,
+                share: new.clone(),
+            })
+            .map_err(std::io::Error::other)?;
+            write_atomic(path, &body)?;
+        }
+        *self.current.write().expect("config lock poisoned") = Arc::new(new);
+        self.configured
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
     }
 
     pub fn current(&self) -> Arc<ShareConfig> {
         self.current.read().expect("config lock poisoned").clone()
+    }
+
+    /// `true` once a configuration was loaded from disk or applied.
+    pub fn is_configured(&self) -> bool {
+        self.configured.load(std::sync::atomic::Ordering::Acquire)
+    }
+}
+
+/// tmp file in the same directory → fsync → rename → fsync of the directory (unix).
+fn write_atomic(path: &Path, body: &[u8]) -> std::io::Result<()> {
+    let dir = path.parent().filter(|d| !d.as_os_str().is_empty());
+    if let Some(d) = dir {
+        std::fs::create_dir_all(d)?;
+    }
+    let tmp = path.with_extension(format!("tmp{}", std::process::id()));
+    let result = (|| {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            opts.mode(0o600);
+        }
+        let mut f = opts.open(&tmp)?;
+        f.write_all(body)?;
+        f.sync_all()?;
+        drop(f);
+        std::fs::rename(&tmp, path)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+        return result;
+    }
+    #[cfg(unix)]
+    if let Some(d) = dir {
+        // Make the rename durable; failure here does not undo it.
+        let _ = std::fs::File::open(d).and_then(|d| d.sync_all());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tmpdir(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("janus-cfg-{name}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn sample() -> ShareConfig {
+        ShareConfig {
+            appliance_endpoint: "vault:7443".into(),
+            client_cert_path: "/c.pem".into(),
+            client_key_path: "/k.pem".into(),
+            ca_pem: b"-----BEGIN CERTIFICATE-----\nAAA\n-----END CERTIFICATE-----\n".to_vec(),
+            share_name: "tm".into(),
+            mount_port: 4445,
+            smb_user: "u".into(),
+            smb_password_ref: "keychain:x".into(),
+            quota_bytes: 123,
+            flush_policy: FlushPolicy::SyncThrough,
+            advertise_bonjour: true,
+            profile: crate::profile::ClientProfile::WindowsGeneric,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn missing_file_is_not_an_error() {
+        let d = tmpdir("missing");
+        let s = ConfigStore::load(&d.join("config")).unwrap();
+        assert!(!s.is_configured());
+        assert!(s.current().appliance_endpoint.is_empty());
+    }
+
+    #[test]
+    fn apply_persists_and_load_restores_everything() {
+        let d = tmpdir("roundtrip");
+        let path = d.join("sub/config");
+        let s = ConfigStore::load(&path).unwrap();
+        s.apply(sample()).unwrap();
+        assert!(s.is_configured());
+
+        let r = ConfigStore::load(&path).unwrap();
+        assert!(r.is_configured());
+        let (a, b) = (s.current(), r.current());
+        assert_eq!(a.appliance_endpoint, b.appliance_endpoint);
+        assert_eq!(b.ca_pem, sample().ca_pem);
+        assert_eq!(b.mount_port, 4445);
+        assert_eq!(b.quota_bytes, 123);
+        assert_eq!(b.flush_policy, FlushPolicy::SyncThrough);
+        assert_eq!(b.profile, crate::profile::ClientProfile::WindowsGeneric);
+        assert_eq!(b.smb_password_ref, "keychain:x");
+        // no leftovers of the tmp file
+        let names: Vec<_> = std::fs::read_dir(path.parent().unwrap())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(names.len(), 1, "{names:?}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn file_is_0600() {
+        use std::os::unix::fs::PermissionsExt;
+        let d = tmpdir("mode");
+        let path = d.join("config");
+        ConfigStore::load(&path).unwrap().apply(sample()).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn invalid_config_is_rejected_and_not_published() {
+        let d = tmpdir("invalid");
+        let path = d.join("config");
+        let s = ConfigStore::load(&path).unwrap();
+        s.apply(sample()).unwrap();
+
+        let mut bad = sample();
+        bad.appliance_endpoint.clear();
+        assert!(s.apply(bad).is_err());
+        let mut bad = sample();
+        bad.flush_policy = FlushPolicy::LocalJournal;
+        let e = s.apply(bad).unwrap_err();
+        assert!(e.to_string().contains("not supported yet"));
+        let mut bad = sample();
+        bad.client_key_path.clear();
+        assert!(s.apply(bad).is_err());
+
+        // old config intact in memory and on disk
+        assert_eq!(s.current().share_name, "tm");
+        assert_eq!(ConfigStore::load(&path).unwrap().current().share_name, "tm");
+    }
+
+    #[test]
+    fn corrupt_file_is_an_error_not_silently_empty() {
+        let d = tmpdir("corrupt");
+        let path = d.join("config");
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(ConfigStore::load(&path).is_err());
+    }
+
+    #[test]
+    fn unknown_fields_ignored_and_newer_version_refused() {
+        let d = tmpdir("compat");
+        let path = d.join("config");
+        std::fs::write(
+            &path,
+            br#"{"version":1,"future":1,"share":{"appliance_endpoint":"h:1","extra":2}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            ConfigStore::load(&path)
+                .unwrap()
+                .current()
+                .appliance_endpoint,
+            "h:1"
+        );
+        std::fs::write(&path, br#"{"version":99,"share":{}}"#).unwrap();
+        assert!(ConfigStore::load(&path).is_err());
+    }
+
+    #[test]
+    fn secret_values_are_not_a_field() {
+        // The persisted file contains only references/paths.
+        let d = tmpdir("nosecret");
+        let path = d.join("config");
+        ConfigStore::load(&path).unwrap().apply(sample()).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("smb_password_ref"));
+        assert!(!text.contains("PRIVATE KEY"));
     }
 }

@@ -8,7 +8,7 @@ license.workspace = true
 
 [dependencies]
 smb-core = { path = "../smb-core" }
-janus-lib = { path = "../janus-lib" }
+janus-lib = { path = "../janus-lib", features = ["backend-grpc"] }
 janus-proto = { path = "../janus-proto" }
 smb-wire = { path = "../smb-wire" }
 tokio = { workspace = true }

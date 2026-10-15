@@ -12,15 +12,11 @@ use janus_proto::v1::{
 };
 use tonic::{Request, Response, Status};
 
-use crate::worker::FileStore;
+use crate::router::Router;
 
 /// Receiver state visible to the control plane.
 pub struct ReceiverState {
-    pub store: Arc<FileStore>,
-    pub quota_bytes: u64,
-    /// Machine identifier in dev mode (one store per process).
-    /// UPGRADE: a real IdentityMap (cert → machine → store).
-    pub machine_id: String,
+    pub router: Arc<Router>,
     /// Daemon stop signal (on the Shutdown command).
     pub shutdown: tokio::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
 }
@@ -42,29 +38,33 @@ impl ReceiverControlService {
 #[tonic::async_trait]
 impl ReceiverControl for ReceiverControlService {
     async fn status(&self, _req: Request<Empty>) -> Result<Response<ReceiverStatusReply>, Status> {
-        let used = self.state.store.used_bytes().unwrap_or(0);
+        let machines = self.state.router.snapshot();
         Ok(Response::new(ReceiverStatusReply {
-            // dev: one built-in worker; UPGRADE: a pool of StoreWorkers.
-            active_workers: 1,
-            machines_known: 1,
+            active_workers: self.state.router.active_workers() as u32,
+            machines_known: self.state.router.machines_known() as u32,
             grpc_sessions: 0, // TODO(metrics): counter of active connections
-            received_bytes_total: used,
+            received_bytes_total: machines.iter().map(|m| m.used_bytes).sum(),
             write_errors: 0,
             version: self.version.to_string(),
         }))
     }
 
     async fn list_machines(&self, _req: Request<Empty>) -> Result<Response<MachineList>, Status> {
-        let used = self.state.store.used_bytes().unwrap_or(0);
         Ok(Response::new(MachineList {
-            machines: vec![MachineInfo {
-                machine_id: self.state.machine_id.clone(),
-                store_path: self.state.store.root().display().to_string(),
-                quota_bytes: self.state.quota_bytes,
-                used_bytes: used,
-                worker_active: true,
-                last_activity_unix_ms: 0, // TODO(metrics)
-            }],
+            machines: self
+                .state
+                .router
+                .snapshot()
+                .into_iter()
+                .map(|m| MachineInfo {
+                    machine_id: m.id,
+                    store_path: m.store_path,
+                    quota_bytes: m.quota_bytes,
+                    used_bytes: m.used_bytes,
+                    worker_active: m.worker_active,
+                    last_activity_unix_ms: m.last_activity_unix_ms,
+                })
+                .collect(),
         }))
     }
 

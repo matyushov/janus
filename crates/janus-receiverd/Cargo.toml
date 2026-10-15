@@ -11,7 +11,22 @@ janus-proto = { path = "../janus-proto" }
 tonic = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { version = "0.1", features = ["net"] }
-# TODO: cap-std (confined Dir), mTLS (tonic tls) for production mode
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+# mTLS: rustls with the `ring` provider only (no aws-lc-rs: it needs a C toolchain/NASM on
+# Windows). TLS 1.3 only: `tls12` is deliberately not enabled.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging"] }
+# Test certificate generation (feature `test-support`, used by this crate's tests and janus-lib's).
+rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"], optional = true }
+# TODO: cap-std (confined Dir)
+
+[features]
+test-support = ["dep:rcgen"]
+
+[dev-dependencies]
+janus-receiverd = { path = ".", features = ["test-support"] }
 
 # --- .deb package (cargo-deb) --------------------------------------------
 # Build: cargo deb -p janus-receiverd   (needs a Linux host; see packaging/README.md)

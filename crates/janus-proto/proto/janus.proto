@@ -16,6 +16,11 @@ package janus.v1;
 // appliance). Channel: gRPC + mTLS over the network.
 // ============================================================================
 
+// Error classification beyond the gRPC code is carried in the trailing metadata key
+// `janus-error` (ASCII): path-not-found | not-a-directory | is-a-directory | not-empty.
+// Clients that ignore it still get a correct gRPC code (NOT_FOUND, FAILED_PRECONDITION, ...).
+// RESOURCE_EXHAUSTED = quota exceeded (maps to STATUS_DISK_FULL); PERMISSION_DENIED = path
+// escapes the store or the certificate is not enrolled; UNAVAILABLE = transport failure.
 service BandTransport {
   rpc Ping(PingRequest) returns (PingReply);
   rpc StatFs(StatFsRequest) returns (StatFsReply);
@@ -28,7 +33,7 @@ service BandTransport {
 message FileRef { string rel_path = 1; }
 
 message PingRequest  { string client_version = 1; }
-message PingReply    { string server_version = 1; uint32 proto_rev = 2; }
+message PingReply    { string server_version = 1; uint32 proto_rev = 2; } // rev 2 as of this version
 
 message StatFsRequest {}
 message StatFsReply {
@@ -63,20 +68,45 @@ message BundleOpRequest {
     TruncateOp truncate = 4;
     ListOp     list     = 5;
     StatOp     stat     = 6;
+    SetTimesOp set_times = 7; // proto_rev 2
   }
 }
-message CreateOp   { FileRef file = 1; bool directory = 2; bool exclusive = 3; }
-message DeleteOp   { FileRef file = 1; }
-message RenameOp   { FileRef from = 1; FileRef to = 2; bool replace = 3; }
+// proto_rev 2 additions are backward compatible: every new field defaults to the
+// rev-1 behaviour, so a rev-1 client keeps working against a rev-2 receiver.
+message CreateOp   {
+  FileRef file = 1; bool directory = 2;
+  bool exclusive = 3;         // fail with ALREADY_EXISTS if present (files AND directories as of rev 2)
+  bool no_create_parents = 4; // rev 2: a missing parent dir is NOT_FOUND (janus-error=path-not-found)
+}
+message DeleteOp   {
+  FileRef file = 1;
+  bool non_recursive = 2;     // rev 2: a non-empty directory fails (janus-error=not-empty)
+}
+message RenameOp   {
+  FileRef from = 1; FileRef to = 2; bool replace = 3;
+  bool no_create_parents = 4; // rev 2: a missing parent of `to` is NOT_FOUND (path-not-found)
+}
 message TruncateOp { FileRef file = 1; uint64 new_length = 2; }
 message ListOp     { string rel_dir = 1; }
 message StatOp     { FileRef file = 1; }
+// rev 2. An absent time means "leave unchanged".
+message SetTimesOp {
+  FileRef file = 1;
+  optional int64 atime_unix_ns = 2;
+  optional int64 mtime_unix_ns = 3;
+}
 
 message FileStat {
   string rel_path      = 1;
-  uint64 size          = 2;
+  uint64 size          = 2; // 0 for directories (rev 2)
   bool   directory     = 3;
   int64  mtime_unix_ns = 4;
+  // rev 2. An absent time means the receiver does not know it: use mtime.
+  optional int64 atime_unix_ns = 5;
+  optional int64 ctime_unix_ns = 6;
+  optional int64 btime_unix_ns = 7;
+  bool   read_only     = 8;
+  uint64 file_id       = 9; // stable object id (inode), 0 = unknown
 }
 message DirListing { repeated FileStat entries = 1; }
 message BundleOpReply {

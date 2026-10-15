@@ -71,6 +71,8 @@ impl Drop for TempStore {
 /// A started server + a mock client. The server is stopped on drop (a shutdown signal),
 /// the store is removed together with `TempStore`.
 pub struct TestServer {
+    /// Where the data plane listens (loopback, ephemeral port).
+    pub addr: std::net::SocketAddr,
     pub store: TempStore,
     pub client: MockClient,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
@@ -98,6 +100,7 @@ impl TestServer {
 
         let client = MockClient::connect(addr).await?;
         Ok(TestServer {
+            addr,
             store: store_dir,
             client,
             shutdown: Some(tx),
@@ -151,6 +154,11 @@ impl MockClient {
             })
             .await?
             .into_inner())
+    }
+
+    /// The raw generated client, for requests that use rev-2 fields.
+    pub fn raw(&mut self) -> &mut BandTransportClient<Channel> {
+        &mut self.inner
     }
 
     pub async fn statfs(&mut self) -> Result<StatFsReply, tonic::Status> {
@@ -234,6 +242,8 @@ impl MockClient {
             }),
             directory,
             exclusive: false,
+            // rev-1 client: no rev-2 fields
+            ..Default::default()
         }))
         .await?;
         Ok(())
@@ -244,6 +254,7 @@ impl MockClient {
             file: Some(FileRef {
                 rel_path: rel.into(),
             }),
+            ..Default::default()
         }))
         .await?;
         Ok(())
@@ -263,6 +274,7 @@ impl MockClient {
                 rel_path: to.into(),
             }),
             replace,
+            ..Default::default()
         }))
         .await?;
         Ok(())

@@ -41,7 +41,12 @@ when the server and the gateway end up on the same machine.
 
 - **Certificates and keys.** The mTLS identity is issued when a machine is registered
   and is not packaged. The files go into `/etc/janus/` (0750 root:janus) by hand
-  or through orchestration tooling.
+  or through orchestration tooling. `janus-receiverd` needs `JANUS_TLS_CERT`, `JANUS_TLS_KEY`,
+  `JANUS_TLS_CA` and the machines file `JANUS_MACHINES` (see `receiverd.env`; the defaults point
+  to `/etc/janus/tls/{server.pem,server.key,ca.pem}` and `/etc/janus/machines.json`) and
+  refuses to start without them. Registering a machine = adding its client certificate's
+  SHA-256 fingerprint to the machines file (`janus-cli server enroll` does not exist yet).
+  `tools/dev-pki.sh` writes a throw-away PKI plus machines file for local trials.
 - **Store data.** `/var/lib/janus/store` is created empty. It is **not erased** when the
   package is removed: it holds backups, and cleaning happens only on an explicit `purge`.
 - **Autostart.** The package does not run `systemctl enable --now`: without a configuration

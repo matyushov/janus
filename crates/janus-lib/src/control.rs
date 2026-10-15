@@ -17,7 +17,7 @@ use janus_proto::v1::{
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 
-use crate::config::{FlushPolicy, ShareConfig};
+use crate::config::{ConfigStore, FlushPolicy, ShareConfig};
 use crate::remote::{RemoteClient, RemoteConfig};
 
 /// The quiesce gate IN FRONT of the journal. Open/Quiesced are the only states.
@@ -48,6 +48,35 @@ pub struct DaemonState {
     pub remote: Option<RemoteClient>,
 }
 
+impl DaemonState {
+    /// Backend for the restored state (see `from_config`).
+    #[cfg(feature = "backend-grpc")]
+    pub fn install_backend(&self, switch: &crate::switch_backend::SwitchBackend) {
+        if let (Some(remote), Some(share)) = (&self.remote, &self.share) {
+            switch.apply(remote, share.quota_bytes);
+        }
+    }
+
+    /// State restored from the persisted configuration (daemon start). An unusable stored
+    /// config is reported to stderr and ignored: the daemon then waits for `Configure`.
+    pub fn from_config(store: &ConfigStore) -> DaemonState {
+        if !store.is_configured() {
+            return DaemonState::default();
+        }
+        let share = (*store.current()).clone();
+        match RemoteClient::connect_lazy(&RemoteConfig::from_share(&share)) {
+            Ok(remote) => DaemonState {
+                share: Some(share),
+                remote: Some(remote),
+            },
+            Err(e) => {
+                eprintln!("janus: stored configuration is unusable ({e}); waiting for configure");
+                DaemonState::default()
+            }
+        }
+    }
+}
+
 /// Implementation of the `SmbFrontControl` RPC.
 pub struct ControlService {
     state: Arc<Mutex<DaemonState>>,
@@ -57,6 +86,11 @@ pub struct ControlService {
     shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
     /// The share's SMB account; generated on `Configure` if it does not exist yet.
     credentials: Option<Arc<crate::credentials::CredentialStore>>,
+    /// Persistent configuration; `None` = memory only (tests).
+    config: Option<Arc<ConfigStore>>,
+    /// The share's backend; `Configure` swaps a new `GrpcBackend` into it.
+    #[cfg(feature = "backend-grpc")]
+    backend: Option<Arc<crate::switch_backend::SwitchBackend>>,
 }
 
 impl ControlService {
@@ -67,7 +101,23 @@ impl ControlService {
             version: env!("CARGO_PKG_VERSION"),
             shutdown: Mutex::new(None),
             credentials: None,
+            config: None,
+            #[cfg(feature = "backend-grpc")]
+            backend: None,
         }
+    }
+
+    /// `Configure` rebuilds the backend in this switch without restarting the daemon.
+    #[cfg(feature = "backend-grpc")]
+    pub fn with_backend(mut self, b: Arc<crate::switch_backend::SwitchBackend>) -> Self {
+        self.backend = Some(b);
+        self
+    }
+
+    /// Persist every accepted `Configure` through this store.
+    pub fn with_config(mut self, store: Arc<ConfigStore>) -> Self {
+        self.config = Some(store);
+        self
     }
 
     pub fn with_credentials(mut self, store: Arc<crate::credentials::CredentialStore>) -> Self {
@@ -90,7 +140,9 @@ fn share_from_request(req: &ConfigureRequest) -> ShareConfig {
         tls_identity_ref: req.tls_identity_ref.clone(),
         client_cert_path: req.client_cert_path.clone(),
         client_key_path: req.client_key_path.clone(),
+        ca_pem: req.ca_pem.clone(),
         share_name: req.share_name.clone(),
+        mount_port: req.mount_port,
         smb_user: req.smb_user.clone(),
         smb_password_ref: req.smb_password_ref.clone(),
         quota_bytes: req.quota_bytes,
@@ -100,7 +152,11 @@ fn share_from_request(req: &ConfigureRequest) -> ShareConfig {
             _ => FlushPolicy::Unspecified,
         },
         advertise_bonjour: req.advertise_bonjour,
-        profile: Default::default(),
+        profile: match req.profile {
+            2 => crate::profile::ClientProfile::WindowsGeneric,
+            3 => crate::profile::ClientProfile::PosixGeneric,
+            _ => crate::profile::ClientProfile::TimeMachine,
+        },
     }
 }
 
@@ -115,12 +171,10 @@ impl SmbFrontControl for ControlService {
         }
 
         let share = share_from_request(&req);
-        let remote_cfg = RemoteConfig {
-            endpoint: req.appliance_endpoint.clone(),
-            ca_pem: req.ca_pem.clone(),
-            client_cert_path: req.client_cert_path.clone(),
-            client_key_path: req.client_key_path.clone(),
-        };
+        if let Err(e) = share.validate() {
+            return Err(Status::invalid_argument(e.to_string()));
+        }
+        let remote_cfg = RemoteConfig::from_share(&share);
         let remote = RemoteClient::connect_lazy(&remote_cfg)
             .map_err(|e| Status::invalid_argument(e.to_string()))?;
 
@@ -134,11 +188,25 @@ impl SmbFrontControl for ControlService {
             }));
         }
 
+        // Persist first: if the disk refuses, the running state stays as it was.
+        if let Some(cfg) = &self.config
+            && let Err(e) = cfg.apply(share.clone())
+        {
+            return Ok(Response::new(Ack {
+                ok: false,
+                error: format!("failed to persist configuration: {e}"),
+            }));
+        }
+
+        #[cfg(feature = "backend-grpc")]
+        if let Some(b) = &self.backend {
+            b.apply(&remote, share.quota_bytes);
+        }
+
         let mut st = self.state.lock().await;
         st.share = Some(share);
         st.remote = Some(remote);
 
-        // TODO(persist): ConfigStore::apply, to survive a daemon restart.
         // TODO(bonjour/SMB): rebuild the advertisement and the listener for the new port/share.
 
         Ok(Response::new(Ack {
@@ -296,6 +364,58 @@ mod shutdown_tests {
         // a repeated configure does not change the pair
         assert!(svc.configure(req()).await.unwrap().into_inner().ok);
         assert_eq!(store.get().unwrap(), first);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn configuration_survives_a_restart() {
+        let dir = std::env::temp_dir().join(format!("janus-ctl-persist-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let path = dir.join("config");
+
+        let store = Arc::new(ConfigStore::load(&path).unwrap());
+        let state = Arc::new(Mutex::new(DaemonState::from_config(&store)));
+        assert!(state.lock().await.share.is_none());
+        let svc =
+            ControlService::new(Arc::clone(&state), Arc::default()).with_config(Arc::clone(&store));
+        let ack = svc
+            .configure(Request::new(ConfigureRequest {
+                appliance_endpoint: "127.0.0.1:7443".into(),
+                share_name: "tm".into(),
+                mount_port: 4445,
+                ..Default::default()
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        assert!(ack.ok, "{}", ack.error);
+
+        // "restart": a new store and state from the same file
+        let store2 = ConfigStore::load(&path).unwrap();
+        let st2 = DaemonState::from_config(&store2);
+        let share = st2.share.expect("restored");
+        assert_eq!(share.appliance_endpoint, "127.0.0.1:7443");
+        assert_eq!(share.share_name, "tm");
+        assert_eq!(share.mount_port, 4445);
+        assert!(st2.remote.is_some());
+
+        // LOCAL_JOURNAL is refused, the stored config stays intact
+        let err = svc
+            .configure(Request::new(ConfigureRequest {
+                appliance_endpoint: "127.0.0.1:1".into(),
+                flush_policy: 2,
+                ..Default::default()
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            ConfigStore::load(&path)
+                .unwrap()
+                .current()
+                .appliance_endpoint,
+            "127.0.0.1:7443"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

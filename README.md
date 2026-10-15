@@ -55,7 +55,7 @@ are enabled by cargo features so that the main build does not pull in unneeded d
 | Feature | Backend | Where it writes | Status |
 |---|---|---|---|
 | `backend-local` | `LocalFsBackend` | a local folder | dev/tests |
-| `backend-grpc` | `GrpcBackend` | the own `janus-receiverd` over gRPC/mTLS | in progress |
+| `backend-grpc` | `GrpcBackend` | the own `janus-receiverd` over gRPC/mTLS | sync-through (J3a); journal mode in J3b |
 | `backend-s3` | `S3Backend` | **any S3-compatible bucket** (AWS S3, MinIO, R2, B2, Wasabi, Ceph) | planned |
 
 ### `backend-s3`: direct upload to S3 (planned)

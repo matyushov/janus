@@ -24,6 +24,38 @@ pub struct StatInfo {
     pub size: u64,
     pub directory: bool,
     pub mtime_unix_ns: i64,
+    pub atime_unix_ns: Option<i64>,
+    pub ctime_unix_ns: Option<i64>,
+    pub btime_unix_ns: Option<i64>,
+    pub read_only: bool,
+    /// Inode where the platform has one, else 0.
+    pub file_id: u64,
+}
+
+/// Machine-readable error class carried inside an `io::Error` (see `ErrClass`).
+/// The service turns it into the `janus-error` trailer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrClass {
+    /// A parent directory is missing (as opposed to the final component).
+    PathNotFound,
+}
+
+impl std::fmt::Display for ErrClass {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ErrClass::PathNotFound => f.write_str("parent directory does not exist"),
+        }
+    }
+}
+
+impl std::error::Error for ErrClass {}
+
+fn path_not_found() -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::NotFound, ErrClass::PathNotFound)
+}
+
+fn denied(msg: &'static str) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::PermissionDenied, msg)
 }
 
 impl FileStore {
@@ -31,6 +63,15 @@ impl FileStore {
     pub fn open(root: impl Into<PathBuf>) -> std::io::Result<FileStore> {
         let root = root.into();
         fs::create_dir_all(&root)?;
+        Ok(FileStore { root })
+    }
+
+    /// Open a store that must already exist (read-only inspection; never creates anything).
+    pub fn open_existing(root: impl Into<PathBuf>) -> std::io::Result<FileStore> {
+        let root = root.into();
+        if !root.is_dir() {
+            return Err(std::io::Error::from(std::io::ErrorKind::NotFound));
+        }
         Ok(FileStore { root })
     }
 
@@ -102,14 +143,23 @@ impl FileStore {
         }
     }
 
-    pub fn create(&self, rel: &str, directory: bool, exclusive: bool) -> std::io::Result<()> {
+    /// `create_parents` keeps the rev-1 behaviour (missing parents are created); rev-2 clients
+    /// pass `false` and get `path-not-found` instead. `exclusive` applies to directories too.
+    pub fn create(
+        &self,
+        rel: &str,
+        directory: bool,
+        exclusive: bool,
+        create_parents: bool,
+    ) -> std::io::Result<()> {
         let path = self.resolve(rel)?;
+        self.prepare_parent(&path, create_parents)?;
         if directory {
-            fs::create_dir_all(&path)?;
-            return Ok(());
-        }
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
+            return match fs::create_dir(&path) {
+                Ok(()) => Ok(()),
+                Err(_) if !exclusive && path.is_dir() => Ok(()),
+                Err(e) => Err(e),
+            };
         }
         // truncate(false) is EXPLICIT: CREATE must not zero an existing file
         // (otherwise a repeated CREATE of a band would erase the data already written).
@@ -126,28 +176,82 @@ impl FileStore {
         }
     }
 
-    pub fn delete(&self, rel: &str) -> std::io::Result<()> {
+    fn prepare_parent(&self, path: &Path, create_parents: bool) -> std::io::Result<()> {
+        let Some(parent) = path.parent() else {
+            return Ok(());
+        };
+        if create_parents {
+            fs::create_dir_all(parent)
+        } else if parent.is_dir() {
+            Ok(())
+        } else {
+            Err(path_not_found())
+        }
+    }
+
+    /// `recursive` keeps the rev-1 behaviour; otherwise a non-empty directory fails with
+    /// `DirectoryNotEmpty`.
+    pub fn delete(&self, rel: &str, recursive: bool) -> std::io::Result<()> {
         let path = self.resolve(rel)?;
-        if path.is_dir() {
-            fs::remove_dir_all(path)
+        let md = fs::symlink_metadata(&path)?;
+        if md.is_dir() {
+            if recursive {
+                fs::remove_dir_all(path)
+            } else {
+                fs::remove_dir(path)
+            }
         } else {
             fs::remove_file(path)
         }
     }
 
-    pub fn rename(&self, from: &str, to: &str, replace: bool) -> std::io::Result<()> {
+    pub fn rename(
+        &self,
+        from: &str,
+        to: &str,
+        replace: bool,
+        create_parents: bool,
+    ) -> std::io::Result<()> {
         let src = self.resolve(from)?;
         let dst = self.resolve(to)?;
-        if dst.exists() && !replace {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::AlreadyExists,
-                "destination exists",
-            ));
-        }
-        if let Some(parent) = dst.parent() {
-            fs::create_dir_all(parent)?;
+        fs::symlink_metadata(&src)?; // NotFound for a missing source
+        match fs::symlink_metadata(&dst) {
+            Ok(md) => {
+                if !replace {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "destination exists",
+                    ));
+                }
+                if md.is_dir() {
+                    return Err(denied("cannot replace a directory"));
+                }
+            }
+            Err(_) => self.prepare_parent(&dst, create_parents)?,
         }
         fs::rename(src, dst)
+    }
+
+    /// `None` leaves a field unchanged. Directories are best effort (a no-op), like the
+    /// client's local reference backend.
+    pub fn set_times(
+        &self,
+        rel: &str,
+        atime_ns: Option<i64>,
+        mtime_ns: Option<i64>,
+    ) -> std::io::Result<()> {
+        let path = self.resolve(rel)?;
+        if fs::symlink_metadata(&path)?.is_dir() {
+            return Ok(());
+        }
+        let mut t = fs::FileTimes::new();
+        if let Some(a) = atime_ns {
+            t = t.set_accessed(from_unix_ns(a));
+        }
+        if let Some(m) = mtime_ns {
+            t = t.set_modified(from_unix_ns(m));
+        }
+        fs::OpenOptions::new().write(true).open(&path)?.set_times(t)
     }
 
     pub fn truncate(&self, rel: &str, new_len: u64) -> std::io::Result<()> {
@@ -156,39 +260,29 @@ impl FileStore {
         f.set_len(new_len)
     }
 
+    /// `rel == ""` is the store root.
     pub fn stat(&self, rel: &str) -> std::io::Result<StatInfo> {
-        let path = self.resolve(rel)?;
-        let md = fs::metadata(&path)?;
-        Ok(StatInfo {
-            rel_path: rel.to_string(),
-            size: md.len(),
-            directory: md.is_dir(),
-            mtime_unix_ns: mtime_nanos(&md),
-        })
+        let path = self.resolve_or_root(rel)?;
+        let md = fs::symlink_metadata(&path)?;
+        Ok(stat_info(rel.to_string(), &md))
     }
 
     pub fn list(&self, rel_dir: &str) -> std::io::Result<Vec<StatInfo>> {
-        let path = if rel_dir.is_empty() {
-            self.root.clone()
-        } else {
-            self.resolve(rel_dir)?
-        };
+        let path = self.resolve_or_root(rel_dir)?;
         let mut out = Vec::new();
         for entry in fs::read_dir(&path)? {
             let entry = entry?;
-            let md = entry.metadata()?;
+            let Ok(md) = entry.metadata() else { continue };
+            if md.file_type().is_symlink() {
+                continue; // never exposed
+            }
             let name = entry.file_name().to_string_lossy().into_owned();
             let rel = if rel_dir.is_empty() {
                 name
             } else {
                 format!("{}/{}", rel_dir.trim_end_matches('/'), name)
             };
-            out.push(StatInfo {
-                rel_path: rel,
-                size: md.len(),
-                directory: md.is_dir(),
-                mtime_unix_ns: mtime_nanos(&md),
-            });
+            out.push(stat_info(rel, &md));
         }
         out.sort_by(|a, b| a.rel_path.cmp(&b.rel_path));
         Ok(out)
@@ -212,10 +306,28 @@ impl FileStore {
         walk(&self.root)
     }
 
-    /// The second line of path defence: forbid `..`, absolute paths and escaping the root.
+    /// The second line of path defence: forbid `..`, absolute paths, escaping the root and
+    /// crossing symlinks.
     fn resolve(&self, rel: &str) -> std::io::Result<PathBuf> {
         self.validate(rel)?;
-        Ok(self.root.join(rel))
+        let mut path = self.root.clone();
+        for part in rel.split('/') {
+            path.push(part);
+            if let Ok(m) = fs::symlink_metadata(&path)
+                && m.file_type().is_symlink()
+            {
+                return Err(denied("path crosses a symlink"));
+            }
+        }
+        Ok(path)
+    }
+
+    fn resolve_or_root(&self, rel: &str) -> std::io::Result<PathBuf> {
+        if rel.is_empty() {
+            Ok(self.root.clone())
+        } else {
+            self.resolve(rel)
+        }
     }
 
     fn validate(&self, rel: &str) -> std::io::Result<()> {
@@ -236,12 +348,47 @@ impl FileStore {
     }
 }
 
-fn mtime_nanos(md: &fs::Metadata) -> i64 {
-    md.modified()
-        .ok()
-        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
+fn unix_ns(t: std::io::Result<std::time::SystemTime>) -> Option<i64> {
+    let t = t.ok()?;
+    match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(d) => i64::try_from(d.as_nanos()).ok(),
+        Err(e) => i64::try_from(e.duration().as_nanos()).ok().map(|n| -n),
+    }
+}
+
+fn from_unix_ns(ns: i64) -> std::time::SystemTime {
+    use std::time::{Duration, UNIX_EPOCH};
+    if ns >= 0 {
+        UNIX_EPOCH + Duration::from_nanos(ns as u64)
+    } else {
+        UNIX_EPOCH - Duration::from_nanos(ns.unsigned_abs())
+    }
+}
+
+#[cfg(unix)]
+fn ctime_and_id(md: &fs::Metadata) -> (Option<i64>, u64) {
+    use std::os::unix::fs::MetadataExt;
+    (Some(md.ctime() * 1_000_000_000 + md.ctime_nsec()), md.ino())
+}
+
+#[cfg(not(unix))]
+fn ctime_and_id(_md: &fs::Metadata) -> (Option<i64>, u64) {
+    (None, 0)
+}
+
+fn stat_info(rel_path: String, md: &fs::Metadata) -> StatInfo {
+    let (ctime, file_id) = ctime_and_id(md);
+    StatInfo {
+        rel_path,
+        size: if md.is_dir() { 0 } else { md.len() },
+        directory: md.is_dir(),
+        mtime_unix_ns: unix_ns(md.modified()).unwrap_or(0),
+        atime_unix_ns: unix_ns(md.accessed()),
+        ctime_unix_ns: ctime,
+        btime_unix_ns: unix_ns(md.created()),
+        read_only: md.permissions().readonly(),
+        file_id,
+    }
 }
 
 pub enum FsyncScope {
@@ -334,11 +481,11 @@ mod tests {
     fn rename_delete_truncate() {
         let (store, dir) = tmp_store();
         store.write_range("a", 0, b"abcdef").unwrap();
-        store.rename("a", "b", false).unwrap();
+        store.rename("a", "b", false, true).unwrap();
         assert!(store.stat("a").is_err());
         store.truncate("b", 3).unwrap();
         assert_eq!(store.read_range("b", 0, 10).unwrap(), b"abc");
-        store.delete("b").unwrap();
+        store.delete("b", true).unwrap();
         assert!(store.stat("b").is_err());
         fs::remove_dir_all(dir).ok();
     }

@@ -4,15 +4,17 @@
 //! on a fixed control port.
 //!
 //! Arguments:
-//!   (no arguments)    normal start (systemd), values from the environment
-//!   --dev             foreground debug mode
+//!   (no arguments)    normal start (systemd), values from the environment; mTLS + IdentityMap
+//!   --dev             foreground debug mode: plain gRPC (NO TLS), one built-in store, no identity
 //!   --listen <addr>   data plane address (receiving bands)
 //!   --store <dir>     storage directory
 //!   --quota <bytes>   store ceiling, 0 = no limit
 //!
 //! In production the parameters come from `/etc/janus/receiverd.env` via the systemd unit
-//! (the variables `JANUS_LISTEN`, `JANUS_STORE`, `JANUS_QUOTA`); flags override
-//! them. The control address is fixed, overridden only by
+//! (the variables `JANUS_LISTEN`, `JANUS_STORE`, `JANUS_QUOTA`, and for the production mode
+//! `JANUS_TLS_CERT`, `JANUS_TLS_KEY`, `JANUS_TLS_CA`, `JANUS_MACHINES`); flags override
+//! them. Without `--dev` all four TLS/mapping variables are mandatory: the daemon refuses to
+//! start rather than fall back to plain gRPC. The control address is fixed, overridden only by
 //! `JANUS_SERVER_ADDR` (dev setups, parallel instances).
 
 use std::process::ExitCode;
@@ -26,6 +28,10 @@ const DEFAULT_STORE: &str = "/var/lib/janus/store";
 const LISTEN_ENV: &str = "JANUS_LISTEN";
 const STORE_ENV: &str = "JANUS_STORE";
 const QUOTA_ENV: &str = "JANUS_QUOTA";
+const TLS_CERT_ENV: &str = "JANUS_TLS_CERT";
+const TLS_KEY_ENV: &str = "JANUS_TLS_KEY";
+const TLS_CA_ENV: &str = "JANUS_TLS_CA";
+const MACHINES_ENV: &str = "JANUS_MACHINES";
 const CONTROL_ADDR_ENV: &str = "JANUS_SERVER_ADDR";
 
 fn main() -> ExitCode {
@@ -91,8 +97,28 @@ fn main() -> ExitCode {
         }
     };
 
+    let result = if dev {
+        None
+    } else {
+        match prod_config(&listen, &store, quota, &control_addr) {
+            Ok(cfg) => Some(cfg),
+            Err(missing) => {
+                eprintln!(
+                    "janus-receiverd: cannot start in production mode: {missing}\n\
+                     Set them (see /etc/janus/receiverd.env) or use --dev for plain gRPC without \
+                     TLS (development only)."
+                );
+                return ExitCode::from(2);
+            }
+        }
+    };
+
     rt.block_on(async move {
-        match server::serve_dev(&listen, &store, quota, &control_addr).await {
+        let run = match result {
+            Some(cfg) => server::serve_mtls(cfg).await,
+            None => server::serve_dev(&listen, &store, quota, &control_addr).await,
+        };
+        match run {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => {
                 eprintln!("janus-receiverd: {e}");
@@ -102,14 +128,61 @@ fn main() -> ExitCode {
     })
 }
 
+/// Production settings from the environment; names every missing variable.
+fn prod_config(
+    listen: &str,
+    store: &str,
+    quota: u64,
+    control_addr: &str,
+) -> Result<server::ProdConfig, String> {
+    let get = |name: &str| std::env::var(name).ok().filter(|v| !v.is_empty());
+    let (cert, key, ca, machines) = (
+        get(TLS_CERT_ENV),
+        get(TLS_KEY_ENV),
+        get(TLS_CA_ENV),
+        get(MACHINES_ENV),
+    );
+    let missing: Vec<&str> = [
+        (TLS_CERT_ENV, cert.is_none()),
+        (TLS_KEY_ENV, key.is_none()),
+        (TLS_CA_ENV, ca.is_none()),
+        (MACHINES_ENV, machines.is_none()),
+    ]
+    .into_iter()
+    .filter_map(|(n, m)| m.then_some(n))
+    .collect();
+    if !missing.is_empty() {
+        return Err(format!("missing environment: {}", missing.join(", ")));
+    }
+    Ok(server::ProdConfig {
+        listen: listen.to_string(),
+        store_root: store.to_string(),
+        default_quota: quota,
+        tls: janus_receiverd::tls::TlsPaths {
+            cert: cert.unwrap().into(),
+            key: key.unwrap().into(),
+            ca: ca.unwrap().into(),
+        },
+        machines: machines.unwrap().into(),
+        control_addr: control_addr.to_string(),
+    })
+}
+
 fn print_usage() {
     eprintln!(
         "janus-receiverd — janus receiver server.\n\n\
          Usage: janus-receiverd [--dev] [--listen <addr>] [--store <dir>] [--quota <bytes>]\n\n  \
-         --dev     foreground debug mode\n  \
+         --dev     foreground debug mode: plain gRPC, NO TLS, one built-in store (development only)\n  \
          --listen  data plane address (default {DEFAULT_LISTEN}, env {LISTEN_ENV})\n  \
-         --store   storage directory (default {DEFAULT_STORE}, env {STORE_ENV})\n  \
-         --quota   limit in bytes, 0 = unlimited (env {QUOTA_ENV})\n\n\
+         --store   storage directory (default {DEFAULT_STORE}, env {STORE_ENV}); in production the\n            \
+                   parent of the per-machine store subdirectories\n  \
+         --quota   limit in bytes, 0 = unlimited (env {QUOTA_ENV}); in production the default for\n            \
+                   machines without their own quota\n\n\
+         Production mode (no --dev) requires, from the environment:\n  \
+         {TLS_CERT_ENV}   server certificate (PEM)\n  \
+         {TLS_KEY_ENV}    server private key (PEM, keep it 0600)\n  \
+         {TLS_CA_ENV}     CA (PEM) that signs the client certificates\n  \
+         {MACHINES_ENV}   machines file (JSON, 0600): certificate fingerprint -> machine -> store -> quota\n\n\
          The daemon awaits instructions on {CONTROL_ADDR}: janus-cli server status|machines|shutdown\n\
          Control address override (dev): {CONTROL_ADDR_ENV}."
     );

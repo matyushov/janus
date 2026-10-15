@@ -8,10 +8,13 @@ license.workspace = true
 
 [dependencies]
 janus-proto = { path = "../janus-proto" }
-tonic = { workspace = true }
+# `tls` = rustls with the ring provider (checked: aws-lc-rs is not in the tree)
+tonic = { workspace = true, features = ["tls"] }
 tokio = { workspace = true }
 tokio-stream = { version = "0.1" }
 getrandom = "0.3"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 # aws-sdk-s3 is enabled ONLY with the backend-s3 feature (the main build does not pull it in).
 aws-sdk-s3 = { version = "1", optional = true }
 aws-config = { version = "1", optional = true }
@@ -22,3 +25,9 @@ default = ["backend-local"]
 backend-local = []
 backend-grpc = []
 backend-s3 = ["dep:aws-sdk-s3", "dep:aws-config"]
+
+[dev-dependencies]
+# Contract tests run GrpcBackend against the real receiver on an ephemeral loopback port.
+janus-receiverd = { path = "../janus-receiverd", features = ["test-support"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }

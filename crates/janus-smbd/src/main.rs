@@ -10,6 +10,9 @@
 //!   --dev             foreground debug mode: verbose output, does not
 //!                     daemonize, does not wait for socket activation
 //!
+//! The configuration is persisted (`JANUS_CONFIG`, default `~/.config/janus/config`, 0600) and
+//! restored on start.
+//!
 //! Addresses are overridden only through the environment (dev setups, parallel
 //! instances): `JANUS_CLIENT_ADDR` is control, `JANUS_SMB_ADDR` is the SMB listener
 //! (there is no `--smb-port` flag).
@@ -22,9 +25,11 @@ mod launchd;
 
 use std::sync::Arc;
 
+use janus_lib::config::ConfigStore;
 use janus_lib::control::{ControlService, DaemonState, WriteGate};
 use janus_lib::credentials::CredentialStore;
-use janus_lib::vfs::LocalFsBackend;
+use janus_lib::switch_backend::SwitchBackend;
+use janus_lib::vfs::{LocalFsBackend, StorageBackend};
 use janus_proto::v1::smb_front_control_server::SmbFrontControlServer;
 use smb_core::server::{DevServer, ServerConfig};
 use tokio::sync::Mutex;
@@ -40,7 +45,7 @@ const SMB_PORT: u16 = 4445;
 /// Overrides for dev setups and tests.
 const CONTROL_ADDR_ENV: &str = "JANUS_CLIENT_ADDR";
 const SMB_ADDR_ENV: &str = "JANUS_SMB_ADDR";
-/// Directory served by the local backend (dev, until the gRPC backend lands in J3).
+/// Directory served by the local backend instead of the receiver (dev only).
 const LOCAL_ROOT_ENV: &str = "JANUS_SMB_LOCAL_ROOT";
 
 fn main() {
@@ -74,9 +79,24 @@ fn print_usage() {
          janus-cli client configure --endpoint <host:port> --client-cert <pem> \\\n    \
          --client-key <pem> --ca <pem> [--share <name>] [--port <n>]\n\n\
          Address overrides (dev): {CONTROL_ADDR_ENV}, {SMB_ADDR_ENV}.\n\
-         Share directory (dev): {LOCAL_ROOT_ENV} (default: <tmp>/janus-dev-share).\n\
+         Share directory (dev only): {LOCAL_ROOT_ENV} serves a local folder instead of the receiver.\n\
          SMB user: JANUS_SMB_USER/JANUS_SMB_PASSWORD or the JANUS_SMB_CREDS_FILE file."
     );
+}
+
+fn spawn_smb<B: StorageBackend>(
+    state: &Arc<Mutex<DaemonState>>,
+    credentials: &Arc<CredentialStore>,
+    backend: Arc<B>,
+    listener: tokio::net::TcpListener,
+) -> tokio::task::JoinHandle<std::io::Result<()>> {
+    let server = Arc::new(DevServer::new(
+        ServerConfig::default(),
+        Arc::clone(state),
+        Arc::clone(credentials),
+        backend,
+    ));
+    tokio::spawn(async move { server.serve(listener).await })
 }
 
 fn run(dev: bool) {
@@ -85,7 +105,29 @@ fn run(dev: bool) {
 
     let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
     rt.block_on(async move {
-        let state = Arc::new(Mutex::new(DaemonState::default()));
+        // Persisted configuration: a restart comes back with the previous share.
+        let config_path = janus_lib::config::default_path();
+        let config = Arc::new(match &config_path {
+            Some(p) => match ConfigStore::load(p) {
+                Ok(c) => {
+                    if c.is_configured() {
+                        eprintln!("janus-smbd: configuration restored from {}", p.display());
+                    }
+                    c
+                }
+                Err(e) => {
+                    eprintln!("janus-smbd: cannot use config file {}: {e}", p.display());
+                    std::process::exit(1);
+                }
+            },
+            None => {
+                eprintln!("janus-smbd: no config path (set JANUS_CONFIG); configuration is not persisted");
+                ConfigStore::in_memory()
+            }
+        });
+        let state = Arc::new(Mutex::new(DaemonState::from_config(&config)));
+        let switch = Arc::new(SwitchBackend::new());
+        state.lock().await.install_backend(&switch);
         let gate = Arc::new(WriteGate::default());
         // SMB account: dev uses JANUS_SMB_USER/JANUS_SMB_PASSWORD, otherwise a 0600 file
         // (created by `janus-cli client configure`). There is no guest access.
@@ -105,6 +147,8 @@ fn run(dev: bool) {
         let control_svc =
             ControlService::new(Arc::clone(&state), Arc::clone(&gate))
                 .with_shutdown(shutdown_tx)
+                .with_config(Arc::clone(&config))
+                .with_backend(Arc::clone(&switch))
                 .with_credentials(Arc::clone(&credentials));
         let control_listener = match tokio::net::TcpListener::bind(&control_addr).await {
             Ok(l) => l,
@@ -136,30 +180,33 @@ fn run(dev: bool) {
         if dev {
             eprintln!("janus-smbd: dev mode; configure with: janus-cli client configure …");
         }
-        let local_root = std::env::var_os(LOCAL_ROOT_ENV)
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::env::temp_dir().join("janus-dev-share"));
-        let backend = match LocalFsBackend::new(&local_root) {
-            Ok(b) => Arc::new(b),
-            Err(e) => {
-                eprintln!(
-                    "janus-smbd: cannot use {} as the share directory: {e}",
-                    local_root.display()
-                );
-                std::process::exit(1);
-            }
+        // Backend: production serves the share from the receiver (gRPC/mTLS), built from the
+        // persisted/pushed configuration and rebuilt on every `Configure`. Setting
+        // JANUS_SMB_LOCAL_ROOT selects a plain local directory instead (dev, no receiver).
+        let smb = if let Some(root) = std::env::var_os(LOCAL_ROOT_ENV) {
+            let root = std::path::PathBuf::from(root);
+            let backend = match LocalFsBackend::new(&root) {
+                Ok(b) => Arc::new(b),
+                Err(e) => {
+                    eprintln!(
+                        "janus-smbd: cannot use {} as the share directory: {e}",
+                        root.display()
+                    );
+                    std::process::exit(1);
+                }
+            };
+            eprintln!(
+                "janus-smbd: DEV share directory {} ({LOCAL_ROOT_ENV}); no receiver is used",
+                root.display()
+            );
+            spawn_smb(&state, &credentials, backend, smb_listener)
+        } else {
+            let backend = Arc::clone(&switch);
+            eprintln!(
+                "janus-smbd: share backend: receiver over gRPC/mTLS (waits for `janus-cli client configure` if not configured)"
+            );
+            spawn_smb(&state, &credentials, backend, smb_listener)
         };
-        eprintln!(
-            "janus-smbd: share directory {} (override with {LOCAL_ROOT_ENV})",
-            local_root.display()
-        );
-        let smb_server = Arc::new(DevServer::new(
-            ServerConfig::default(),
-            Arc::clone(&state),
-            Arc::clone(&credentials),
-            backend,
-        ));
-        let smb = tokio::spawn(async move { smb_server.serve(smb_listener).await });
 
         // The failure of either plane is fatal for the daemon.
         tokio::select! {

@@ -96,7 +96,9 @@ share (details and the run are in `crates/smb-core/README.md`). Next (J2) is the
 CREATE of files, READ/WRITE/FLUSH and so on, then the backends.
 Business logic marked `todo!()` is tied to the architecture sections below.
 
-License: MIT.
+## License
+
+MIT. See [LICENSE](LICENSE).
 
 ---
 

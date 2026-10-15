@@ -262,22 +262,29 @@ async fn an_unreachable_receiver_is_remote_unavailable_not_not_found() {
     let addr = l.local_addr().unwrap();
     drop(l);
     let b = backend_for(addr);
-    let t = std::time::Instant::now();
+    // Windows takes ~2 s per refused connect (SYN retransmits), so a sum over several operations
+    // is not portable; what matters is that each operation stays within the time budget.
+    let budget = janus_lib::remote::Timeouts::default().budget;
+    macro_rules! timed {
+        ($op:expr) => {{
+            let t = std::time::Instant::now();
+            let r = $op.await.map(|_| ());
+            assert!(
+                t.elapsed() < budget + Duration::from_secs(2),
+                "must fail within the budget, took {:?}",
+                t.elapsed()
+            );
+            r
+        }};
+    }
     for r in [
-        b.stat("x").await.map(|_| ()),
-        b.open("x", req(Disposition::OpenOrCreate))
-            .await
-            .map(|_| ()),
-        b.list("").await.map(|_| ()),
-        b.statfs().await.map(|_| ()),
+        timed!(b.stat("x")),
+        timed!(b.open("x", req(Disposition::OpenOrCreate))),
+        timed!(b.list("")),
+        timed!(b.statfs()),
     ] {
         assert!(matches!(r, Err(BackendError::RemoteUnavailable)), "{r:?}");
     }
-    assert!(
-        t.elapsed() < Duration::from_secs(15),
-        "must fail fast, took {:?}",
-        t.elapsed()
-    );
 }
 
 /// Receiver on a fixed listener that can be stopped and started again over the same store.

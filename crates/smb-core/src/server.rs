@@ -209,7 +209,7 @@ fn trace_exchange(conn_id: ConnId, raw: &[u8], result: &Result<Reply, smb_wire::
                 m.header.flags,
                 m.header.status
             ),
-            Err(e) => format!("<не разобран: {e}>"),
+            Err(e) => format!("<unparsed: {e}>"),
         }
     };
     let elements = |buf: &[u8]| -> Vec<String> {
@@ -237,8 +237,8 @@ fn trace_exchange(conn_id: ConnId, raw: &[u8], result: &Result<Reply, smb_wire::
     };
     let resp = match result {
         Ok(Reply::Now(b)) if smb_wire::messages::is_smb1(raw) || !b.is_empty() => elements(b),
-        Ok(_) => vec!["(без ответа)".to_owned()],
-        Err(e) => vec![format!("ОШИБКА {e}")],
+        Ok(_) => vec!["(no response)".to_owned()],
+        Err(e) => vec![format!("ERROR {e}")],
     };
     eprintln!("janus: conn {conn_id:?} → {}", req.join(" | "));
     eprintln!("janus: conn {conn_id:?} ← {}", resp.join(" | "));

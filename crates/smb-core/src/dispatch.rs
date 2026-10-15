@@ -95,7 +95,7 @@ pub struct ServerCtx<'a> {
 
 /// System source of randomness for `ServerCtx::random`.
 pub fn system_random(buf: &mut [u8]) {
-    getrandom::fill(buf).expect("системный генератор случайных чисел недоступен");
+    getrandom::fill(buf).expect("system random number generator unavailable");
 }
 
 /// One reply before assembly: header + body + the key to sign with.
@@ -140,7 +140,7 @@ impl Dispatcher {
             return Self::smb1_negotiate(payload, conn, ctx);
         }
         if payload.len() >= 4 && payload[..4] == SMB2_TRANSFORM_MAGIC {
-            return Err(WireError::Malformed("шифрование не согласовано"));
+            return Err(WireError::Malformed("encryption not negotiated"));
         }
         let parts = split_compound(payload)?;
         let compound = parts.len() > 1;
@@ -151,7 +151,7 @@ impl Dispatcher {
         for raw in parts {
             let mut msg = Message::decode_single(raw)?;
             if msg.header.flags & flags::SERVER_TO_REDIR != 0 {
-                return Err(WireError::Malformed("ответ вместо запроса"));
+                return Err(WireError::Malformed("response instead of request"));
             }
             // Related operations: identifiers are inherited from the previous request.
             if msg.header.flags & flags::RELATED_OPERATIONS != 0 {
@@ -169,15 +169,15 @@ impl Dispatcher {
                 .filter(|&st| st != status::SUCCESS);
 
             if conn.credits.charge(msg.header.credit_charge).is_err() {
-                return Err(WireError::Malformed("недостаточно кредитов"));
+                return Err(WireError::Malformed("insufficient credits"));
             }
             let element = match msg.header.command {
                 Command::Negotiate | Command::SessionSetup if compound => {
-                    return Err(WireError::Malformed("NEGOTIATE/SESSION_SETUP в compound"));
+                    return Err(WireError::Malformed("NEGOTIATE/SESSION_SETUP in compound"));
                 }
                 Command::Negotiate => Self::negotiate(raw, &msg, conn, ctx)?,
                 _ if conn.dialect.is_none() => {
-                    return Err(WireError::Malformed("команда до NEGOTIATE"));
+                    return Err(WireError::Malformed("command before NEGOTIATE"));
                 }
                 Command::SessionSetup => Self::session_setup(raw, &msg, conn, ctx)?,
                 _ => Self::authenticated(raw, &msg, conn, ctx, related_failed)?,
@@ -199,11 +199,11 @@ impl Dispatcher {
         ctx: &ServerCtx<'_>,
     ) -> Result<Reply, WireError> {
         if conn.dialect.is_some() || conn.smb1_negotiated {
-            return Err(WireError::Malformed("SMB1 после NEGOTIATE"));
+            return Err(WireError::Malformed("SMB1 after NEGOTIATE"));
         }
         let dialects = smb_wire::messages::smb1_negotiate_dialects(payload)?;
         let Some(revision) = smb_wire::messages::smb1_wildcard_revision(&dialects) else {
-            return Err(WireError::Malformed("SMB1-клиент без SMB 2.x"));
+            return Err(WireError::Malformed("SMB1 client without SMB 2.x"));
         };
         conn.smb1_negotiated = true;
 
@@ -258,7 +258,7 @@ impl Dispatcher {
         let h = &msg.header;
         if conn.dialect.is_some() {
             // MS-SMB2 §3.3.5.4: a repeated NEGOTIATE on a connection means disconnect.
-            return Err(WireError::Malformed("повторный NEGOTIATE"));
+            return Err(WireError::Malformed("repeated NEGOTIATE"));
         }
         let req = NegotiateReq::decode(&mut Reader::new(&msg.body))?;
         let Some(dialect) = req.select_dialect() else {
@@ -504,7 +504,7 @@ impl Dispatcher {
         let session = conn
             .sessions
             .get_mut(&h.session_id)
-            .expect("сессия найдена выше");
+            .expect("session found above");
         let out = match h.command {
             Command::Echo | Command::Logoff => {
                 decode_simple_req(&mut Reader::new(&msg.body))?;
@@ -724,11 +724,11 @@ fn pending_mut(conn: &mut ConnState, sid: u64) -> &mut PendingAuth {
     match &mut conn
         .sessions
         .get_mut(&sid)
-        .expect("сессия в состоянии Authenticating")
+        .expect("session in Authenticating state")
         .state
     {
         SessionState::Authenticating(p) => p,
-        SessionState::Active { .. } => unreachable!("ожидали Authenticating"),
+        SessionState::Active { .. } => unreachable!("expected Authenticating"),
     }
 }
 
@@ -765,12 +765,12 @@ fn split_compound(payload: &[u8]) -> Result<Vec<&[u8]>, WireError> {
             return Ok(out);
         }
         if next < smb_wire::header::HEADER_LEN || !next.is_multiple_of(8) || next > rest.len() {
-            return Err(WireError::Malformed("NextCommand вне пакета"));
+            return Err(WireError::Malformed("NextCommand outside the packet"));
         }
         out.push(&rest[..next]);
         rest = &rest[next..];
         if out.len() >= MAX_COMPOUND {
-            return Err(WireError::Malformed("слишком длинная compound-цепочка"));
+            return Err(WireError::Malformed("compound chain too long"));
         }
     }
 }
@@ -898,7 +898,7 @@ mod tests {
             };
             match Dispatcher::handle(payload, &mut self.conn, &ctx)? {
                 Reply::Now(b) => Ok(b),
-                _ => panic!("ожидали Reply::Now"),
+                _ => panic!("expected Reply::Now"),
             }
         }
 
@@ -938,7 +938,7 @@ mod tests {
         assert_eq!(
             u16::from_le_bytes([b[6], b[7]]),
             1,
-            "один negotiate context"
+            "single negotiate context"
         );
         assert_eq!(&b[8..24], &[9; 16], "ServerGuid");
         assert_eq!(
@@ -947,7 +947,7 @@ mod tests {
             "capabilities"
         );
         let t = u64::from_le_bytes(b[40..48].try_into().unwrap());
-        assert_eq!(t, 133_000_000_000_000_000, "реальное FILETIME из ctx");
+        assert_eq!(t, 133_000_000_000_000_000, "real FILETIME from ctx");
         assert_eq!(
             u64::from_le_bytes(b[48..56].try_into().unwrap()),
             0,
@@ -1030,16 +1030,12 @@ mod tests {
         assert_eq!(p.status(), status::SUCCESS);
         assert_eq!(p.header().message_id, 0);
         let b = &p.message.body;
-        assert_eq!(
-            u16::from_le_bytes([b[2], b[3]]),
-            0x0003,
-            "подпись обязательна"
-        );
-        assert_eq!(u16::from_le_bytes([b[4], b[5]]), 0x02FF, "wildcard-диалект");
-        assert_eq!(fx.conn.dialect, None, "диалект ещё не выбран");
+        assert_eq!(u16::from_le_bytes([b[2], b[3]]), 0x0003, "signing required");
+        assert_eq!(u16::from_le_bytes([b[4], b[5]]), 0x02FF, "wildcard dialect");
+        assert_eq!(fx.conn.dialect, None, "dialect not chosen yet");
         assert_eq!(
             fx.conn.preauth_hash, [0; 64],
-            "SMB1-обмен не входит в preauth-хэш"
+            "SMB1 exchange is not part of the preauth hash"
         );
         // The real SMB2 NEGOTIATE after the wildcard goes through as usual, the hash is computed from scratch.
         let mut c = ok_client();
@@ -1089,7 +1085,7 @@ mod tests {
         // The reply is signed with a key derived by the client independently of the server.
         assert!(
             c.verify_response(&r.raw),
-            "подпись финального SESSION_SETUP-ответа"
+            "signature of the final SESSION_SETUP response"
         );
         assert_eq!(r.header().session_id, c.session_id);
         assert_ne!(c.session_id, 0);
@@ -1131,10 +1127,14 @@ mod tests {
         assert_eq!(
             r.header().flags & flags::SIGNED,
             0,
-            "ошибка входа не подписывается"
+            "logon failure is not signed"
         );
-        assert_eq!(r.message.body, error_body(), "в теле нет причины отказа");
-        assert!(fx.conn.sessions.is_empty(), "сессия удалена");
+        assert_eq!(
+            r.message.body,
+            error_body(),
+            "no failure reason in the body"
+        );
+        assert!(fx.conn.sessions.is_empty(), "session removed");
         assert_eq!(fx.conn.auth_failures, 1);
         assert!(!fx.conn.close_after_reply);
     }
@@ -1344,10 +1344,10 @@ mod tests {
         let r = fx.send(&req).unwrap();
         let p = Response::parse(&r).unwrap();
         assert_eq!(p.status(), status::ACCESS_DENIED);
-        assert!(c.verify_response(&r), "отказ тоже подписан");
+        assert!(c.verify_response(&r), "the rejection is signed too");
         assert!(
             fx.conn.sessions[&c.session_id].trees.is_empty(),
-            "команда не выполнена"
+            "command not executed"
         );
     }
 
@@ -1495,7 +1495,10 @@ mod tests {
         let r = fx
             .send(&c.signed_request(Command::Logoff, 0, &simple_body()))
             .unwrap();
-        assert!(c.verify_response(&r), "ответ LOGOFF подписан ключом сессии");
+        assert!(
+            c.verify_response(&r),
+            "LOGOFF response signed with the session key"
+        );
         assert_eq!(Response::parse(&r).unwrap().status(), status::SUCCESS);
         assert!(fx.conn.sessions.is_empty());
         // after LOGOFF the session is invalid
@@ -1565,9 +1568,9 @@ mod tests {
         let parts = split_compound(&resp);
         assert_eq!(parts.len(), 3);
         for (i, p) in parts.iter().enumerate() {
-            assert!(c.verify_response(p), "элемент {i} подписан и валиден");
+            assert!(c.verify_response(p), "item {i} is signed and valid");
             if i + 1 < parts.len() {
-                assert_eq!(p.len() % 8, 0, "элемент {i} выровнен");
+                assert_eq!(p.len() % 8, 0, "item {i} is aligned");
             }
         }
         let statuses: Vec<u32> = parts
@@ -1740,7 +1743,7 @@ mod tests {
         assert_eq!(
             u32::from_le_bytes(b[56..60].try_into().unwrap()),
             0x10,
-            "каталог"
+            "directory"
         );
         assert_eq!(&b[88 + 16..88 + 20], b"MxAc");
         assert_eq!(
@@ -1896,7 +1899,7 @@ mod tests {
         assert_eq!(
             q(2, 3, 4096, RELATED).0,
             status::FILE_CLOSED,
-            "related вне цепочки"
+            "related outside a chain"
         );
     }
 

@@ -34,7 +34,7 @@ pub struct OpenTable {
 
 impl OpenTable {
     pub fn park_all_for_conn(&self, _conn: crate::server::ConnId) {
-        todo!("Active(conn) → Parked + таймер DurableConfig.timeout")
+        todo!("Active(conn) → Parked + timer DurableConfig.timeout")
     }
 
     pub fn reconnect(
@@ -42,7 +42,7 @@ impl OpenTable {
         _create_guid: [u8; 16],
         _new_conn: crate::server::ConnId,
     ) -> Option<FileId> {
-        todo!("DURABLE_HANDLE_RECONNECT_V2: Parked → Active(new_conn), тот же FileId")
+        todo!("DURABLE_HANDLE_RECONNECT_V2: Parked → Active(new_conn), same FileId")
     }
 }
 
@@ -55,7 +55,7 @@ impl LeaseTable {
     /// Server-initiated break: puts LeaseBreakNotify into the owning
     /// connection's write queue and arms the ack timer.
     pub fn request_break(&self, _key: LeaseKey) {
-        todo!("Granted → BreakPending; таймаут ack → принудительный даунгрейд")
+        todo!("Granted → BreakPending; ack timeout → forced downgrade")
     }
 }
 

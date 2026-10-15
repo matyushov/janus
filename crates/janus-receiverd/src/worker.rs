@@ -310,7 +310,7 @@ mod tests {
         for bad in ["../escape", "/abs", "a/../../b", "", "C:/x"] {
             assert!(
                 store.write_range(bad, 0, b"x").is_err(),
-                "должно быть отклонено: {bad}"
+                "must be rejected: {bad}"
             );
         }
         fs::remove_dir_all(dir).ok();

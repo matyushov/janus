@@ -24,8 +24,8 @@ case "$1" in
             chmod 640 /etc/janus/receiverd.env 2>/dev/null || true
         fi
 
-        echo "janus-receiverd установлен. Дальше:"
-        echo "  1) отредактируйте /etc/janus/receiverd.env"
+        echo "janus-receiverd installed. Next steps:"
+        echo "  1) edit /etc/janus/receiverd.env"
         echo "  2) systemctl enable --now janus-receiverd"
         ;;
 esac

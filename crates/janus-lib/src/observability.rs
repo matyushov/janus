@@ -34,7 +34,7 @@ pub struct EventBus;
 
 impl EventBus {
     pub fn emit(&self, _e: Event) {
-        todo!("broadcast подписчикам + DiagRing")
+        todo!("broadcast to subscribers + DiagRing")
     }
 }
 

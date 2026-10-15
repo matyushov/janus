@@ -54,7 +54,7 @@ fn tlv(buf: &[u8]) -> Result<(u8, &[u8], &[u8]), WireError> {
     } else {
         let n = (l0 & 0x7F) as usize;
         if n == 0 || n > 4 {
-            return Err(WireError::Malformed("DER: неподдерживаемая длина"));
+            return Err(WireError::Malformed("DER: unsupported length"));
         }
         let bytes = buf.get(2..2 + n).ok_or(WireError::Truncated)?;
         (
@@ -70,7 +70,7 @@ fn tlv(buf: &[u8]) -> Result<(u8, &[u8], &[u8]), WireError> {
 fn expect(buf: &[u8], tag: u8) -> Result<(&[u8], &[u8]), WireError> {
     let (t, c, rest) = tlv(buf)?;
     if t != tag {
-        return Err(WireError::Malformed("DER: неожиданный тег"));
+        return Err(WireError::Malformed("DER: unexpected tag"));
     }
     Ok((c, rest))
 }
@@ -100,7 +100,7 @@ impl SpnegoToken {
                 let (inner, _) = expect(bytes, TAG_APPLICATION_0)?;
                 let (oid, rest) = expect(inner, TAG_OID)?;
                 if oid != OID_SPNEGO {
-                    return Err(WireError::Malformed("GSS: не SPNEGO"));
+                    return Err(WireError::Malformed("GSS: not SPNEGO"));
                 }
                 let (c, _) = expect(rest, TAG_CTX_0)?;
                 Self::parse_init(c)
@@ -113,7 +113,7 @@ impl SpnegoToken {
                 let (c, _) = expect(bytes, TAG_CTX_1)?;
                 Self::parse_resp(c)
             }
-            _ => Err(WireError::Malformed("SPNEGO: неизвестный токен")),
+            _ => Err(WireError::Malformed("SPNEGO: unknown token")),
         }
     }
 
@@ -272,7 +272,7 @@ mod tests {
                 assert_eq!(&mech_token[..8], b"NTLMSSP\0");
                 assert_eq!(mech_token.len(), 40);
             }
-            other => panic!("ожидали NegTokenInit, получили {other:?}"),
+            other => panic!("expected NegTokenInit, got {other:?}"),
         }
     }
 

@@ -1,6 +1,6 @@
 [package]
 name = "janus-cli"
-description = "CLI управления демоном janus-smbd: тот же control-контракт (SmbFrontControl), что у агента-оркестратора, поверх unix-сокета."
+description = "Management CLI for the janus-smbd daemon: the same control contract (SmbFrontControl) as the orchestrator agent, over a unix socket."
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

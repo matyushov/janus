@@ -17,6 +17,6 @@ pub struct LaunchdSockets {
 
 pub fn checkin() -> std::io::Result<LaunchdSockets> {
     todo!(
-        "launch_activate_socket(\"smb-listener\") + \"control\"; вне macOS — ошибка с подсказкой про dev-режим"
+        "launch_activate_socket(\"smb-listener\") + \"control\"; outside macOS — an error hinting at dev mode"
     )
 }

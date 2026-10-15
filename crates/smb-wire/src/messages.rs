@@ -56,7 +56,7 @@ impl NegotiateReq {
         }
         let dialect_count = r.u16()? as usize;
         if dialect_count == 0 {
-            return Err(WireError::Malformed("NEGOTIATE без диалектов"));
+            return Err(WireError::Malformed("NEGOTIATE without dialects"));
         }
         let security_mode = r.u16()?;
         let _reserved = r.u16()?;
@@ -76,7 +76,7 @@ impl NegotiateReq {
         let contexts =
             if dialects.contains(&(Dialect::Smb311 as u16)) && ctx_count > 0 {
                 let start = ctx_offset.checked_sub(crate::header::HEADER_LEN).ok_or(
-                    WireError::Malformed("NegotiateContextOffset внутри заголовка"),
+                    WireError::Malformed("NegotiateContextOffset inside the header"),
                 )?;
                 NegotiateContexts::decode(body, start, ctx_count)?
             } else {
@@ -247,10 +247,10 @@ pub fn smb1_negotiate_dialects(payload: &[u8]) -> Result<Vec<String>, WireError>
     const SMB1_HEADER: usize = 32;
     const CMD_NEGOTIATE: u8 = 0x72;
     if !is_smb1(payload) || payload.len() < SMB1_HEADER + 3 {
-        return Err(WireError::Malformed("SMB1: короткий пакет"));
+        return Err(WireError::Malformed("SMB1: short packet"));
     }
     if payload[4] != CMD_NEGOTIATE {
-        return Err(WireError::Malformed("SMB1: не NEGOTIATE"));
+        return Err(WireError::Malformed("SMB1: not NEGOTIATE"));
     }
     let mut r = Reader::new(payload);
     r.seek(SMB1_HEADER)?;
@@ -261,7 +261,7 @@ pub fn smb1_negotiate_dialects(payload: &[u8]) -> Result<Vec<String>, WireError>
     let mut dialects = Vec::new();
     while data.remaining() > 0 {
         if data.u8()? != 0x02 {
-            return Err(WireError::Malformed("SMB1: ожидали маркер диалекта 0x02"));
+            return Err(WireError::Malformed("SMB1: expected dialect marker 0x02"));
         }
         let mut name = Vec::new();
         loop {
@@ -272,7 +272,7 @@ pub fn smb1_negotiate_dialects(payload: &[u8]) -> Result<Vec<String>, WireError>
         }
         dialects.push(String::from_utf8_lossy(&name).into_owned());
         if dialects.len() > 32 {
-            return Err(WireError::Malformed("SMB1: слишком много диалектов"));
+            return Err(WireError::Malformed("SMB1: too many dialects"));
         }
     }
     Ok(dialects)
@@ -323,14 +323,14 @@ impl SessionSetupReq {
         let start = off
             .checked_sub(crate::header::HEADER_LEN)
             .ok_or(WireError::Malformed(
-                "SecurityBufferOffset внутри заголовка",
+                "SecurityBufferOffset inside the header",
             ))?;
         let end = start
             .checked_add(len)
             .ok_or(WireError::Malformed("SecurityBuffer overflow"))?;
         let security_buffer = body
             .get(start..end)
-            .ok_or(WireError::Malformed("SecurityBuffer вне сообщения"))?
+            .ok_or(WireError::Malformed("SecurityBuffer outside the message"))?
             .to_vec();
         Ok(SessionSetupReq {
             flags,
@@ -377,15 +377,15 @@ impl TreeConnectReq {
         let len = r.u16()? as usize;
         let start = off
             .checked_sub(crate::header::HEADER_LEN)
-            .ok_or(WireError::Malformed("PathOffset внутри заголовка"))?;
+            .ok_or(WireError::Malformed("PathOffset inside the header"))?;
         let end = start
             .checked_add(len)
             .ok_or(WireError::Malformed("Path overflow"))?;
         let raw = body
             .get(start..end)
-            .ok_or(WireError::Malformed("Path вне сообщения"))?;
+            .ok_or(WireError::Malformed("Path outside the message"))?;
         if !raw.len().is_multiple_of(2) {
-            return Err(WireError::Malformed("Path: нечётная длина UTF-16"));
+            return Err(WireError::Malformed("Path: odd UTF-16 length"));
         }
         let units: Vec<u16> = raw
             .chunks_exact(2)
@@ -680,13 +680,13 @@ mod session_tests {
         let body = tree_connect_body("\\\\127.0.0.1\\backup");
         let req = TreeConnectReq::decode(&mut Reader::new(&body)).unwrap();
         assert_eq!(req.path, "\\\\127.0.0.1\\backup");
-        // Cyrillic and surrogates do not break parsing
-        let body = tree_connect_body("\\\\h\\шара😀");
+        // Non-ASCII and surrogates do not break parsing
+        let body = tree_connect_body("\\\\h\\σχάρα😀");
         assert_eq!(
             TreeConnectReq::decode(&mut Reader::new(&body))
                 .unwrap()
                 .path,
-            "\\\\h\\шара😀"
+            "\\\\h\\σχάρα😀"
         );
     }
 

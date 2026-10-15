@@ -1,6 +1,6 @@
 [package]
 name = "smb-wire"
-description = "SMB2/3 wire codec: байты ↔ типы. Ноль I/O, ноль долгоживущего состояния."
+description = "SMB2/3 wire codec: bytes ↔ types. Zero I/O, no long-lived state."
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

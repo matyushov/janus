@@ -120,14 +120,14 @@ impl CreateReq {
             String::new()
         } else {
             if !name_len.is_multiple_of(2) {
-                return Err(WireError::Malformed("CREATE: нечётная длина имени"));
+                return Err(WireError::Malformed("CREATE: odd name length"));
             }
             let start = name_off
                 .checked_sub(crate::header::HEADER_LEN)
-                .ok_or(WireError::Malformed("NameOffset внутри заголовка"))?;
+                .ok_or(WireError::Malformed("NameOffset inside the header"))?;
             let raw = body
                 .get(start..start + name_len)
-                .ok_or(WireError::Malformed("имя вне сообщения"))?;
+                .ok_or(WireError::Malformed("name outside the message"))?;
             let units: Vec<u16> = raw
                 .chunks_exact(2)
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
@@ -142,11 +142,11 @@ impl CreateReq {
                 ctx_off
                     .checked_sub(crate::header::HEADER_LEN)
                     .ok_or(WireError::Malformed(
-                        "CreateContextsOffset внутри заголовка",
+                        "CreateContextsOffset inside the header",
                     ))?;
             let chain = body
                 .get(start..start + ctx_len)
-                .ok_or(WireError::Malformed("контексты вне сообщения"))?;
+                .ok_or(WireError::Malformed("contexts outside the message"))?;
             decode_contexts(chain)?
         };
 

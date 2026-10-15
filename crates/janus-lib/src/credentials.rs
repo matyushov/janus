@@ -92,7 +92,7 @@ impl CredentialStore {
         let path = self.path.as_deref().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
-                "путь файла учётных данных неизвестен",
+                "credentials file path unknown",
             )
         })?;
         let creds = SmbCredentials {

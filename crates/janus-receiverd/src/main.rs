@@ -54,7 +54,7 @@ fn main() -> ExitCode {
             }
             flag @ ("--listen" | "--store" | "--quota") => {
                 let Some(value) = args.get(i + 1) else {
-                    eprintln!("janus-receiverd: {flag} требует значение");
+                    eprintln!("janus-receiverd: {flag} requires a value");
                     return ExitCode::from(2);
                 };
                 match flag {
@@ -63,7 +63,7 @@ fn main() -> ExitCode {
                     "--quota" => match value.parse() {
                         Ok(v) => quota = v,
                         Err(_) => {
-                            eprintln!("janus-receiverd: --quota: не число: {value}");
+                            eprintln!("janus-receiverd: --quota: not a number: {value}");
                             return ExitCode::from(2);
                         }
                     },
@@ -72,7 +72,7 @@ fn main() -> ExitCode {
                 i += 2;
             }
             other => {
-                eprintln!("janus-receiverd: неизвестный аргумент {other}\n");
+                eprintln!("janus-receiverd: unknown argument {other}\n");
                 print_usage();
                 return ExitCode::from(2);
             }
@@ -80,13 +80,13 @@ fn main() -> ExitCode {
     }
 
     if dev {
-        eprintln!("janus-receiverd: dev-режим (foreground, без mTLS)");
+        eprintln!("janus-receiverd: dev mode (foreground, no mTLS)");
     }
 
     let rt = match tokio::runtime::Runtime::new() {
         Ok(rt) => rt,
         Err(e) => {
-            eprintln!("janus-receiverd: не удалось создать runtime: {e}");
+            eprintln!("janus-receiverd: failed to create runtime: {e}");
             return ExitCode::FAILURE;
         }
     };
@@ -104,13 +104,13 @@ fn main() -> ExitCode {
 
 fn print_usage() {
     eprintln!(
-        "janus-receiverd — приёмный сервер janus.\n\n\
-         Использование: janus-receiverd [--dev] [--listen <addr>] [--store <dir>] [--quota <bytes>]\n\n  \
-         --dev     foreground-режим отладки\n  \
-         --listen  адрес data-плоскости (default {DEFAULT_LISTEN}, env {LISTEN_ENV})\n  \
-         --store   каталог хранения (default {DEFAULT_STORE}, env {STORE_ENV})\n  \
-         --quota   потолок в байтах, 0 = без лимита (env {QUOTA_ENV})\n\n\
-         Демон ожидает указаний на {CONTROL_ADDR}: janus-cli server status|machines|shutdown\n\
-         Переопределение control-адреса (dev): {CONTROL_ADDR_ENV}."
+        "janus-receiverd — janus receiver server.\n\n\
+         Usage: janus-receiverd [--dev] [--listen <addr>] [--store <dir>] [--quota <bytes>]\n\n  \
+         --dev     foreground debug mode\n  \
+         --listen  data plane address (default {DEFAULT_LISTEN}, env {LISTEN_ENV})\n  \
+         --store   storage directory (default {DEFAULT_STORE}, env {STORE_ENV})\n  \
+         --quota   limit in bytes, 0 = unlimited (env {QUOTA_ENV})\n\n\
+         The daemon awaits instructions on {CONTROL_ADDR}: janus-cli server status|machines|shutdown\n\
+         Control address override (dev): {CONTROL_ADDR_ENV}."
     );
 }

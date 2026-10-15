@@ -1,6 +1,6 @@
 [package]
 name = "janus-proto"
-description = "Общий protobuf-контракт: BandTransport, SmbFrontControl, ReceiverControl. Один контракт — несколько потребителей (Rust-демоны, CLI, C++ агента)."
+description = "Shared protobuf contract: BandTransport, SmbFrontControl, ReceiverControl. One contract, several consumers (Rust daemons, CLI, C++ agent)."
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

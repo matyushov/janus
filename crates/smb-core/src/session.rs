@@ -97,8 +97,8 @@ impl Session {
 
     /// Find an open object by FileId on the given tree.
     pub fn open_mut(&mut self, file_id: &[u8; 16], tree_id: u32) -> Option<&mut OpenRoot> {
-        let persistent = u64::from_le_bytes(file_id[..8].try_into().expect("8 байт"));
-        let volatile = u64::from_le_bytes(file_id[8..].try_into().expect("8 байт"));
+        let persistent = u64::from_le_bytes(file_id[..8].try_into().expect("8 bytes"));
+        let volatile = u64::from_le_bytes(file_id[8..].try_into().expect("8 bytes"));
         if persistent != volatile {
             return None;
         }
@@ -111,7 +111,7 @@ impl Session {
         if self.open_mut(file_id, tree_id).is_none() {
             return false;
         }
-        let volatile = u64::from_le_bytes(file_id[8..].try_into().expect("8 байт"));
+        let volatile = u64::from_le_bytes(file_id[8..].try_into().expect("8 bytes"));
         self.opens.remove(&volatile).is_some()
     }
 }

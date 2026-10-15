@@ -288,7 +288,7 @@ impl MockClient {
         match reply.result {
             Some(bundle_op_reply::Result::Listing(l)) => Ok(l.entries),
             other => Err(tonic::Status::internal(format!(
-                "ожидался listing, получено: {other:?}"
+                "expected listing, got: {other:?}"
             ))),
         }
     }
@@ -304,7 +304,7 @@ impl MockClient {
         match reply.result {
             Some(bundle_op_reply::Result::Stat(s)) => Ok(s),
             other => Err(tonic::Status::internal(format!(
-                "ожидался stat, получено: {other:?}"
+                "expected stat, got: {other:?}"
             ))),
         }
     }

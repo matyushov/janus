@@ -75,7 +75,7 @@ impl ReceiverControl for ReceiverControlService {
         &self,
         _req: Request<Empty>,
     ) -> Result<Response<Self::WatchEventsStream>, Status> {
-        Err(Status::unimplemented("WatchEvents: TODO (шина событий)"))
+        Err(Status::unimplemented("WatchEvents: TODO (event bus)"))
     }
 
     async fn get_diagnostics(
@@ -99,7 +99,7 @@ impl ReceiverControl for ReceiverControlService {
             }
             None => Ok(Response::new(Ack {
                 ok: false,
-                error: "остановка уже запрошена".into(),
+                error: "shutdown already requested".into(),
             })),
         }
     }

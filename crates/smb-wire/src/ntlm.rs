@@ -146,7 +146,7 @@ fn from_utf16le(b: &[u8]) -> Result<String, NtlmError> {
 }
 
 fn hmac_md5(key: &[u8], parts: &[&[u8]]) -> [u8; 16] {
-    let mut m = <HmacMd5 as Mac>::new_from_slice(key).expect("HMAC принимает любой ключ");
+    let mut m = <HmacMd5 as Mac>::new_from_slice(key).expect("HMAC accepts any key length");
     for p in parts {
         m.update(p);
     }
@@ -209,10 +209,10 @@ impl NtlmServer {
         let mut r = check_header(negotiate, 1)?;
         let client_flags = r.u32()?;
         if client_flags & flag::UNICODE == 0 {
-            return Err(NtlmError::Unsupported("OEM-only клиент"));
+            return Err(NtlmError::Unsupported("OEM-only client"));
         }
         if client_flags & flag::EXTENDED_SESSIONSECURITY == 0 {
-            return Err(NtlmError::Unsupported("нет extended session security"));
+            return Err(NtlmError::Unsupported("no extended session security"));
         }
         let flags = SERVER_FLAGS | (client_flags & CLIENT_DEPENDENT);
 
@@ -271,21 +271,21 @@ impl NtlmServer {
         let flags = r.u32()?;
 
         if user.is_empty() {
-            return Err(NtlmError::Unsupported("анонимный вход"));
+            return Err(NtlmError::Unsupported("anonymous logon"));
         }
         if flags & flag::UNICODE == 0 || flags & flag::EXTENDED_SESSIONSECURITY == 0 {
-            return Err(NtlmError::Unsupported("флаги AUTHENTICATE"));
+            return Err(NtlmError::Unsupported("AUTHENTICATE flags"));
         }
         // the client cannot enable KEY_EXCH/SIGN/SEAL that we did not advertise
         if flags & CLIENT_DEPENDENT & !self.flags != 0 {
-            return Err(NtlmError::Malformed("флаги вне CHALLENGE"));
+            return Err(NtlmError::Malformed("flags outside CHALLENGE"));
         }
         // NTLMv2: NTProofStr(16) + blob (>= 28 bytes + AV pairs); 24 bytes means NTLMv1
         if nt_response.len() <= 24 {
             return Err(NtlmError::Unsupported("NTLMv1"));
         }
         if nt_response.len() < 16 + 28 {
-            return Err(NtlmError::Malformed("NT response слишком короткий"));
+            return Err(NtlmError::Malformed("NT response too short"));
         }
         let (proof, temp) = nt_response.split_at(16);
 

@@ -1,6 +1,6 @@
 [package]
 name = "janus-lib"
-description = "Слой хранения (vfs/journal/uploader/sparsebundle-model) и слой управления (control/config/bonjour/observability) мак-стороны."
+description = "Storage layer (vfs/journal/uploader/sparsebundle-model) and control layer (control/config/bonjour/observability) of the Mac side."
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

@@ -45,12 +45,12 @@ impl ConfigStore {
     /// Load the persistent file at startup. A missing file is NOT an error
     /// (first start before the agent): the daemon lives without a share and waits for Configure.
     pub fn load(_path: &std::path::Path) -> std::io::Result<ConfigStore> {
-        todo!("чтение + валидация")
+        todo!("read + validate")
     }
 
     /// Validation → atomic persist (tmp+rename, 0600) → publication.
     pub fn apply(&self, _new: ShareConfig) -> std::io::Result<()> {
-        todo!("persist + swap; перестройка зависимых — у вызывающего (control)")
+        todo!("persist + swap; rebuilding dependents is the caller's job (control)")
     }
 
     pub fn current(&self) -> Arc<ShareConfig> {

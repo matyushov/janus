@@ -22,7 +22,7 @@ impl IdentityMap {
         &self,
         _client_cert_fingerprint: &str,
     ) -> Option<&(MachineId, std::path::PathBuf)> {
-        todo!("маппинг из конфигурации аплайенса")
+        todo!("mapping from the appliance configuration")
     }
 }
 
@@ -33,7 +33,9 @@ pub struct WorkerPool;
 
 impl WorkerPool {
     pub fn get_or_spawn(&self, _machine: &MachineId) -> WorkerHandle {
-        todo!("FreeBSD: jail без сети + nullfs store; Linux: uid+mount-ns; канал — unix-сокет")
+        todo!(
+            "FreeBSD: jail without network + nullfs store; Linux: uid+mount-ns; channel — unix socket"
+        )
     }
 }
 

@@ -1,6 +1,6 @@
 [package]
 name = "smb-core"
-description = "Ядро SMB-сервера: коннекты, сессии, handle-таблицы, durable/lease-семантика, Apple-расширения. Всё состояние протокола и I/O."
+description = "SMB server core: connections, sessions, handle tables, durable/lease semantics, Apple extensions. All protocol state and I/O."
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

@@ -130,7 +130,7 @@ impl SmbFrontControl for ControlService {
         {
             return Ok(Response::new(Ack {
                 ok: false,
-                error: format!("не удалось создать учётные данные SMB: {e}"),
+                error: format!("failed to create SMB credentials: {e}"),
             }));
         }
 
@@ -262,7 +262,7 @@ impl SmbFrontControl for ControlService {
             }
             None => Ok(Response::new(Ack {
                 ok: false,
-                error: "остановка уже запрошена".into(),
+                error: "shutdown already requested".into(),
             })),
         }
     }
@@ -290,7 +290,7 @@ mod shutdown_tests {
             })
         };
         assert!(svc.configure(req()).await.unwrap().into_inner().ok);
-        let first = store.get().expect("пара создана при configure");
+        let first = store.get().expect("pair created on configure");
         assert!(file.exists());
 
         // a repeated configure does not change the pair

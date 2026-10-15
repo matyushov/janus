@@ -106,36 +106,36 @@ pub struct ConfigureArgs {
 pub struct ParseError(pub String);
 
 pub const USAGE: &str = "\
-janus-cli — управление демонами janus
+janus-cli — janus daemon management
 
-Использование: janus-cli <client|server> <команда> [опции]
+Usage: janus-cli <client|server> <command> [options]
 
-Стороны:
-  client     janus-smbd — SMB-шлюз (127.0.0.1:50051)
-  server     janus-receiverd — приёмник (127.0.0.1:50052)
+Sides:
+  client     janus-smbd — SMB gateway (127.0.0.1:50051)
+  server     janus-receiverd — receiver (127.0.0.1:50052)
 
-Команды (обе стороны):
-  status                    состояние демона
-  events                    поток событий
-  diag --out <path>         выгрузить диагностический бандл
-  shutdown [--drain]        остановить демон (--drain только для client)
+Commands (both sides):
+  status                    daemon status
+  events                    event stream
+  diag --out <path>         dump a diagnostic bundle
+  shutdown [--drain]        stop the daemon (--drain is client-only)
 
-Команды (только client):
-  ready                     проверка связи с сервером (exit 0 = готов)
+Commands (client only):
+  ready                     check connectivity to the server (exit 0 = ready)
   configure --endpoint <host:port> --client-cert <pem> --client-key <pem>
             --ca <pem> [--share <name>] [--port <n>]
-                            задать сервер-приёмник, mTLS-идентичность и
-                            точку монтирования smb://127.0.0.1:<port>/<share>
-                            (--port только для вывода; реальный SMB-адрес
-                            задаётся окружением демона: JANUS_SMB_ADDR)
-  drain [--timeout <sec>]   дожать невыгруженные данные (default 300)
-  quiesce | resume          приостановить/возобновить приём записи
+                            set the receiver server, mTLS identity and
+                            the mount point smb://127.0.0.1:<port>/<share>
+                            (--port is for display only; the real SMB address
+                            is set by the daemon environment: JANUS_SMB_ADDR)
+  drain [--timeout <sec>]   flush pending data (default 300)
+  quiesce | resume          pause/resume accepting writes
 
-Команды (только server):
-  machines                  список машин: store, квоты, активные worker'ы
+Commands (server only):
+  machines                  list machines: store, quotas, active workers
 
-Адреса демонов фиксированы; переопределение (dev/тесты) — через переменные
-окружения JANUS_CLIENT_ADDR и JANUS_SERVER_ADDR.
+Daemon addresses are fixed; override (dev/tests) via the
+environment variables JANUS_CLIENT_ADDR and JANUS_SERVER_ADDR.
 ";
 
 pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, ParseError> {
@@ -146,15 +146,15 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, ParseError>
         Some("server") => Target::Server,
         Some(other) => {
             return Err(ParseError(format!(
-                "неизвестная сторона: {other} (ожидается client | server)"
+                "unknown side: {other} (expected client | server)"
             )));
         }
-        None => return Err(ParseError("не указана сторона (client | server)".into())),
+        None => return Err(ParseError("side not specified (client | server)".into())),
     };
 
     let cmd = args
         .next()
-        .ok_or_else(|| ParseError("не указана команда".into()))?;
+        .ok_or_else(|| ParseError("command not specified".into()))?;
 
     let command = match (target, cmd.as_str()) {
         // common
@@ -169,7 +169,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, ParseError>
         (Target::Server, "shutdown") => {
             if args.peek().map(String::as_str) == Some("--drain") {
                 return Err(ParseError(
-                    "--drain неприменим к server (у него нет журнала)".into(),
+                    "--drain does not apply to server (it has no journal)".into(),
                 ));
             }
             Command::Shutdown { drain: false }
@@ -184,7 +184,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, ParseError>
             let mount_port = match f.remove("--port") {
                 Some(v) => v
                     .parse()
-                    .map_err(|_| ParseError(format!("--port: не число: {v}")))?,
+                    .map_err(|_| ParseError(format!("--port: not a number: {v}")))?,
                 None => 0, // daemon default
             };
             let cfg = ConfigureArgs {
@@ -196,7 +196,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, ParseError>
                 mount_port,
             };
             if let Some((unknown, _)) = f.into_iter().next() {
-                return Err(ParseError(format!("configure: неизвестный флаг {unknown}")));
+                return Err(ParseError(format!("configure: unknown flag {unknown}")));
             }
             // the configure flags were consumed entirely: nothing left to check in the tail
             return Ok(Cli {
@@ -208,7 +208,7 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, ParseError>
             let timeout_sec = match optional_value(&mut args, "--timeout")? {
                 Some(v) => v
                     .parse()
-                    .map_err(|_| ParseError(format!("--timeout: не число: {v}")))?,
+                    .map_err(|_| ParseError(format!("--timeout: not a number: {v}")))?,
                 None => 300,
             };
             Command::Drain { timeout_sec }
@@ -219,14 +219,14 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, ParseError>
 
         (target, other) => {
             return Err(ParseError(format!(
-                "команда «{other}» не поддерживается стороной {}",
+                "command \"{other}\" is not supported by side {}",
                 target.name()
             )));
         }
     };
 
     if let Some(extra) = args.next() {
-        return Err(ParseError(format!("лишний аргумент: {extra}")));
+        return Err(ParseError(format!("unexpected argument: {extra}")));
     }
 
     Ok(Cli { target, command })
@@ -240,13 +240,13 @@ fn collect_flags(
     let mut map = std::collections::HashMap::new();
     while let Some(flag) = args.next() {
         if !flag.starts_with("--") {
-            return Err(ParseError(format!("ожидался --флаг, получено: {flag}")));
+            return Err(ParseError(format!("expected --flag, got: {flag}")));
         }
         let value = args
             .next()
-            .ok_or_else(|| ParseError(format!("{flag} требует значение")))?;
+            .ok_or_else(|| ParseError(format!("{flag} requires a value")))?;
         if map.insert(flag.clone(), value).is_some() {
-            return Err(ParseError(format!("флаг {flag} указан дважды")));
+            return Err(ParseError(format!("flag {flag} given twice")));
         }
     }
     Ok(map)
@@ -257,7 +257,7 @@ fn take_required(
     flag: &str,
 ) -> Result<String, ParseError> {
     map.remove(flag)
-        .ok_or_else(|| ParseError(format!("configure требует {flag} <значение>")))
+        .ok_or_else(|| ParseError(format!("configure requires {flag} <value>")))
 }
 
 fn required_value(
@@ -267,7 +267,7 @@ fn required_value(
 ) -> Result<String, ParseError> {
     match optional_value(args, flag)? {
         Some(v) => Ok(v),
-        None => Err(ParseError(format!("{cmd} требует {flag} <значение>"))),
+        None => Err(ParseError(format!("{cmd} requires {flag} <value>"))),
     }
 }
 
@@ -279,7 +279,7 @@ fn optional_value(
         args.next();
         let v = args
             .next()
-            .ok_or_else(|| ParseError(format!("{flag} требует значение")))?;
+            .ok_or_else(|| ParseError(format!("{flag} requires a value")))?;
         Ok(Some(v))
     } else {
         Ok(None)

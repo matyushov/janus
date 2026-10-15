@@ -1,6 +1,6 @@
 [package]
 name = "janus-smbd"
-description = "macOS LaunchDaemon: локальный SMB-эндпоинт Time Machine. Только склейка — вся логика в janus-lib/smb-core."
+description = "macOS LaunchDaemon: local SMB endpoint for Time Machine. Glue only — all logic lives in janus-lib/smb-core."
 version.workspace = true
 edition.workspace = true
 publish.workspace = true

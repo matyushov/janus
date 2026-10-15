@@ -15,16 +15,16 @@ pub struct UploaderHandle;
 impl UploaderHandle {
     /// Wait for the acks of all dirty ranges of the file + Fsync(file) on the receiver.
     pub async fn flush_barrier(&self, _file: PathId) -> Result<(), UploadError> {
-        todo!("барьер per-file")
+        todo!("per-file barrier")
     }
 
     /// The same for the whole bundle + Fsync(all_bundle). Drain stands on this.
     pub async fn drain_barrier(&self) -> Result<(), UploadError> {
-        todo!("барьер bundle")
+        todo!("bundle barrier")
     }
 
     pub fn backlog_bytes(&self) -> u64 {
-        todo!("для Status")
+        todo!("for Status")
     }
 }
 

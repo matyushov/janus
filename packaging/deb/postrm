@@ -12,8 +12,8 @@ case "$1" in
         rmdir /etc/janus 2>/dev/null || true
 
         if [ -d /var/lib/janus ]; then
-            echo "janus-receiverd: данные сохранены в /var/lib/janus"
-            echo "  удалить вручную: rm -rf /var/lib/janus"
+            echo "janus-receiverd: data kept in /var/lib/janus"
+            echo "  remove manually: rm -rf /var/lib/janus"
         fi
         ;;
 esac

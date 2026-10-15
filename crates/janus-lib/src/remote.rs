@@ -31,9 +31,9 @@ pub enum RemoteError {
 impl std::fmt::Display for RemoteError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            RemoteError::BadEndpoint(e) => write!(f, "некорректный endpoint: {e}"),
-            RemoteError::Unreachable(e) => write!(f, "приёмник недостижим: {e}"),
-            RemoteError::Rpc(s) => write!(f, "ошибка RPC: {s}"),
+            RemoteError::BadEndpoint(e) => write!(f, "invalid endpoint: {e}"),
+            RemoteError::Unreachable(e) => write!(f, "receiver unreachable: {e}"),
+            RemoteError::Rpc(s) => write!(f, "RPC error: {s}"),
         }
     }
 }
@@ -136,7 +136,7 @@ mod tests {
     #[test]
     fn bad_endpoint_rejected() {
         let cfg = RemoteConfig {
-            endpoint: "не a valid uri!!".into(),
+            endpoint: "not a valid uri!!".into(),
             ..Default::default()
         };
         assert!(RemoteClient::connect_lazy(&cfg).is_err());
@@ -151,7 +151,7 @@ mod tests {
         assert!(!cfg.tls_configured());
         cfg.ca_pem = b"ca".to_vec();
         cfg.client_cert_path = "c.pem".into();
-        assert!(!cfg.tls_configured(), "без ключа — не сконфигурирован");
+        assert!(!cfg.tls_configured(), "without a key — not configured");
         cfg.client_key_path = "k.pem".into();
         assert!(cfg.tls_configured());
     }

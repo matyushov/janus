@@ -45,11 +45,11 @@ async fn connect(target: Target) -> Channel {
             Ok(ch) => ch,
             Err(e) => {
                 eprintln!(
-                    "janus-cli: демон {} недоступен на {addr}: {e}",
+                    "janus-cli: daemon {} unavailable at {addr}: {e}",
                     target.name()
                 );
                 eprintln!(
-                    "  запущен ли {}? (dev: {} --dev)",
+                    "  is {} running? (dev: {} --dev)",
                     daemon_binary(target),
                     daemon_binary(target)
                 );
@@ -57,7 +57,7 @@ async fn connect(target: Target) -> Channel {
             }
         },
         Err(e) => {
-            eprintln!("janus-cli: некорректный адрес {addr}: {e}");
+            eprintln!("janus-cli: invalid address {addr}: {e}");
             std::process::exit(exit::USAGE);
         }
     }
@@ -97,12 +97,15 @@ async fn run_client(cmd: Command) {
                             std::env::var("JANUS_SMB_ADDR").ok().as_deref(),
                         );
                         println!(
-                            "janus-smbd сконфигурирован: сервер {}, шара smb://127.0.0.1:{}/{}",
+                            "janus-smbd configured: server {}, share smb://127.0.0.1:{}/{}",
                             args.endpoint, port, args.share
                         );
-                        println!("проверка связи: janus-cli client ready");
+                        println!("connectivity check: janus-cli client ready");
                     } else {
-                        eprintln!("janus-cli: демон отклонил конфигурацию: {}", ack.error);
+                        eprintln!(
+                            "janus-cli: daemon rejected the configuration: {}",
+                            ack.error
+                        );
                         std::process::exit(exit::NOT_READY);
                     }
                 }
@@ -113,9 +116,9 @@ async fn run_client(cmd: Command) {
             Ok(reply) => {
                 let r = reply.into_inner();
                 if r.ready {
-                    println!("janus-smbd готов: связь с сервером установлена");
+                    println!("janus-smbd ready: connected to the server");
                 } else {
-                    eprintln!("janus-smbd НЕ готов: {}", r.blocker);
+                    eprintln!("janus-smbd NOT ready: {}", r.blocker);
                     std::process::exit(exit::NOT_READY);
                 }
             }
@@ -124,22 +127,22 @@ async fn run_client(cmd: Command) {
         Command::Status => match c.status(Empty {}).await {
             Ok(reply) => {
                 let s = reply.into_inner();
-                println!("версия:             {}", s.version);
-                println!("SMB-сессий:         {}", s.smb_sessions);
-                println!("открытых handle:    {}", s.open_handles);
-                println!("durable в парковке: {}", s.durable_handles_parked);
-                println!("backlog журнала:    {} байт", s.journal_backlog_bytes);
-                println!("выгружено:          {} байт", s.uploaded_bytes_total);
-                println!("ошибок выгрузки:    {}", s.upload_errors);
+                println!("version:           {}", s.version);
+                println!("SMB sessions:      {}", s.smb_sessions);
+                println!("open handles:      {}", s.open_handles);
+                println!("parked durables:   {}", s.durable_handles_parked);
+                println!("journal backlog:   {} bytes", s.journal_backlog_bytes);
+                println!("uploaded:          {} bytes", s.uploaded_bytes_total);
+                println!("upload errors:     {}", s.upload_errors);
             }
             Err(e) => fail_rpc(e),
         },
         Command::Quiesce => match c.quiesce(Empty {}).await {
-            Ok(_) => println!("janus-smbd: запись приостановлена"),
+            Ok(_) => println!("janus-smbd: writes paused"),
             Err(e) => fail_rpc(e),
         },
         Command::Resume => match c.resume(Empty {}).await {
-            Ok(_) => println!("janus-smbd: запись возобновлена"),
+            Ok(_) => println!("janus-smbd: writes resumed"),
             Err(e) => fail_rpc(e),
         },
         Command::Drain { timeout_sec } => {
@@ -147,12 +150,8 @@ async fn run_client(cmd: Command) {
                 Ok(r) => {
                     let r = r.into_inner();
                     println!(
-                        "janus-smbd: drain {} (осталось {} байт)",
-                        if r.drained {
-                            "завершён"
-                        } else {
-                            "не завершён"
-                        },
+                        "janus-smbd: drain {} ({} bytes left)",
+                        if r.drained { "complete" } else { "incomplete" },
                         r.remaining_bytes
                     );
                     if !r.drained {
@@ -170,7 +169,7 @@ async fn run_client(cmd: Command) {
                 Ok(reply) => {
                     let ack = reply.into_inner();
                     if ack.ok {
-                        println!("janus-smbd: остановка запрошена");
+                        println!("janus-smbd: shutdown requested");
                     } else {
                         eprintln!("janus-cli: {}", ack.error);
                         std::process::exit(exit::NOT_READY);
@@ -180,10 +179,10 @@ async fn run_client(cmd: Command) {
             }
         }
         Command::Events | Command::Diag { .. } => {
-            eprintln!("janus-cli: команда пока не реализована на стороне демона");
+            eprintln!("janus-cli: command not implemented by the daemon yet");
             std::process::exit(exit::NOT_READY);
         }
-        Command::Machines => unreachable!("machines отсеивается парсером для client"),
+        Command::Machines => unreachable!("machines is rejected by the parser for client"),
     }
 }
 
@@ -204,7 +203,7 @@ fn build_configure(args: &ConfigureArgs) -> ConfigureRequest {
     let ca_pem = match std::fs::read(&args.ca) {
         Ok(b) => b,
         Err(e) => {
-            eprintln!("janus-cli: не читается --ca {}: {e}", args.ca.display());
+            eprintln!("janus-cli: cannot read --ca {}: {e}", args.ca.display());
             std::process::exit(exit::USAGE);
         }
     };
@@ -213,7 +212,7 @@ fn build_configure(args: &ConfigureArgs) -> ConfigureRequest {
         ("--client-key", &args.client_key),
     ] {
         if !path.exists() {
-            eprintln!("janus-cli: {flag} не найден: {}", path.display());
+            eprintln!("janus-cli: {flag} not found: {}", path.display());
             std::process::exit(exit::USAGE);
         }
     }
@@ -241,12 +240,12 @@ async fn run_server(cmd: Command) {
         Command::Status => match c.status(Empty {}).await {
             Ok(reply) => {
                 let s = reply.into_inner();
-                println!("версия:            {}", s.version);
-                println!("активных worker'ов:{}", s.active_workers);
-                println!("известных машин:   {}", s.machines_known);
-                println!("gRPC-сессий:       {}", s.grpc_sessions);
-                println!("принято:           {} байт", s.received_bytes_total);
-                println!("ошибок записи:     {}", s.write_errors);
+                println!("version:           {}", s.version);
+                println!("active workers:    {}", s.active_workers);
+                println!("known machines:    {}", s.machines_known);
+                println!("gRPC sessions:     {}", s.grpc_sessions);
+                println!("received:          {} bytes", s.received_bytes_total);
+                println!("write errors:      {}", s.write_errors);
             }
             Err(e) => fail_rpc(e),
         },
@@ -254,7 +253,7 @@ async fn run_server(cmd: Command) {
             Ok(reply) => {
                 let list = reply.into_inner().machines;
                 if list.is_empty() {
-                    println!("машин нет");
+                    println!("no machines");
                     return;
                 }
                 println!(
@@ -272,11 +271,7 @@ async fn run_server(cmd: Command) {
                         } else {
                             m.quota_bytes.to_string()
                         },
-                        if m.worker_active {
-                            "активен"
-                        } else {
-                            "—"
-                        }
+                        if m.worker_active { "active" } else { "—" }
                     );
                 }
             }
@@ -286,7 +281,7 @@ async fn run_server(cmd: Command) {
             Ok(reply) => {
                 let ack = reply.into_inner();
                 if ack.ok {
-                    println!("janus-receiverd: остановка запрошена");
+                    println!("janus-receiverd: shutdown requested");
                 } else {
                     eprintln!("janus-cli: {}", ack.error);
                     std::process::exit(exit::NOT_READY);
@@ -295,15 +290,15 @@ async fn run_server(cmd: Command) {
             Err(e) => fail_rpc(e),
         },
         Command::Events | Command::Diag { .. } => {
-            eprintln!("janus-cli: команда пока не реализована на стороне демона");
+            eprintln!("janus-cli: command not implemented by the daemon yet");
             std::process::exit(exit::NOT_READY);
         }
-        _ => unreachable!("client-команды отсеиваются парсером для server"),
+        _ => unreachable!("client commands are rejected by the parser for server"),
     }
 }
 
 fn fail_rpc(e: tonic::Status) -> ! {
-    eprintln!("janus-cli: демон отказал: {}", e.message());
+    eprintln!("janus-cli: daemon refused: {}", e.message());
     std::process::exit(exit::NOT_READY);
 }
 

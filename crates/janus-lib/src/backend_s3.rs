@@ -31,7 +31,7 @@ pub struct S3Config {
 impl S3Config {
     /// Extract from the common share configuration (once we add S3 fields to Configure).
     pub fn from_share(_cfg: &ShareConfig) -> S3Config {
-        todo!("маппинг S3-полей ShareConfig → S3Config")
+        todo!("map ShareConfig S3 fields → S3Config")
     }
 }
 

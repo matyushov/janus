@@ -33,7 +33,7 @@ pub fn preauth_chain(prev: &[u8; 64], frame_bytes: &[u8]) -> [u8; 64] {
 pub fn derive_key(session_key: &[u8; 16], label: &[u8], context: &[u8]) -> [u8; 16] {
     use hmac::Mac as _;
     let mut mac = <Hmac<Sha256> as hmac::Mac>::new_from_slice(session_key)
-        .expect("HMAC принимает любой ключ");
+        .expect("HMAC accepts any key length");
     mac.update(&1u32.to_be_bytes()); // counter i
     mac.update(label);
     mac.update(&[0]);
@@ -55,7 +55,7 @@ pub fn signing_key_311(session_key: &[u8; 16], preauth_hash: &[u8; 64]) -> [u8; 
 /// the computation regardless of its current content. There is nothing to sign in a frame
 /// shorter than the header: the caller checks the length (`verify` rejects such a frame).
 pub fn sign_cmac(signing_key: &[u8; 16], frame: &[u8]) -> [u8; 16] {
-    let mut mac = <Cmac<Aes128> as Mac>::new_from_slice(signing_key).expect("ключ 16 байт");
+    let mut mac = <Cmac<Aes128> as Mac>::new_from_slice(signing_key).expect("16-byte key");
     if frame.len() < HEADER_LEN {
         mac.update(frame);
     } else {

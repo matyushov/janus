@@ -442,7 +442,10 @@ impl Client {
     pub fn session_setup_2(&mut self, resp: &[u8]) -> Result<Vec<u8>, String> {
         let r = Response::parse(resp).map_err(|e| e.to_string())?;
         if r.status() != 0xC000_0016 {
-            return Err(format!("ожидали MORE_PROCESSING, статус {:#x}", r.status()));
+            return Err(format!(
+                "expected MORE_PROCESSING, status {:#x}",
+                r.status()
+            ));
         }
         self.preauth_hash = crypto::preauth_chain(&self.preauth_hash, resp);
         self.session_id = r.header().session_id;
@@ -452,7 +455,7 @@ impl Client {
                 neg_state: Some(NegState::AcceptIncomplete),
                 ..
             } => {}
-            other => return Err(format!("неожиданный SPNEGO: {other:?}")),
+            other => return Err(format!("unexpected SPNEGO: {other:?}")),
         }
         self.challenge_ntlm = token.ntlm_token().to_vec();
         let auth = ntlm_authenticate_message(
@@ -487,14 +490,14 @@ impl Client {
     pub fn signed_request(&mut self, command: Command, tree_id: u32, body: &[u8]) -> Vec<u8> {
         let h = request_header(command, self.next_id(), self.session_id, tree_id);
         let mut f = frame(&h, body);
-        sign_frame(&mut f, &self.signing_key.expect("сессия не установлена"));
+        sign_frame(&mut f, &self.signing_key.expect("session not established"));
         f
     }
 
     /// Verify the signature of a server reply.
     pub fn verify_response(&self, resp: &[u8]) -> bool {
         let r = Response::parse(resp).unwrap();
-        let key = self.signing_key.expect("сессия не установлена");
+        let key = self.signing_key.expect("session not established");
         r.header().flags & flags::SIGNED != 0 && crypto::verify(&key, resp, &r.header().signature)
     }
 }

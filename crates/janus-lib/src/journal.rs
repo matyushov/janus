@@ -56,15 +56,15 @@ pub struct DirtyIndex {
 
 impl DirtyIndex {
     pub fn insert(&mut self, _file: PathId, _offset: u64, _len: u32, _loc: Loc) {
-        todo!("вставка с расщеплением пересечений (later-wins)")
+        todo!("insert, splitting overlaps (later-wins)")
     }
 
     pub fn lookup(&self, _file: PathId, _offset: u64, _len: u64) -> Vec<Chunk> {
-        todo!("покрытие запроса: Wal-куски + Missing-дырки")
+        todo!("query coverage: Wal chunks + Missing holes")
     }
 
     pub fn dirty_ranges(&self, _file: PathId) -> Vec<(u64, u32, Loc)> {
-        todo!("для flush_barrier(file)")
+        todo!("for flush_barrier(file)")
     }
 }
 
@@ -83,11 +83,11 @@ impl Journal {
     /// Recovery at startup: scan segments from the checkpoint → DirtyIndex +
     /// ParkedHandleStore. After a crash we continue from the same place.
     pub fn recover(_wal_dir: &std::path::Path) -> std::io::Result<Journal> {
-        todo!("скан сегментов, проверка crc32, сборка индекса")
+        todo!("scan segments, verify crc32, build index")
     }
 
     pub fn append(&mut self, _file: PathId, _offset: u64, _data: &[u8]) -> Seq {
-        todo!("запись в активный сегмент + DirtyIndex.insert; Busy при переполнении")
+        todo!("append to the active segment + DirtyIndex.insert; Busy on overflow")
     }
 
     /// Read-your-writes: WAL pieces + holes to read through from the appliance.
@@ -97,6 +97,6 @@ impl Journal {
 
     /// All seq ≤ watermark are acknowledged by the appliance → trim segments.
     pub fn mark_uploaded(&mut self, _watermark: Seq) {
-        todo!("checkpoint + удаление полностью подтверждённых сегментов")
+        todo!("checkpoint + delete fully acknowledged segments")
     }
 }

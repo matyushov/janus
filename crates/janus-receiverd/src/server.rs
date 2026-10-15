@@ -31,10 +31,10 @@ pub async fn serve_dev(
     let local = listener.local_addr()?;
     let store = Arc::new(FileStore::open(store_dir)?);
     eprintln!(
-        "janus-receiverd: data-плоскость на {local}, store={} (quota={})",
+        "janus-receiverd: data plane on {local}, store={} (quota={})",
         store.root().display(),
         if quota_bytes == 0 {
-            "без лимита".to_string()
+            "unlimited".to_string()
         } else {
             quota_bytes.to_string()
         }
@@ -49,7 +49,7 @@ pub async fn serve_dev(
         shutdown: tokio::sync::Mutex::new(Some(shutdown_tx)),
     });
     let control_listener = TcpListener::bind(control_addr).await?;
-    eprintln!("janus-receiverd: control-плоскость на {control_addr} (janus-cli server …)");
+    eprintln!("janus-receiverd: control plane on {control_addr} (janus-cli server …)");
     let control_svc = ReceiverControlService::new(state);
     let control = tokio::spawn(async move {
         let incoming = tokio_stream::wrappers::TcpListenerStream::new(control_listener);
@@ -62,13 +62,13 @@ pub async fn serve_dev(
     // The data plane lives until the Shutdown command from the control plane.
     let data = serve_on_listener(listener, store, quota_bytes, async move {
         let _ = shutdown_rx.await;
-        eprintln!("janus-receiverd: получена команда остановки");
+        eprintln!("janus-receiverd: shutdown command received");
     });
 
     tokio::select! {
         r = data => r?,
         r = control => {
-            r.map_err(|e| format!("control-плоскость упала: {e}"))??;
+            r.map_err(|e| format!("control plane failed: {e}"))??;
         }
     }
     Ok(())

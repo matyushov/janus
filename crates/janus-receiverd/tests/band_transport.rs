@@ -47,7 +47,7 @@ async fn write_is_idempotent_on_retry() {
             .expect("write retry");
     }
     let on_disk = srv.store.read_file("bands/2").expect("file");
-    assert_eq!(on_disk.len(), 8, "офсетная запись не должна дублироваться");
+    assert_eq!(on_disk.len(), 8, "offset write must not be duplicated");
     assert_eq!(&on_disk[4..], b"abcd");
 }
 
@@ -130,11 +130,11 @@ async fn path_traversal_is_rejected_over_grpc() {
             .client
             .write(bad, 0, b"x")
             .await
-            .expect_err("должно быть отклонено");
+            .expect_err("must be rejected");
         assert_eq!(
             err.code(),
             tonic::Code::PermissionDenied,
-            "путь {bad} должен отбиваться"
+            "path {bad} must be rejected"
         );
     }
     // and nothing was created outside the store
@@ -146,9 +146,9 @@ async fn temp_store_is_removed_on_drop() {
     let path = {
         let srv = TestServer::start("cleanup", 0).await.expect("server up");
         let p = srv.store.path().to_path_buf();
-        assert!(p.exists(), "store существует пока живёт сервер");
+        assert!(p.exists(), "store exists while the server lives");
         p
     };
     // after TestServer (and TempStore) is dropped the directory must disappear
-    assert!(!path.exists(), "временный store должен удаляться при drop");
+    assert!(!path.exists(), "temporary store must be removed on drop");
 }

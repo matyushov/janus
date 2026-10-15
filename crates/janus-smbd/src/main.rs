@@ -52,7 +52,7 @@ fn main() {
                 return;
             }
             other => {
-                eprintln!("janus-smbd: неизвестный аргумент {other}\n");
+                eprintln!("janus-smbd: unknown argument {other}\n");
                 print_usage();
                 std::process::exit(2);
             }
@@ -64,14 +64,14 @@ fn main() {
 
 fn print_usage() {
     eprintln!(
-        "janus-smbd — SMB-шлюз janus.\n\n\
-         Использование: janus-smbd [--dev]\n\n  \
-         --dev    foreground-режим отладки (подробный вывод)\n\n\
-         Демон ожидает указаний на {CONTROL_ADDR}. Настройка:\n  \
+        "janus-smbd — janus SMB gateway.\n\n\
+         Usage: janus-smbd [--dev]\n\n  \
+         --dev    foreground debug mode (verbose output)\n\n\
+         The daemon awaits instructions on {CONTROL_ADDR}. Setup:\n  \
          janus-cli client configure --endpoint <host:port> --client-cert <pem> \\\n    \
          --client-key <pem> --ca <pem> [--share <name>] [--port <n>]\n\n\
-         Переопределение адресов (dev): {CONTROL_ADDR_ENV}, {SMB_ADDR_ENV}.\n\
-         SMB-пользователь: JANUS_SMB_USER/JANUS_SMB_PASSWORD или файл JANUS_SMB_CREDS_FILE."
+         Address overrides (dev): {CONTROL_ADDR_ENV}, {SMB_ADDR_ENV}.\n\
+         SMB user: JANUS_SMB_USER/JANUS_SMB_PASSWORD or the JANUS_SMB_CREDS_FILE file."
     );
 }
 
@@ -87,10 +87,10 @@ fn run(dev: bool) {
         // (created by `janus-cli client configure`). There is no guest access.
         let credentials = Arc::new(CredentialStore::from_process_env());
         match credentials.get() {
-            Some(c) => eprintln!("janus-smbd: SMB-пользователь «{}» (пароль не логируется)", c.user),
+            Some(c) => eprintln!("janus-smbd: SMB user \"{}\" (password is not logged)", c.user),
             None => eprintln!(
-                "janus-smbd: SMB-учётных данных нет — входы отклоняются до `janus-cli client configure` \
-                 (или задайте {}/{})",
+                "janus-smbd: no SMB credentials — logins are rejected until `janus-cli client configure` \
+                 (or set {}/{})",
                 janus_lib::credentials::USER_ENV,
                 janus_lib::credentials::PASSWORD_ENV
             ),
@@ -105,11 +105,11 @@ fn run(dev: bool) {
         let control_listener = match tokio::net::TcpListener::bind(&control_addr).await {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("janus-smbd: не удалось слушать control {control_addr}: {e}");
+                eprintln!("janus-smbd: failed to listen on control {control_addr}: {e}");
                 std::process::exit(1);
             }
         };
-        eprintln!("janus-smbd: control-плоскость на {control_addr} (janus-cli client …)");
+        eprintln!("janus-smbd: control plane on {control_addr} (janus-cli client …)");
         let control = tokio::spawn(async move {
             let incoming = tokio_stream::wrappers::TcpListenerStream::new(control_listener);
             tonic::transport::Server::builder()
@@ -124,13 +124,13 @@ fn run(dev: bool) {
         let smb_listener = match tokio::net::TcpListener::bind(&smb_addr).await {
             Ok(l) => l,
             Err(e) => {
-                eprintln!("janus-smbd: не удалось слушать SMB {smb_addr}: {e}");
+                eprintln!("janus-smbd: failed to listen on SMB {smb_addr}: {e}");
                 std::process::exit(1);
             }
         };
-        eprintln!("janus-smbd: SMB на {smb_addr} (точка монтирования smb://{smb_addr}/<share>)");
+        eprintln!("janus-smbd: SMB on {smb_addr} (mount point smb://{smb_addr}/<share>)");
         if dev {
-            eprintln!("janus-smbd: dev-режим; настроить: janus-cli client configure …");
+            eprintln!("janus-smbd: dev mode; configure with: janus-cli client configure …");
         }
         let smb_server = Arc::new(DevServer::new(
             ServerConfig::default(),
@@ -141,10 +141,10 @@ fn run(dev: bool) {
 
         // The failure of either plane is fatal for the daemon.
         tokio::select! {
-            r = control => eprintln!("janus-smbd: control-плоскость остановлена: {r:?}"),
-            r = smb => eprintln!("janus-smbd: SMB-плоскость остановлена: {r:?}"),
+            r = control => eprintln!("janus-smbd: control plane stopped: {r:?}"),
+            r = smb => eprintln!("janus-smbd: SMB plane stopped: {r:?}"),
             _ = shutdown_rx => {
-                eprintln!("janus-smbd: остановка по команде shutdown");
+                eprintln!("janus-smbd: stopping on shutdown command");
                 // Let the gRPC reply to Shutdown reach the client.
                 tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                 std::process::exit(0);

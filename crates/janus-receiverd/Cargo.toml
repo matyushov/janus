@@ -1,6 +1,6 @@
 [package]
 name = "janus-receiverd"
-description = "Приёмный сервер janus: gRPC → файлы в store. Router (сеть, mTLS) / StoreWorker (без сети, только свой store)."
+description = "janus receiver server: gRPC → files in the store. Router (network, mTLS) / StoreWorker (no network, own store only)."
 version.workspace = true
 edition.workspace = true
 publish.workspace = true
@@ -21,9 +21,9 @@ maintainer = "Alexander Matyushov <matyushov.a.a@gmail.com>"
 copyright = "2026, Alexander Matyushov"
 license-file = ["../../LICENSE", "0"]
 extended-description = """\
-Приёмная сторона janus: принимает band-файлы по gRPC и складывает их в store.
-Работает под непривилегированным пользователем janus; systemd-юнит ужесточён.
-Сертификаты и данные store в пакет не входят."""
+janus receiving side: accepts band files over gRPC and writes them to the store.
+Runs as the unprivileged user janus; the systemd unit is hardened.
+Certificates and store data are not included in the package."""
 section = "utils"
 priority = "optional"
 # NB: asset paths are resolved FROM THE CRATE DIRECTORY, except "target/release/…",

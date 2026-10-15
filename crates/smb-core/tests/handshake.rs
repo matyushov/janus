@@ -42,7 +42,7 @@ async fn roundtrip(s: &mut TcpStream, req: &[u8]) -> Vec<u8> {
     read_message(s)
         .await
         .unwrap()
-        .expect("сервер закрыл соединение")
+        .expect("server closed the connection")
 }
 
 async fn login(s: &mut TcpStream, c: &mut Client) -> Response {
@@ -61,7 +61,10 @@ async fn full_session_over_tcp() {
 
     let fin = login(&mut s, &mut c).await;
     assert_eq!(fin.status(), 0, "SESSION_SETUP");
-    assert!(c.verify_response(&fin.raw), "подпись финального ответа");
+    assert!(
+        c.verify_response(&fin.raw),
+        "signature of the final response"
+    );
 
     // TREE_CONNECT to the default share ("backup", case-insensitive)
     let r = roundtrip(
@@ -128,7 +131,7 @@ async fn wrong_password_fails_and_third_failure_drops_the_connection() {
         let r1 = roundtrip(&mut s, &c.session_setup_1()).await;
         let req2 = c.session_setup_2(&r1).unwrap();
         let r = Response::parse(&roundtrip(&mut s, &req2).await).unwrap();
-        assert_eq!(r.status(), 0xC000_006D, "попытка {attempt}");
+        assert_eq!(r.status(), 0xC000_006D, "attempt {attempt}");
     }
     // after the third failure the server closes the connection
     assert!(read_message(&mut s).await.unwrap().is_none());

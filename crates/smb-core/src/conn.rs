@@ -133,11 +133,11 @@ pub struct AsyncOpRegistry {
 
 impl AsyncOpRegistry {
     pub fn register(&mut self, _message_id: u64) -> u64 {
-        todo!("выдать async_id, запомнить контекст для финального ответа")
+        todo!("allocate async_id, remember context for the final response")
     }
 
     pub fn complete(&mut self, _async_id: u64) {
-        todo!("сматчить и отправить финальный ответ через write_loop")
+        todo!("match and send the final response via write_loop")
     }
 }
 

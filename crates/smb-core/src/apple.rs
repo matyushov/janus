@@ -13,7 +13,7 @@ impl AppleExt {
     /// Active only with `CompatCaps::advertise_aapl` (TimeMachine profile);
     /// for Windows/POSIX profiles the context is ignored as Unknown.
     pub fn on_create_root(_req: &AaplContext) -> AaplContext {
-        todo!("ответный AAPL: server_caps |= AAPL_SUPPORTS_FULL_SYNC")
+        todo!("AAPL reply: server_caps |= AAPL_SUPPORTS_FULL_SYNC")
     }
 
     /// F_FULLFSYNC = SMB2 FLUSH c Reserved1 == 0xFFFF (Apple spec).

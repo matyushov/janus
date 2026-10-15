@@ -46,6 +46,56 @@ impl std::fmt::Display for RemoteError {
 
 impl std::error::Error for RemoteError {}
 
+/// Time limits of the receiver link. Defaults are tuned so that one SMB operation, retries
+/// included, fails well before the macOS SMB client gives up on its own (`max_resp_timeout`,
+/// 30 s by default); see the `janus-lib` README for the reasoning.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Timeouts {
+    /// TCP + TLS connect, per attempt.
+    pub connect: Duration,
+    /// One ordinary RPC attempt.
+    pub request: Duration,
+    /// One `ReadRange`/`WriteRange` attempt (payloads up to 1 MiB over a slow link).
+    pub bulk_request: Duration,
+    /// While the receiver is considered down (the last operation failed on transport), every
+    /// call is a single probe of at most this long, so a retrying client burns through its
+    /// attempts quickly instead of waiting a full budget each time. Any success clears it.
+    pub degraded_probe: Duration,
+    /// After a failed probe, calls fail immediately (no network) for this long, then the next
+    /// call probes again. Keeps a client that retries in a loop from queueing probes.
+    pub fail_fast: Duration,
+    /// Total time for one backend operation, all attempts and backoff included.
+    pub budget: Duration,
+    /// HTTP/2 PING interval (also while idle, so a silent peer is noticed).
+    pub keepalive_interval: Duration,
+    /// How long to wait for the PING ack before the connection is declared dead.
+    pub keepalive_timeout: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Timeouts {
+            connect: DEFAULT_CONNECT_TIMEOUT,
+            request: DEFAULT_REQUEST_TIMEOUT,
+            bulk_request: DEFAULT_BULK_REQUEST_TIMEOUT,
+            degraded_probe: DEFAULT_DEGRADED_PROBE,
+            fail_fast: DEFAULT_FAIL_FAST,
+            budget: DEFAULT_OPERATION_BUDGET,
+            keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
+            keepalive_timeout: DEFAULT_KEEPALIVE_TIMEOUT,
+        }
+    }
+}
+
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(4);
+pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
+pub const DEFAULT_BULK_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+pub const DEFAULT_DEGRADED_PROBE: Duration = Duration::from_secs(2);
+pub const DEFAULT_FAIL_FAST: Duration = Duration::from_secs(2);
+pub const DEFAULT_OPERATION_BUDGET: Duration = Duration::from_secs(18);
+pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
+pub const DEFAULT_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(3);
+
 /// Connection parameters (from `ConfigureRequest`).
 #[derive(Debug, Clone, Default)]
 pub struct RemoteConfig {
@@ -54,6 +104,7 @@ pub struct RemoteConfig {
     pub ca_pem: Vec<u8>,
     pub client_cert_path: String,
     pub client_key_path: String,
+    pub timeouts: Timeouts,
 }
 
 impl RemoteConfig {
@@ -63,6 +114,7 @@ impl RemoteConfig {
             ca_pem: cfg.ca_pem.clone(),
             client_cert_path: cfg.client_cert_path.clone(),
             client_key_path: cfg.client_key_path.clone(),
+            timeouts: Timeouts::default(),
         }
     }
 
@@ -111,6 +163,7 @@ fn warn_if_wide(path: &str) {
 pub struct RemoteClient {
     client: BandTransportClient<Channel>,
     endpoint: String,
+    timeouts: Timeouts,
 }
 
 impl RemoteClient {
@@ -146,8 +199,12 @@ impl RemoteClient {
 
         let mut endpoint = Endpoint::from_shared(uri.clone())
             .map_err(|e| RemoteError::BadEndpoint(e.to_string()))?
-            .connect_timeout(Duration::from_secs(5))
-            .timeout(Duration::from_secs(30));
+            .connect_timeout(cfg.timeouts.connect)
+            // Hard ceiling for any single request; the backend applies tighter per-attempt limits.
+            .timeout(cfg.timeouts.budget)
+            .http2_keep_alive_interval(cfg.timeouts.keepalive_interval)
+            .keep_alive_timeout(cfg.timeouts.keepalive_timeout)
+            .keep_alive_while_idle(true);
 
         if tls {
             let read = |what: &str, path: &str| {
@@ -169,12 +226,17 @@ impl RemoteClient {
         Ok(RemoteClient {
             client: BandTransportClient::new(channel),
             endpoint: cfg.endpoint.clone(),
+            timeouts: cfg.timeouts,
         })
     }
 
     /// A cheap clone of the underlying (lazy, auto-reconnecting) transport client.
     pub fn transport(&self) -> BandTransportClient<Channel> {
         self.client.clone()
+    }
+
+    pub fn timeouts(&self) -> Timeouts {
+        self.timeouts
     }
 
     pub fn endpoint(&self) -> &str {

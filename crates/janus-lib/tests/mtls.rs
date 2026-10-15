@@ -83,6 +83,7 @@ impl Rig {
             ca_pem: self.pki.ca_pem.clone().into_bytes(),
             client_cert_path: cert,
             client_key_path: key,
+            ..Default::default()
         }
     }
 
@@ -447,6 +448,7 @@ async fn tls_configuration_mistakes_are_errors_not_silent_downgrades() {
         ca_pem: b"x".to_vec(),
         client_cert_path: "c".into(),
         client_key_path: "k".into(),
+        ..Default::default()
     };
     assert!(matches!(
         RemoteClient::connect_lazy(&c),

@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use janus_proto::v1 as pb;
 use janus_proto::v1::band_transport_client::BandTransportClient;
@@ -25,7 +25,7 @@ use pb::{bundle_op_reply, bundle_op_request, fsync_request};
 use tonic::transport::Channel;
 use tonic::{Code, Status};
 
-use crate::remote::{RemoteClient, is_transport_failure};
+use crate::remote::{RemoteClient, Timeouts, is_transport_failure};
 use crate::vfs::{
     BackendError, BackendHandle, Disposition, FileStat, FsStats, Kind, OpenRequest, Opened, Result,
     SetTimes, StorageBackend,
@@ -71,6 +71,10 @@ impl HandleEntry {
 pub struct GrpcBackend {
     client: BandTransportClient<Channel>,
     retry: RetryPolicy,
+    timeouts: Timeouts,
+    /// When a call last timed out (a silent peer); cleared by the next success. Errors the receiver
+    /// or the network report promptly (refused connection, `UNAVAILABLE`) do not set it.
+    degraded: Mutex<Option<Instant>>,
     /// Used when the receiver reports "no quota" (0).
     fallback_quota: u64,
     next_handle: AtomicU64,
@@ -83,6 +87,8 @@ impl GrpcBackend {
         GrpcBackend {
             client,
             retry: RetryPolicy::default(),
+            timeouts: Timeouts::default(),
+            degraded: Mutex::new(None),
             fallback_quota: if fallback_quota == 0 {
                 DEFAULT_QUOTA
             } else {
@@ -95,7 +101,23 @@ impl GrpcBackend {
     }
 
     pub fn from_remote(remote: &RemoteClient, fallback_quota: u64) -> GrpcBackend {
-        GrpcBackend::new(remote.transport(), fallback_quota)
+        GrpcBackend::new(remote.transport(), fallback_quota).with_timeouts(remote.timeouts())
+    }
+
+    pub fn with_timeouts(mut self, timeouts: Timeouts) -> Self {
+        self.timeouts = timeouts;
+        self
+    }
+
+    fn mark_degraded(&self) {
+        *self.degraded.lock().expect("degraded poisoned") = Some(Instant::now());
+    }
+
+    /// Bound a whole backend operation (possibly several RPCs) by the time budget.
+    async fn within<T>(&self, op: impl Future<Output = Result<T>>) -> Result<T> {
+        tokio::time::timeout(self.timeouts.budget, op)
+            .await
+            .unwrap_or(Err(BackendError::RemoteUnavailable))
     }
 
     pub fn with_retry(mut self, retry: RetryPolicy) -> Self {
@@ -105,22 +127,63 @@ impl GrpcBackend {
 
     // ---- RPC plumbing -------------------------------------------------------------
 
-    async fn rpc<T, F, Fut>(&self, idempotent: bool, call: F) -> Result<T>
+    /// One RPC with retries under a shared deadline: every attempt is limited by `request`
+    /// (or `bulk_request`) and by what is left of the budget, and a retry starts only if
+    /// the backoff plus a minimal attempt still fit. A silent peer is a timeout, which counts
+    /// as a transport failure (retried only when `idempotent`).
+    async fn rpc<T, F, Fut>(&self, idempotent: bool, bulk: bool, call: F) -> Result<T>
     where
         F: Fn(BandTransportClient<Channel>) -> Fut,
         Fut: Future<Output = std::result::Result<tonic::Response<T>, Status>>,
     {
-        let attempts = if idempotent {
+        /// A retry with less than this left is pointless.
+        const MIN_ATTEMPT: Duration = Duration::from_millis(500);
+        let last_failure = *self.degraded.lock().expect("degraded poisoned");
+        if last_failure.is_some_and(|t| t.elapsed() < self.timeouts.fail_fast) {
+            return Err(BackendError::RemoteUnavailable);
+        }
+        let degraded = last_failure.is_some();
+        let attempts = if idempotent && !degraded {
             self.retry.attempts.max(1)
         } else {
             1
         };
+        let mut per_attempt = if bulk {
+            self.timeouts.bulk_request
+        } else {
+            self.timeouts.request
+        };
+        if degraded {
+            per_attempt = per_attempt.min(self.timeouts.degraded_probe);
+        }
+        let deadline = Instant::now() + self.timeouts.budget;
         let mut delay = self.retry.base_delay;
         let mut attempt = 1;
         loop {
-            match call(self.client.clone()).await {
-                Ok(r) => return Ok(r.into_inner()),
+            let left = deadline.saturating_duration_since(Instant::now());
+            let outcome = match tokio::time::timeout(
+                per_attempt.min(left),
+                call(self.client.clone()),
+            )
+            .await
+            {
+                Ok(r) => r,
+                Err(_) => {
+                    // A silent peer: later calls must not each wait a full budget.
+                    self.mark_degraded();
+                    Err(Status::unavailable("transport error: request timed out"))
+                }
+            };
+            match outcome {
+                Ok(r) => {
+                    *self.degraded.lock().expect("degraded poisoned") = None;
+                    return Ok(r.into_inner());
+                }
                 Err(s) if attempt < attempts && is_transport_failure(&s) => {
+                    let left = deadline.saturating_duration_since(Instant::now());
+                    if left < delay + MIN_ATTEMPT {
+                        return Err(map_status(&s));
+                    }
                     tokio::time::sleep(delay).await;
                     delay = delay.saturating_mul(2);
                     attempt += 1;
@@ -136,7 +199,7 @@ impl GrpcBackend {
         op: bundle_op_request::Op,
     ) -> Result<bundle_op_reply::Result> {
         let reply = self
-            .rpc(idempotent, |mut c| {
+            .rpc(idempotent, false, |mut c| {
                 let op = op.clone();
                 async move { c.bundle_op(pb::BundleOpRequest { op: Some(op) }).await }
             })
@@ -287,8 +350,8 @@ fn is_under(path: &str, prefix: &str) -> bool {
             .is_some_and(|rest| rest.starts_with('/'))
 }
 
-impl StorageBackend for GrpcBackend {
-    async fn open(&self, rel_path: &str, req: OpenRequest) -> Result<Opened> {
+impl GrpcBackend {
+    async fn open_inner(&self, rel_path: &str, req: OpenRequest) -> Result<Opened> {
         let rel = normalize(rel_path)?;
         let truncating = matches!(
             req.disposition,
@@ -379,12 +442,7 @@ impl StorageBackend for GrpcBackend {
         Err(BackendError::AlreadyExists)
     }
 
-    async fn stat_handle(&self, h: BackendHandle) -> Result<FileStat> {
-        let e = self.entry(h)?;
-        self.stat_path(&e.path()).await
-    }
-
-    async fn read(&self, h: BackendHandle, offset: u64, len: u32) -> Result<Vec<u8>> {
+    async fn read_inner(&self, h: BackendHandle, offset: u64, len: u32) -> Result<Vec<u8>> {
         let e = self.entry(h)?;
         if e.directory {
             return Err(BackendError::IsADirectory);
@@ -397,7 +455,7 @@ impl StorageBackend for GrpcBackend {
             let chunk = (want - out.len()).min(MAX_CHUNK);
             let pos = offset + out.len() as u64;
             let reply = self
-                .rpc(true, |mut c| {
+                .rpc(true, true, |mut c| {
                     let req = pb::ReadRangeRequest {
                         file: file_ref(&path),
                         offset: pos,
@@ -415,7 +473,7 @@ impl StorageBackend for GrpcBackend {
         Ok(out)
     }
 
-    async fn write(&self, h: BackendHandle, offset: u64, data: &[u8]) -> Result<()> {
+    async fn write_inner(&self, h: BackendHandle, offset: u64, data: &[u8]) -> Result<()> {
         let e = self.entry(h)?;
         if e.directory {
             return Err(BackendError::IsADirectory);
@@ -437,7 +495,7 @@ impl StorageBackend for GrpcBackend {
             let pos = offset + (i * MAX_CHUNK) as u64;
             let write_id = self.next_write_id.fetch_add(1, Ordering::Relaxed);
             // Repeating a WriteRange is safe (same offset, same bytes).
-            self.rpc(true, |mut c| {
+            self.rpc(true, true, |mut c| {
                 let req = pb::WriteRangeRequest {
                     file: file_ref(&path),
                     offset: pos,
@@ -450,6 +508,25 @@ impl StorageBackend for GrpcBackend {
         }
         Ok(())
     }
+}
+
+impl StorageBackend for GrpcBackend {
+    async fn open(&self, rel_path: &str, req: OpenRequest) -> Result<Opened> {
+        self.within(self.open_inner(rel_path, req)).await
+    }
+
+    async fn stat_handle(&self, h: BackendHandle) -> Result<FileStat> {
+        let e = self.entry(h)?;
+        self.stat_path(&e.path()).await
+    }
+
+    async fn read(&self, h: BackendHandle, offset: u64, len: u32) -> Result<Vec<u8>> {
+        self.within(self.read_inner(h, offset, len)).await
+    }
+
+    async fn write(&self, h: BackendHandle, offset: u64, data: &[u8]) -> Result<()> {
+        self.within(self.write_inner(h, offset, data)).await
+    }
 
     async fn flush(&self, h: BackendHandle, _fullfsync: bool) -> Result<()> {
         let e = self.entry(h)?;
@@ -458,7 +535,7 @@ impl StorageBackend for GrpcBackend {
         }
         let path = e.path();
         // Sync-through: F_FULLFSYNC and plain flush both wait for the receiver's fsync.
-        self.rpc(true, |mut c| {
+        self.rpc(true, false, |mut c| {
             let req = pb::FsyncRequest {
                 scope: Some(fsync_request::Scope::File(pb::FileRef {
                     rel_path: path.clone(),
@@ -594,7 +671,7 @@ impl StorageBackend for GrpcBackend {
 
     async fn statfs(&self) -> Result<FsStats> {
         let r = self
-            .rpc(true, |mut c| async move {
+            .rpc(true, false, |mut c| async move {
                 c.stat_fs(pb::StatFsRequest {}).await
             })
             .await?;

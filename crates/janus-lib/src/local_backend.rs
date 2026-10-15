@@ -293,7 +293,7 @@ fn dir_size(dir: &Path) -> u64 {
         return 0;
     };
     rd.flatten()
-        .map(|e| match e.metadata() {
+        .map(|e| match std::fs::symlink_metadata(e.path()) {
             Ok(m) if m.is_dir() => dir_size(&e.path()),
             Ok(m) => m.len(),
             Err(_) => 0,
@@ -732,13 +732,13 @@ mod tests {
             o.handle,
             SetTimes {
                 atime_unix_ns: Some(t),
-                mtime_unix_ns: Some(t + 5),
+                mtime_unix_ns: Some(t + 1_000),
             },
         )
         .await
         .unwrap();
         let st = b.stat_handle(o.handle).await.unwrap();
-        assert_eq!(st.mtime_unix_ns, t + 5);
+        assert_eq!(st.mtime_unix_ns, t + 1_000);
         b.close(o.handle).await.unwrap();
     }
 

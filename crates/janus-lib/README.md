@@ -14,22 +14,74 @@ backends) and the control layer (`control`, `config`, `remote`).
 `tests/backend_contract.rs` runs one set of assertions against `LocalFsBackend` and
 `GrpcBackend` (against a real receiver on loopback).
 
-### `GrpcBackend` in J3a: sync-through
+### `GrpcBackend` without the journal: sync-through (J3a)
+
+(`journal.enabled = false`; the journal mode is described in the next section.)
 
 **Every operation goes to the receiver immediately.** There is no local journal, uploader or read
-overlay yet (J3b). Consequences, on purpose:
+overlay. Consequences, on purpose:
 
 - the latency of an SMB reply equals the round trip to the receiver (plus its disk);
 - `flush` (also `F_FULLFSYNC`) is an end-to-end `Fsync` on the receiver, so it is honest;
 - while the receiver is unreachable, operations fail with `RemoteUnavailable`
   (SMB `STATUS_UNEXPECTED_NETWORK_ERROR`, never "not found"); nothing is buffered;
-- `FlushPolicy::LocalJournal` is refused by `Configure` ("not supported yet").
 
 Handles live on the client (`handle → current path, kind, flags`); the receiver sees paths only,
 so every write is idempotent (by offset). Writes and reads are cut into pieces of at most 1 MiB;
 `write_id` is monotonic. Only idempotent calls (reads, stat, list, `WriteRange`, `Fsync`,
 truncate, set-times) are retried, 3 attempts with backoff, and only on transport failure.
 Exclusive create, rename and delete-on-close are never retried.
+
+### `GrpcBackend` with the journal (J3b, the default)
+
+Writes are appended to a local write-ahead journal and acknowledged at once; an uploader sends
+them to the receiver in the background (4 concurrent `WriteRange`s of up to 1 MiB). The journal
+exists for **speed** (no round trip per write) and to **smooth over short outages** (a receiver
+frozen for tens of seconds does not abort a copy). It must **not hide a long outage**: Time
+Machine must not think a backup is done while the data exists only on the laptop.
+
+- **Limit by backlog, not by time.** At most `max_backlog_bytes` (default 1 GiB) of unuploaded
+  data. At the limit a write waits for the uploader (backpressure) for the operation budget, then
+  fails with `RemoteUnavailable` (`UNEXPECTED_NETWORK_ERROR`). It is never `DISK_FULL`: that
+  means the receiver is out of quota, and is returned at once when
+  `receiver used + backlog + write > quota` (from a cached `statfs`), so Time Machine gets its
+  thinning signal while it writes.
+- **Honest fsync (`SYNC_THROUGH`).** `flush` / `F_FULLFSYNC` and the close of a file with
+  unuploaded data wait until the data reached the receiver and was fsynced there. If the receiver
+  is unreachable for longer than the barrier budget (26 s) they fail (the backup aborts and is retried
+  in the next cycle); they never report a false success.
+- **`LOCAL_JOURNAL` (off by default, UNSAFE for backups).** `flush` returns after an fsync of the
+  journal; the network catches up later. A lost laptop or disk means lost "durable" data, and Time
+  Machine will believe a backup exists that the server does not have.
+- **Read-your-writes.** `read`, `stat` and listings overlay the unuploaded bytes on the
+  receiver's data (holes between them read as zeros, like a sparse file); `statfs` counts the
+  journal.
+- **Metadata stays synchronous** (create, rename, delete, truncate, set-times) and is ordered
+  after the data of the files it touches: rename, set-times and `truncate(n>0)` wait for the
+  file's upload first; delete, `truncate(0)` and an overwriting open discard the unuploaded bytes
+  (durably, with a `Drop` record) after waiting for batches already on the wire. Because of this
+  a listing or `stat` needs the receiver: while it is frozen they fail rather than guess.
+- **Errors.** Transient ones (transport, timeout) pause the uploader with an exponential
+  backoff; the journal grows up to the limit. Permanent ones (no space, access denied) become the
+  *sticky* error of that file: returned by its next flush/close and shown in `status`, and
+  cleared by a new write to it (so retrying after Time Machine freed space works).
+- **Crash safety.** Every record has a CRC. After `kill -9` the next start replays everything the
+  receiver has not acknowledged (above the stored watermark), cuts a torn tail and continues;
+  `WriteRange` is idempotent so a replay of what had already arrived changes nothing. A file that
+  was deleted or renamed meanwhile is not resurrected. A graceful `shutdown --drain` waits for
+  the journal to empty (and refuses to stop while it cannot); without `--drain` the journal stays
+  on disk and is uploaded at the next start.
+- **Reconfigure.** `Configure` with the same journal directory keeps the running journal and
+  points the uploader at the new link.
+- **Where.** `<state-dir>/journal` (`~/.config/janus/journal`) with mode 0700, files 0600; on
+  macOS it is excluded from Time Machine (`tmutil addexclusion`, best effort). Segments are
+  ~64 MiB. **Known limit: the journal holds user data unencrypted**; protection is the file
+  permissions only.
+
+Configuration (`janus-cli client configure`): `--journal on|off`, `--journal-dir <path>`,
+`--max-backlog <MiB>`, `--flush-policy sync-through|local-journal`.
+`janus-cli client status` shows the backlog, the age of the oldest unuploaded record, the last
+upload error and the time of the last acknowledgement; `drain` waits for an empty journal.
 
 #### Time limits (`remote::Timeouts`)
 
@@ -40,6 +92,7 @@ shared deadline per backend operation, not "timeout x attempts":
 | Limit | Default | Why |
 |---|---|---|
 | operation budget | 18 s | all attempts and backoff of one operation; leaves ~12 s of margin to 30 s |
+| barrier (journal mode) | 26 s | how long a flush / close of a file with unuploaded data waits for the receiver; it is what absorbs a receiver frozen for ~20 s, and still ends 4 s before the client gives up |
 | request attempt | 6 s | far above a healthy RTT + disk fsync, short enough for 2-3 attempts |
 | bulk attempt (`ReadRange`/`WriteRange`) | 10 s | up to 1 MiB per call on a slow link; still < budget |
 | connect | 4 s | an unreachable host must not eat the budget |

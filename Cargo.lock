@@ -1570,6 +1570,7 @@ version = "0.1.0"
 dependencies = [
  "aws-config",
  "aws-sdk-s3",
+ "crc32fast",
  "getrandom 0.3.4",
  "janus-proto",
  "janus-receiverd",

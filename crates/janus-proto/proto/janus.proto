@@ -172,6 +172,11 @@ message ConfigureRequest {
   FlushPolicy flush_policy  = 8;
   bool   advertise_bonjour  = 9;
   ClientProfile profile     = 10; // UNSPECIFIED is treated as TIME_MACHINE
+  // Write-ahead journal (J3b). Absent journal_enabled = enabled. Empty journal_dir = the
+  // default (<state-dir>/journal). max_backlog_bytes 0 = the default (1 GiB).
+  optional bool journal_enabled = 14;
+  string journal_dir            = 15;
+  uint64 max_backlog_bytes      = 16;
 }
 
 message Readiness {
@@ -188,6 +193,9 @@ message StatusReply {
   uint32 upload_errors              = 6;
   int64  last_appliance_ack_unix_ms = 7;
   string version                    = 8;
+  uint64 oldest_unuploaded_age_ms   = 9;  // age of the oldest record not yet on the appliance
+  string last_upload_error          = 10; // empty = none
+  uint32 sticky_error_files         = 11; // files with a permanent upload error
 }
 
 message DrainRequest { uint32 timeout_sec = 1; }

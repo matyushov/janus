@@ -11,7 +11,7 @@
 use std::any::Any;
 use std::path::{Path, PathBuf};
 
-use janus_lib::grpc_backend::GrpcBackend;
+use janus_lib::grpc_backend::{GrpcBackend, JournalSettings};
 use janus_lib::remote::{RemoteClient, RemoteConfig};
 use janus_lib::vfs::{
     BackendError, Disposition, Kind, LocalFsBackend, OpenRequest, SetTimes, StorageBackend,
@@ -60,6 +60,39 @@ async fn make_grpc() -> (GrpcBackend, Env) {
         Env {
             root,
             _guard: Box::new(srv),
+        },
+    )
+}
+
+/// The journal mode: writes are acknowledged from the local journal and uploaded in the
+/// background. The assertions are the same as for the other two backends.
+async fn make_grpc_journal() -> (GrpcBackend, Env) {
+    let srv = TestServer::start("contract-j", 0)
+        .await
+        .expect("receiver up");
+    let remote = RemoteClient::connect_lazy(&RemoteConfig {
+        endpoint: srv.addr.to_string(),
+        ..Default::default()
+    })
+    .unwrap();
+    let mut r = [0u8; 8];
+    getrandom::fill(&mut r).unwrap();
+    let jdir = std::env::temp_dir().join(format!("janus-contract-wal-{}", u64::from_le_bytes(r)));
+    let b = GrpcBackend::from_remote(&remote, 0)
+        .with_journal(
+            &jdir,
+            JournalSettings {
+                max_backlog: 64 << 20,
+                local_journal: false,
+            },
+        )
+        .unwrap();
+    let root = srv.store.path().to_path_buf();
+    (
+        b,
+        Env {
+            root,
+            _guard: Box::new((srv, LocalDir(jdir))),
         },
     )
 }
@@ -667,6 +700,16 @@ macro_rules! scenarios {
                 #[tokio::test]
                 async fn $name() {
                     let (b, env) = super::make_local().await;
+                    super::$name(b, &env.root).await;
+                }
+            )*
+        }
+        mod grpc_journal {
+            $(
+                $(#[$m])*
+                #[tokio::test]
+                async fn $name() {
+                    let (b, env) = super::make_grpc_journal().await;
                     super::$name(b, &env.root).await;
                 }
             )*

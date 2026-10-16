@@ -12,6 +12,7 @@ janus-proto = { path = "../janus-proto" }
 tonic = { workspace = true, features = ["tls"] }
 tokio = { workspace = true }
 tokio-stream = { version = "0.1" }
+crc32fast = "1"
 getrandom = "0.3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

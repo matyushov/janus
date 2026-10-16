@@ -126,9 +126,12 @@ fn run(dev: bool) {
             }
         });
         let state = Arc::new(Mutex::new(DaemonState::from_config(&config)));
-        let switch = Arc::new(SwitchBackend::new());
-        state.lock().await.install_backend(&switch);
         let gate = Arc::new(WriteGate::default());
+        let switch = Arc::new(SwitchBackend::new().with_gate(Arc::clone(&gate)));
+        if let Err(e) = state.lock().await.install_backend(&switch) {
+            eprintln!("janus-smbd: cannot start the journal: {e}");
+            std::process::exit(1);
+        }
         // SMB account: dev uses JANUS_SMB_USER/JANUS_SMB_PASSWORD, otherwise a 0600 file
         // (created by `janus-cli client configure`). There is no guest access.
         let credentials = Arc::new(CredentialStore::from_process_env());

@@ -51,10 +51,14 @@ pub struct DaemonState {
 impl DaemonState {
     /// Backend for the restored state (see `from_config`).
     #[cfg(feature = "backend-grpc")]
-    pub fn install_backend(&self, switch: &crate::switch_backend::SwitchBackend) {
+    pub fn install_backend(
+        &self,
+        switch: &crate::switch_backend::SwitchBackend,
+    ) -> std::io::Result<()> {
         if let (Some(remote), Some(share)) = (&self.remote, &self.share) {
-            switch.apply(remote, share.quota_bytes);
+            switch.apply(remote, share)?;
         }
+        Ok(())
     }
 
     /// State restored from the persisted configuration (daemon start). An unusable stored
@@ -84,6 +88,8 @@ pub struct ControlService {
     version: &'static str,
     /// Daemon stop signal (on the Shutdown command); one-shot.
     shutdown: Mutex<Option<tokio::sync::oneshot::Sender<()>>>,
+    /// How long `shutdown --drain` waits for the journal to empty.
+    shutdown_drain_timeout: std::time::Duration,
     /// The share's SMB account; generated on `Configure` if it does not exist yet.
     credentials: Option<Arc<crate::credentials::CredentialStore>>,
     /// Persistent configuration; `None` = memory only (tests).
@@ -100,6 +106,7 @@ impl ControlService {
             gate,
             version: env!("CARGO_PKG_VERSION"),
             shutdown: Mutex::new(None),
+            shutdown_drain_timeout: SHUTDOWN_DRAIN_TIMEOUT,
             credentials: None,
             config: None,
             #[cfg(feature = "backend-grpc")]
@@ -111,6 +118,11 @@ impl ControlService {
     #[cfg(feature = "backend-grpc")]
     pub fn with_backend(mut self, b: Arc<crate::switch_backend::SwitchBackend>) -> Self {
         self.backend = Some(b);
+        self
+    }
+
+    pub fn with_shutdown_drain_timeout(mut self, t: std::time::Duration) -> Self {
+        self.shutdown_drain_timeout = t;
         self
     }
 
@@ -157,6 +169,11 @@ fn share_from_request(req: &ConfigureRequest) -> ShareConfig {
             3 => crate::profile::ClientProfile::PosixGeneric,
             _ => crate::profile::ClientProfile::TimeMachine,
         },
+        journal: crate::config::JournalConfig {
+            enabled: req.journal_enabled.unwrap_or(true),
+            dir: req.journal_dir.clone(),
+            max_backlog_bytes: req.max_backlog_bytes,
+        },
     }
 }
 
@@ -199,8 +216,13 @@ impl SmbFrontControl for ControlService {
         }
 
         #[cfg(feature = "backend-grpc")]
-        if let Some(b) = &self.backend {
-            b.apply(&remote, share.quota_bytes);
+        if let Some(b) = &self.backend
+            && let Err(e) = b.apply(&remote, &share)
+        {
+            return Ok(Response::new(Ack {
+                ok: false,
+                error: format!("failed to start the journal: {e}"),
+            }));
         }
 
         let mut st = self.state.lock().await;
@@ -247,30 +269,53 @@ impl SmbFrontControl for ControlService {
     }
 
     async fn status(&self, _req: Request<Empty>) -> Result<Response<StatusReply>, Status> {
-        // TODO(metrics): a snapshot of the observability::Metrics atomics.
         let st = self.state.lock().await;
-        Ok(Response::new(StatusReply {
-            smb_sessions: 0,
-            open_handles: 0,
-            durable_handles_parked: 0,
-            journal_backlog_bytes: 0,
-            uploaded_bytes_total: 0,
-            upload_errors: 0,
-            last_appliance_ack_unix_ms: 0,
+        #[cfg_attr(not(feature = "backend-grpc"), allow(unused_mut))]
+        let mut reply = StatusReply {
             version: format!(
-                "{} ({})",
+                "{} ({}{})",
                 self.version,
                 if st.share.is_some() {
                     "configured"
                 } else {
                     "unconfigured"
+                },
+                if self.gate.is_open() {
+                    ""
+                } else {
+                    ", quiesced"
                 }
             ),
-        }))
+            ..Default::default()
+        };
+        #[cfg(feature = "backend-grpc")]
+        if let Some(b) = &self.backend {
+            reply.open_handles = b.open_handles() as u32;
+            if let Some(s) = b.journal_stats() {
+                reply.journal_backlog_bytes = s.backlog_bytes;
+                reply.uploaded_bytes_total = s.uploaded_bytes_total;
+                reply.upload_errors = s.upload_errors.min(u32::MAX as u64) as u32;
+                reply.last_appliance_ack_unix_ms = s.last_ack_unix_ms as i64;
+                reply.oldest_unuploaded_age_ms = s.oldest_age_ms;
+                reply.last_upload_error = s.last_error;
+                reply.sticky_error_files = s.sticky_files as u32;
+            }
+        }
+        Ok(Response::new(reply))
     }
 
-    async fn drain(&self, _req: Request<DrainRequest>) -> Result<Response<DrainReply>, Status> {
-        // TODO: forward to Uploader::drain_barrier.
+    /// Wait until everything accepted so far reached the receiver and was fsynced there.
+    async fn drain(&self, req: Request<DrainRequest>) -> Result<Response<DrainReply>, Status> {
+        let timeout = std::time::Duration::from_secs(req.into_inner().timeout_sec.max(1) as u64);
+        #[cfg(feature = "backend-grpc")]
+        if let Some(b) = &self.backend {
+            let (drained, remaining_bytes) = b.drain(timeout).await;
+            return Ok(Response::new(DrainReply {
+                drained,
+                remaining_bytes,
+            }));
+        }
+        let _ = timeout;
         Ok(Response::new(DrainReply {
             drained: true,
             remaining_bytes: 0,
@@ -317,9 +362,27 @@ impl SmbFrontControl for ControlService {
         Err(Status::unimplemented("GetDiagnostics: TODO"))
     }
 
-    /// Stop the daemon. `drain_first` is not honoured yet: `drain` is a stub
-    /// (TODO: forward to Uploader::drain_barrier), so there is nothing to build on here.
-    async fn shutdown(&self, _req: Request<ShutdownRequest>) -> Result<Response<Ack>, Status> {
+    /// Stop the daemon. With `drain_first` the journal is emptied first (bounded by
+    /// `shutdown_drain_timeout`); if that fails the daemon keeps running and the reply says
+    /// how much is left. Without it the journal stays on disk and is uploaded at the next start.
+    async fn shutdown(&self, req: Request<ShutdownRequest>) -> Result<Response<Ack>, Status> {
+        #[cfg(feature = "backend-grpc")]
+        if req.into_inner().drain_first
+            && let Some(b) = &self.backend
+        {
+            let (drained, remaining) = b.drain(self.shutdown_drain_timeout).await;
+            if !drained {
+                return Ok(Response::new(Ack {
+                    ok: false,
+                    error: format!(
+                        "drain incomplete: {remaining} bytes are still not on the receiver; \
+                         not stopping (shutdown without --drain keeps the journal for the next start)"
+                    ),
+                }));
+            }
+        }
+        #[cfg(not(feature = "backend-grpc"))]
+        let _ = req;
         match self.shutdown.lock().await.take() {
             Some(tx) => {
                 let _ = tx.send(());
@@ -335,6 +398,9 @@ impl SmbFrontControl for ControlService {
         }
     }
 }
+
+/// Default of how long `shutdown --drain` waits for the journal to empty.
+const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(300);
 
 #[cfg(test)]
 mod shutdown_tests {
@@ -399,11 +465,12 @@ mod shutdown_tests {
         assert_eq!(share.mount_port, 4445);
         assert!(st2.remote.is_some());
 
-        // LOCAL_JOURNAL is refused, the stored config stays intact
+        // LOCAL_JOURNAL without a journal is refused, the stored config stays intact
         let err = svc
             .configure(Request::new(ConfigureRequest {
                 appliance_endpoint: "127.0.0.1:1".into(),
                 flush_policy: 2,
+                journal_enabled: Some(false),
                 ..Default::default()
             }))
             .await

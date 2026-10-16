@@ -100,6 +100,14 @@ pub struct ConfigureArgs {
     pub share: String,
     /// Mount point port (the loopback host is fixed). 0 = the daemon default.
     pub mount_port: u32,
+    /// `--journal on|off`; `None` = the daemon default (on).
+    pub journal: Option<bool>,
+    /// `--journal-dir`; empty = `<state-dir>/journal`.
+    pub journal_dir: String,
+    /// `--max-backlog <MiB>`; 0 = the default (1024).
+    pub max_backlog_mib: u64,
+    /// `--flush-policy local-journal`: fsync = fsync of the journal (unsafe for backups).
+    pub local_journal: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -124,10 +132,15 @@ Commands (client only):
   ready                     check connectivity to the server (exit 0 = ready)
   configure --endpoint <host:port> --client-cert <pem> --client-key <pem>
             --ca <pem> [--share <name>] [--port <n>]
+            [--journal on|off] [--journal-dir <path>] [--max-backlog <MiB>]
+            [--flush-policy sync-through|local-journal]
                             set the receiver server, mTLS identity and
                             the mount point smb://127.0.0.1:<port>/<share>
                             (--port is for display only; the real SMB address
                             is set by the daemon environment: JANUS_SMB_ADDR)
+                            --journal off = every write goes to the server at once;
+                            --max-backlog = unuploaded data the journal may hold (default 1024);
+                            local-journal = fsync only syncs the journal: UNSAFE for backups
   drain [--timeout <sec>]   flush pending data (default 300)
   quiesce | resume          pause/resume accepting writes
 
@@ -194,6 +207,30 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, ParseError>
                 ca: take_required(&mut f, "--ca")?.into(),
                 share: f.remove("--share").unwrap_or_else(|| "backup".into()),
                 mount_port,
+                journal: match f.remove("--journal").as_deref() {
+                    None => None,
+                    Some("on") => Some(true),
+                    Some("off") => Some(false),
+                    Some(v) => {
+                        return Err(ParseError(format!("--journal: expected on|off, got {v}")));
+                    }
+                },
+                journal_dir: f.remove("--journal-dir").unwrap_or_default(),
+                max_backlog_mib: match f.remove("--max-backlog") {
+                    Some(v) => v
+                        .parse()
+                        .map_err(|_| ParseError(format!("--max-backlog: not a number: {v}")))?,
+                    None => 0,
+                },
+                local_journal: match f.remove("--flush-policy").as_deref() {
+                    None | Some("sync-through") => false,
+                    Some("local-journal") => true,
+                    Some(v) => {
+                        return Err(ParseError(format!(
+                            "--flush-policy: expected sync-through|local-journal, got {v}"
+                        )));
+                    }
+                },
             };
             if let Some((unknown, _)) = f.into_iter().next() {
                 return Err(ParseError(format!("configure: unknown flag {unknown}")));
@@ -367,8 +404,57 @@ mod tests {
                 ca: PathBuf::from("ca.pem"),
                 share: "backup".into(),
                 mount_port: 0,
+                journal: None,
+                journal_dir: String::new(),
+                max_backlog_mib: 0,
+                local_journal: false,
             })
         );
+    }
+
+    #[test]
+    fn configure_journal_flags() {
+        let base = [
+            "client",
+            "configure",
+            "--endpoint",
+            "v:1",
+            "--client-cert",
+            "c",
+            "--client-key",
+            "k",
+            "--ca",
+            "ca",
+        ];
+        let with = |extra: &[&str]| {
+            let mut v: Vec<&str> = base.to_vec();
+            v.extend_from_slice(extra);
+            parse(v.into_iter().map(String::from))
+        };
+        let a = match with(&[
+            "--journal",
+            "off",
+            "--journal-dir",
+            "/j",
+            "--max-backlog",
+            "256",
+            "--flush-policy",
+            "local-journal",
+        ])
+        .unwrap()
+        .command
+        {
+            Command::Configure(a) => a,
+            _ => panic!(),
+        };
+        assert_eq!(a.journal, Some(false));
+        assert_eq!(
+            (a.journal_dir.as_str(), a.max_backlog_mib, a.local_journal),
+            ("/j", 256, true)
+        );
+        assert!(with(&["--journal", "maybe"]).is_err());
+        assert!(with(&["--max-backlog", "lots"]).is_err());
+        assert!(with(&["--flush-policy", "fast"]).is_err());
     }
 
     #[test]

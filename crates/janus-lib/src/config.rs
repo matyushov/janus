@@ -37,6 +37,54 @@ pub enum FlushPolicy {
     LocalJournal,
 }
 
+/// Default size of the unuploaded backlog the journal may hold (1 GiB).
+pub const DEFAULT_MAX_BACKLOG: u64 = 1 << 30;
+
+/// The directory holding the config and the journal (`~/.config/janus`).
+pub fn state_dir() -> Option<PathBuf> {
+    default_path().and_then(|p| p.parent().map(Path::to_path_buf))
+}
+
+/// Write-ahead journal settings. `enabled = false` is the J3a behaviour: every operation
+/// goes to the receiver synchronously.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JournalConfig {
+    pub enabled: bool,
+    /// Empty = `<state-dir>/journal`.
+    pub dir: String,
+    /// Unuploaded data the journal may hold; writes wait (then fail) when it is reached.
+    /// 0 = `DEFAULT_MAX_BACKLOG`.
+    pub max_backlog_bytes: u64,
+}
+
+impl Default for JournalConfig {
+    fn default() -> Self {
+        JournalConfig {
+            enabled: true,
+            dir: String::new(),
+            max_backlog_bytes: 0,
+        }
+    }
+}
+
+impl JournalConfig {
+    pub fn max_backlog(&self) -> u64 {
+        if self.max_backlog_bytes == 0 {
+            DEFAULT_MAX_BACKLOG
+        } else {
+            self.max_backlog_bytes
+        }
+    }
+
+    pub fn resolve_dir(&self) -> Option<PathBuf> {
+        if !self.dir.is_empty() {
+            return Some(PathBuf::from(&self.dir));
+        }
+        state_dir().map(|d| d.join("journal"))
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShareConfig {
@@ -61,6 +109,7 @@ pub struct ShareConfig {
     /// The share's client profile (TM / Windows / POSIX) sets case semantics,
     /// AAPL, POSIX-ext and so on. See profile::ClientProfile.
     pub profile: crate::profile::ClientProfile,
+    pub journal: JournalConfig,
 }
 
 mod pem_text {
@@ -90,8 +139,8 @@ impl ShareConfig {
         if self.appliance_endpoint.trim().is_empty() {
             return Err(invalid("appliance_endpoint is required"));
         }
-        if self.flush_policy == FlushPolicy::LocalJournal {
-            return Err(invalid("flush policy LOCAL_JOURNAL is not supported yet"));
+        if self.flush_policy == FlushPolicy::LocalJournal && !self.journal.enabled {
+            return Err(invalid("flush policy LOCAL_JOURNAL needs the journal"));
         }
         if self.client_cert_path.is_empty() != self.client_key_path.is_empty() {
             return Err(invalid(
@@ -301,8 +350,9 @@ mod tests {
         assert!(s.apply(bad).is_err());
         let mut bad = sample();
         bad.flush_policy = FlushPolicy::LocalJournal;
+        bad.journal.enabled = false;
         let e = s.apply(bad).unwrap_err();
-        assert!(e.to_string().contains("not supported yet"));
+        assert!(e.to_string().contains("needs the journal"));
         let mut bad = sample();
         bad.client_key_path.clear();
         assert!(s.apply(bad).is_err());
@@ -338,6 +388,34 @@ mod tests {
         );
         std::fs::write(&path, br#"{"version":99,"share":{}}"#).unwrap();
         assert!(ConfigStore::load(&path).is_err());
+    }
+
+    #[test]
+    fn journal_settings_default_on_roundtrip_and_old_files_load() {
+        let d = tmpdir("journal");
+        let path = d.join("config");
+        // a file written before J3b has no journal section: the journal is on
+        std::fs::write(
+            &path,
+            br#"{"version":1,"share":{"appliance_endpoint":"h:1"}}"#,
+        )
+        .unwrap();
+        let c = ConfigStore::load(&path).unwrap().current();
+        assert!(c.journal.enabled);
+        assert_eq!(c.journal.max_backlog(), DEFAULT_MAX_BACKLOG);
+
+        let mut cfg = sample();
+        cfg.journal = JournalConfig {
+            enabled: false,
+            dir: "/x/j".into(),
+            max_backlog_bytes: 5,
+        };
+        let s = ConfigStore::load(&path).unwrap();
+        s.apply(cfg.clone()).unwrap();
+        let back = ConfigStore::load(&path).unwrap().current();
+        assert_eq!(back.journal, cfg.journal);
+        assert_eq!(back.journal.resolve_dir().unwrap(), PathBuf::from("/x/j"));
+        assert_eq!(back.journal.max_backlog(), 5);
     }
 
     #[test]

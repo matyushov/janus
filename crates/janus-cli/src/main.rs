@@ -132,8 +132,28 @@ async fn run_client(cmd: Command) {
                 println!("open handles:      {}", s.open_handles);
                 println!("parked durables:   {}", s.durable_handles_parked);
                 println!("journal backlog:   {} bytes", s.journal_backlog_bytes);
+                println!(
+                    "oldest unuploaded: {}",
+                    if s.journal_backlog_bytes == 0 {
+                        "-".to_string()
+                    } else {
+                        format!("{:.1} s ago", s.oldest_unuploaded_age_ms as f64 / 1000.0)
+                    }
+                );
                 println!("uploaded:          {} bytes", s.uploaded_bytes_total);
                 println!("upload errors:     {}", s.upload_errors);
+                println!("stuck files:       {}", s.sticky_error_files);
+                if !s.last_upload_error.is_empty() {
+                    println!("last upload error: {}", s.last_upload_error);
+                }
+                if s.last_appliance_ack_unix_ms > 0 {
+                    let ago = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0)
+                        - s.last_appliance_ack_unix_ms;
+                    println!("last server ack:   {:.1} s ago", ago.max(0) as f64 / 1000.0);
+                }
             }
             Err(e) => fail_rpc(e),
         },
@@ -224,6 +244,10 @@ fn build_configure(args: &ConfigureArgs) -> ConfigureRequest {
         ca_pem,
         share_name: args.share.clone(),
         mount_port: args.mount_port,
+        flush_policy: if args.local_journal { 2 } else { 1 },
+        journal_enabled: args.journal,
+        journal_dir: args.journal_dir.clone(),
+        max_backlog_bytes: args.max_backlog_mib << 20,
         ..Default::default()
     }
 }

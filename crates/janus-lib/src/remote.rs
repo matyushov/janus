@@ -69,6 +69,10 @@ pub struct Timeouts {
     pub fail_fast: Duration,
     /// Total time for one backend operation, all attempts and backoff included.
     pub budget: Duration,
+    /// Longest a flush / close of a file with unuploaded data may wait for the receiver
+    /// (journal mode). Longer than `budget` on purpose: this wait is what absorbs a receiver
+    /// that freezes for tens of seconds; it still ends before the client's own 30 s timeout.
+    pub barrier: Duration,
     /// HTTP/2 PING interval (also while idle, so a silent peer is noticed).
     pub keepalive_interval: Duration,
     /// How long to wait for the PING ack before the connection is declared dead.
@@ -84,6 +88,7 @@ impl Default for Timeouts {
             degraded_probe: DEFAULT_DEGRADED_PROBE,
             fail_fast: DEFAULT_FAIL_FAST,
             budget: DEFAULT_OPERATION_BUDGET,
+            barrier: DEFAULT_BARRIER_BUDGET,
             keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
             keepalive_timeout: DEFAULT_KEEPALIVE_TIMEOUT,
         }
@@ -100,6 +105,8 @@ pub const DEFAULT_CONNECTIONS: usize = 4;
 /// Calls in flight per connection (tower limit; further calls wait for a slot).
 const MAX_CALLS_PER_CONNECTION: usize = 128;
 pub const DEFAULT_OPERATION_BUDGET: Duration = Duration::from_secs(18);
+/// See `Timeouts::barrier`.
+pub const DEFAULT_BARRIER_BUDGET: Duration = Duration::from_secs(26);
 pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 pub const DEFAULT_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(3);
 

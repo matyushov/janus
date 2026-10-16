@@ -34,9 +34,11 @@ pub async fn read_message<R: AsyncReadExt + Unpin>(r: &mut R) -> std::io::Result
 pub async fn write_message<W: AsyncWriteExt + Unpin>(w: &mut W, msg: &[u8]) -> std::io::Result<()> {
     let len = msg.len();
     debug_assert!(len <= MAX_MESSAGE);
-    let prefix = [0u8, (len >> 16) as u8, (len >> 8) as u8, len as u8];
-    w.write_all(&prefix).await?;
-    w.write_all(msg).await?;
+    // One buffer, one write: a separate 4-byte prefix write would go out as its own tiny segment.
+    let mut framed = Vec::with_capacity(4 + len);
+    framed.extend_from_slice(&[0u8, (len >> 16) as u8, (len >> 8) as u8, len as u8]);
+    framed.extend_from_slice(msg);
+    w.write_all(&framed).await?;
     w.flush().await
 }
 

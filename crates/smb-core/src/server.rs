@@ -14,6 +14,8 @@ use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 
+use futures_util::StreamExt;
+use futures_util::stream::FuturesUnordered;
 use janus_lib::control::DaemonState;
 use janus_lib::credentials::CredentialStore;
 use janus_lib::profile::ClientProfile;
@@ -24,12 +26,25 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
 use crate::conn::{AUTH_TIMEOUT, ConnState};
-use crate::dispatch::{Dispatcher, Reply, ServerCtx, system_random};
+use crate::dispatch::{Dispatcher, IoMeta, Reply, ServerCtx, system_random};
 use crate::transport::{read_message, write_message};
 
 /// TCP connection identifier.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ConnId(pub u64);
+
+/// READ/WRITE backend calls of one connection that may be in flight at once. Each holds up to
+/// `MAX_IO` of payload; a high-latency backend needs several in flight to fill the link.
+const MAX_INFLIGHT_IO: usize = 8;
+
+/// Aborts the reader task when the connection loop ends (otherwise it would hold the socket).
+struct AbortOnDrop(tokio::task::JoinHandle<()>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// Share name until `configure` sets one.
 pub const DEFAULT_SHARE: &str = "backup";
@@ -98,6 +113,8 @@ impl<B: StorageBackend> DevServer<B> {
     pub async fn serve(self: Arc<Self>, listener: TcpListener) -> std::io::Result<()> {
         loop {
             let (stream, peer) = listener.accept().await?;
+            // Request/response protocol: Nagle + delayed ACK would add tens of ms per exchange.
+            let _ = stream.set_nodelay(true);
             let conn_id = ConnId(
                 self.next_conn
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
@@ -111,36 +128,71 @@ impl<B: StorageBackend> DevServer<B> {
         }
     }
 
-    async fn serve_conn(&self, mut stream: TcpStream, conn_id: ConnId) -> std::io::Result<()> {
+    async fn serve_conn(&self, stream: TcpStream, conn_id: ConnId) -> std::io::Result<()> {
         let mut conn = ConnState::default();
         eprintln!("janus: conn {conn_id:?} established");
-        let result = self.conn_loop(&mut stream, &mut conn, conn_id).await;
+        let result = self.conn_loop(stream, &mut conn, conn_id).await;
         // Whatever ended the connection, release the backend handles it still holds.
         Dispatcher::cleanup(&mut conn, &*self.backend).await;
         eprintln!("janus: conn {conn_id:?} closed");
         result
     }
 
+    /// Reads packets on a separate task (cancel-safe `recv`) and runs plain READ/WRITE requests
+    /// concurrently, up to `MAX_INFLIGHT_IO`. Everything else is a barrier: it waits until the
+    /// in-flight I/O is replied to, so CLOSE/FLUSH/SET_INFO and friends see all earlier writes
+    /// and the order of every other command is exactly the order of arrival. Replies to
+    /// READ/WRITE may overtake each other, which SMB2 allows (clients match by MessageId).
     async fn conn_loop(
         &self,
-        stream: &mut TcpStream,
+        stream: TcpStream,
         conn: &mut ConnState,
         conn_id: ConnId,
     ) -> std::io::Result<()> {
+        let (mut rd, mut wr) = stream.into_split();
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<std::io::Result<Option<Vec<u8>>>>(2);
+        let _reader = AbortOnDrop(tokio::spawn(async move {
+            loop {
+                let r = read_message(&mut rd).await;
+                let last = !matches!(r, Ok(Some(_)));
+                if tx.send(r).await.is_err() || last {
+                    break;
+                }
+            }
+        }));
+        let backend = &*self.backend;
+        let mut inflight = FuturesUnordered::new();
         loop {
             // While authentication is in progress, wait for the next packet only for a bounded time.
-            let next = if conn.has_pending_auth() {
-                match tokio::time::timeout(AUTH_TIMEOUT, read_message(stream)).await {
-                    Ok(r) => r?,
-                    Err(_) => {
-                        eprintln!("janus: conn {conn_id:?} auth timeout; closing");
-                        break;
-                    }
+            let auth_wait = conn.has_pending_auth() && inflight.is_empty();
+            let next = tokio::select! {
+                biased;
+                Some((meta, out, raw)) = inflight.next(), if !inflight.is_empty() => {
+                    self.send_io_reply(&mut wr, conn, conn_id, meta, out, raw).await?;
+                    continue;
                 }
-            } else {
-                read_message(stream).await?
+                m = rx.recv(), if inflight.len() < MAX_INFLIGHT_IO => match m {
+                    Some(r) => r?,
+                    None => break,
+                },
+                _ = tokio::time::sleep(AUTH_TIMEOUT), if auth_wait => {
+                    eprintln!("janus: conn {conn_id:?} auth timeout; closing");
+                    break;
+                }
             };
             let Some(raw) = next else { break };
+
+            if let Some((meta, job)) = Dispatcher::try_defer_io(&raw, conn, &self.backend) {
+                let keep = (self.trace > 0).then_some(raw);
+                inflight.push(async move { (meta, job.run(backend).await, keep) });
+                continue;
+            }
+            conn.io_epoch += 1; // anything but plain READ/WRITE may change what readahead holds
+            // Barrier: finish the I/O in flight before anything else is looked at.
+            while let Some((meta, out, raw)) = inflight.next().await {
+                self.send_io_reply(&mut wr, conn, conn_id, meta, out, raw)
+                    .await?;
+            }
 
             // Snapshot of the share configuration and credentials for the duration of packet handling.
             let (share_name, profile, volume_bytes) = {
@@ -193,7 +245,7 @@ impl<B: StorageBackend> DevServer<B> {
                 eprintln!("janus: conn {conn_id:?} raw → {hex}");
             }
             match result {
-                Ok(Reply::Now(bytes)) => write_message(stream, &bytes).await?,
+                Ok(Reply::Now(bytes)) => write_message(&mut wr, &bytes).await?,
                 Ok(Reply::None) => {}
                 Ok(Reply::Async { .. }) => {
                     // UPGRADE: the interim STATUS_PENDING has already been sent, the final reply comes later.
@@ -209,6 +261,24 @@ impl<B: StorageBackend> DevServer<B> {
             }
         }
         Ok(())
+    }
+}
+
+impl<B: StorageBackend> DevServer<B> {
+    async fn send_io_reply(
+        &self,
+        wr: &mut tokio::net::tcp::OwnedWriteHalf,
+        conn: &mut ConnState,
+        conn_id: ConnId,
+        meta: IoMeta,
+        out: crate::dispatch::Out,
+        raw: Option<Vec<u8>>,
+    ) -> std::io::Result<()> {
+        let bytes = Dispatcher::finish_io(&meta, out, conn);
+        if let Some(raw) = raw {
+            trace_exchange(conn_id, &raw, &Ok(Reply::Now(bytes.clone())));
+        }
+        write_message(wr, &bytes).await
     }
 }
 

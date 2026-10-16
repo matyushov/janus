@@ -13,10 +13,13 @@
 //! UPGRADE(keychain): `tls_identity_ref` (client identity from the macOS Keychain) is not
 //! implemented; only the file mode is.
 
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use janus_proto::v1::PingRequest;
 use janus_proto::v1::band_transport_client::BandTransportClient;
+use tonic::codec::CompressionEncoding;
 use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 
 /// Errors of communication with the receiver, in terms the control plane understands.
@@ -92,6 +95,10 @@ pub const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(6);
 pub const DEFAULT_BULK_REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 pub const DEFAULT_DEGRADED_PROBE: Duration = Duration::from_secs(2);
 pub const DEFAULT_FAIL_FAST: Duration = Duration::from_secs(2);
+/// Connections in the pool unless the config says otherwise.
+pub const DEFAULT_CONNECTIONS: usize = 4;
+/// Calls in flight per connection (tower limit; further calls wait for a slot).
+const MAX_CALLS_PER_CONNECTION: usize = 128;
 pub const DEFAULT_OPERATION_BUDGET: Duration = Duration::from_secs(18);
 pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 pub const DEFAULT_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(3);
@@ -100,6 +107,11 @@ pub const DEFAULT_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(3);
 #[derive(Debug, Clone, Default)]
 pub struct RemoteConfig {
     pub endpoint: String,
+    /// No zstd at all: requests are sent plain and compressed replies are not asked for.
+    pub no_compression: bool,
+    /// Parallel HTTP/2 connections to the receiver (0 = `DEFAULT_CONNECTIONS`). One TCP
+    /// stream does not fill a lossy link; bulk calls are spread over the pool round-robin.
+    pub connections: usize,
     /// UPGRADE(mTLS): CA + client identity.
     pub ca_pem: Vec<u8>,
     pub client_cert_path: String,
@@ -111,6 +123,8 @@ impl RemoteConfig {
     pub fn from_share(cfg: &crate::config::ShareConfig) -> RemoteConfig {
         RemoteConfig {
             endpoint: cfg.appliance_endpoint.clone(),
+            no_compression: false,
+            connections: 0,
             ca_pem: cfg.ca_pem.clone(),
             client_cert_path: cfg.client_cert_path.clone(),
             client_key_path: cfg.client_key_path.clone(),
@@ -158,10 +172,24 @@ fn warn_if_wide(path: &str) {
     let _ = path;
 }
 
+/// The receiver says in its `Ping` reply that it can read zstd-compressed requests
+/// (tonic itself only reports `grpc-accept-encoding` when it rejects an encoding).
+pub fn accepts_zstd(md: &tonic::metadata::MetadataMap) -> bool {
+    md.get("janus-accept-encoding")
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| v.split(',').any(|e| e.trim() == "zstd"))
+}
+
 /// Receiver client. Holds a lazy tonic channel (the real connection is made on
 /// the first call).
 pub struct RemoteClient {
-    client: BandTransportClient<Channel>,
+    /// Never empty. Index 0 also serves control calls (`ping`).
+    clients: Vec<BandTransportClient<Channel>>,
+    /// The same channels, sending zstd-compressed requests. Used only once `zstd` is set.
+    zstd_clients: Vec<BandTransportClient<Channel>>,
+    /// The receiver advertised zstd in a reply (see `ping`).
+    zstd: Arc<AtomicBool>,
+    no_compression: bool,
     endpoint: String,
     timeouts: Timeouts,
 }
@@ -204,7 +232,8 @@ impl RemoteClient {
             .timeout(cfg.timeouts.budget)
             .http2_keep_alive_interval(cfg.timeouts.keepalive_interval)
             .keep_alive_timeout(cfg.timeouts.keepalive_timeout)
-            .keep_alive_while_idle(true);
+            .keep_alive_while_idle(true)
+            .concurrency_limit(MAX_CALLS_PER_CONNECTION);
 
         if tls {
             let read = |what: &str, path: &str| {
@@ -222,9 +251,31 @@ impl RemoteClient {
                 .map_err(|e| RemoteError::Tls(e.to_string()))?;
         }
 
-        let channel = endpoint.connect_lazy();
+        let n = match cfg.connections {
+            0 => DEFAULT_CONNECTIONS,
+            n => n,
+        };
+        // Each `connect_lazy` channel owns its own connection and reconnects by itself.
+        let channels: Vec<Channel> = (0..n).map(|_| endpoint.connect_lazy()).collect();
+        let no_zstd = cfg.no_compression;
+        let plain = |c: &Channel| {
+            let client = BandTransportClient::new(c.clone());
+            if no_zstd {
+                client
+            } else {
+                client.accept_compressed(CompressionEncoding::Zstd)
+            }
+        };
+        let clients = channels.iter().map(plain).collect();
+        let zstd_clients = channels
+            .iter()
+            .map(|c| plain(c).send_compressed(CompressionEncoding::Zstd))
+            .collect();
         Ok(RemoteClient {
-            client: BandTransportClient::new(channel),
+            clients,
+            zstd_clients,
+            zstd: Arc::new(AtomicBool::new(false)),
+            no_compression: no_zstd,
             endpoint: cfg.endpoint.clone(),
             timeouts: cfg.timeouts,
         })
@@ -232,7 +283,22 @@ impl RemoteClient {
 
     /// A cheap clone of the underlying (lazy, auto-reconnecting) transport client.
     pub fn transport(&self) -> BandTransportClient<Channel> {
-        self.client.clone()
+        self.clients[0].clone()
+    }
+
+    /// Clones of every pooled transport client (see `RemoteConfig::connections`).
+    pub fn transports(&self) -> Vec<BandTransportClient<Channel>> {
+        self.clients.clone()
+    }
+
+    /// The pool again, sending compressed requests, with the switch that says whether the
+    /// receiver is known to accept them (set by `ping`).
+    pub fn compression_allowed(&self) -> bool {
+        !self.no_compression
+    }
+
+    pub fn compressed_transports(&self) -> (Vec<BandTransportClient<Channel>>, Arc<AtomicBool>) {
+        (self.zstd_clients.clone(), Arc::clone(&self.zstd))
     }
 
     pub fn timeouts(&self) -> Timeouts {
@@ -246,8 +312,7 @@ impl RemoteClient {
     /// Reachability check: the only operation done by
     /// `EnsureReady`. The first call is also what opens the connection.
     pub async fn ping(&mut self) -> Result<String, RemoteError> {
-        let reply = self
-            .client
+        let reply = self.clients[0]
             .ping(PingRequest {
                 client_version: env!("CARGO_PKG_VERSION").to_string(),
             })
@@ -259,9 +324,11 @@ impl RemoteClient {
                 } else {
                     RemoteError::Rpc(Box::new(s))
                 }
-            })?
-            .into_inner();
-        Ok(reply.server_version)
+            })?;
+        if !self.no_compression && accepts_zstd(reply.metadata()) {
+            self.zstd.store(true, Ordering::Relaxed);
+        }
+        Ok(reply.into_inner().server_version)
     }
 }
 
@@ -302,5 +369,28 @@ mod tests {
         assert!(!cfg.tls_configured(), "without a key — not configured");
         cfg.client_key_path = "k.pem".into();
         assert!(cfg.tls_configured());
+    }
+}
+
+#[cfg(test)]
+mod pool_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pool_size_follows_the_config_and_is_never_empty() {
+        let cfg = |connections| RemoteConfig {
+            endpoint: "127.0.0.1:1".into(),
+            connections,
+            ..Default::default()
+        };
+        let n = |c| {
+            RemoteClient::connect_lazy(&cfg(c))
+                .unwrap()
+                .transports()
+                .len()
+        };
+        assert_eq!(n(3), 3);
+        assert_eq!(n(1), 1);
+        assert!(n(0) >= 1);
     }
 }

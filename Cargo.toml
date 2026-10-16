@@ -10,7 +10,7 @@ license = "MIT"
 
 [workspace.dependencies]
 # Contract / gRPC
-tonic = "0.12"
+tonic = { version = "0.12", features = ["zstd"] }
 prost = "0.13"
 tonic-build = "0.12"
 protoc-bin-vendored = "3"

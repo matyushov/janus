@@ -654,7 +654,19 @@ impl Client {
 
     /// A signed request after the session is established.
     pub fn signed_request(&mut self, command: Command, tree_id: u32, body: &[u8]) -> Vec<u8> {
-        let h = request_header(command, self.next_id(), self.session_id, tree_id);
+        self.signed_request_charged(command, tree_id, body, 1)
+    }
+
+    /// Like `signed_request`, with an explicit CreditCharge (multi-credit READ/WRITE).
+    pub fn signed_request_charged(
+        &mut self,
+        command: Command,
+        tree_id: u32,
+        body: &[u8],
+        credit_charge: u16,
+    ) -> Vec<u8> {
+        let mut h = request_header(command, self.next_id(), self.session_id, tree_id);
+        h.credit_charge = credit_charge;
         let mut f = frame(&h, body);
         sign_frame(&mut f, &self.signing_key.expect("session not established"));
         f

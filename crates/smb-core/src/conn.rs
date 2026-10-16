@@ -36,6 +36,9 @@ pub struct ConnState {
     pub smb1_negotiated: bool,
     /// FileId of the last successful CREATE in the current compound chain (related operations).
     pub compound_file: Option<[u8; 16]>,
+    /// Bumped by every WRITE and every command that is not a plain READ/WRITE. Prefetched
+    /// reads started under an older value may predate a change and are discarded.
+    pub io_epoch: u64,
 }
 
 impl Default for ConnState {
@@ -50,6 +53,7 @@ impl Default for ConnState {
             close_after_reply: false,
             smb1_negotiated: false,
             compound_file: None,
+            io_epoch: 0,
         }
     }
 }

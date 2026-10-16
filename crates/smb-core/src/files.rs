@@ -7,7 +7,8 @@
 //! the trait.
 
 use janus_lib::vfs::{
-    BackendError, Disposition, FileStat, FsStats, Kind, OpenRequest, SetTimes, StorageBackend,
+    BackendError, BackendHandle, Disposition, FileStat, FsStats, Kind, OpenRequest, SetTimes,
+    StorageBackend,
 };
 use smb_wire::bytes::Writer;
 use smb_wire::create::{
@@ -31,8 +32,17 @@ use smb_wire::messages::ACCESS_ALL;
 use crate::dispatch::{Out, ServerCtx, status};
 use crate::session::{DirScan, Open, Session};
 
-/// Largest READ/WRITE payload: no LARGE_MTU, so one credit, 64 KiB.
-pub const MAX_IO: u32 = 65536;
+/// Largest READ/WRITE payload. With LARGE_MTU one request may carry up to 1 MiB, which
+/// the client pays for with multiple credits (see `required_credits`). 1 MiB is also the
+/// largest chunk of one gRPC call, so a request maps to exactly one RPC.
+pub const MAX_IO: u32 = 1 << 20;
+/// One credit covers this many payload bytes (MS-SMB2 §3.3.1.2).
+const CREDIT_UNIT: u32 = 65536;
+
+/// Credits a READ/WRITE of `len` payload bytes must be charged (MS-SMB2 §3.3.5.2.5).
+fn required_credits(len: u32) -> u32 {
+    len.saturating_sub(1) / CREDIT_UNIT + 1
+}
 /// Open objects per session (a client that leaks handles must not exhaust the server).
 pub const MAX_OPENS_PER_SESSION: usize = 16384;
 /// Allocation granularity reported to clients.
@@ -191,6 +201,7 @@ pub(crate) async fn create<B: StorageBackend>(
     }
     .encode(&mut w);
     let file_id = session.add_open(Open {
+        readahead: Default::default(),
         tree_id,
         rel_path: path,
         handle: opened.handle,
@@ -239,81 +250,218 @@ pub(crate) async fn close<B: StorageBackend>(
     Out::ok(w.into_vec())
 }
 
+/// A validated READ or WRITE, ready for the backend. Everything that needs the session is
+/// done by `prepare_*` (synchronously, in request order); `run` only talks to the backend,
+/// so several jobs of one connection may be in flight at once.
+pub(crate) enum IoJob {
+    Read {
+        handle: BackendHandle,
+        offset: u64,
+        length: u32,
+        minimum_count: u32,
+        /// The same range already requested by readahead; a failed prefetch falls back to a
+        /// direct read.
+        prefetched: Option<tokio::task::JoinHandle<janus_lib::vfs::Result<Vec<u8>>>>,
+    },
+    Write {
+        handle: BackendHandle,
+        offset: u64,
+        data: Vec<u8>,
+        /// WRITE_THROUGH / UNBUFFERED: flush before replying.
+        flush: bool,
+    },
+}
+
+impl IoJob {
+    pub(crate) async fn run<B: StorageBackend>(self, backend: &B) -> Out {
+        match self {
+            IoJob::Read {
+                handle,
+                offset,
+                length,
+                minimum_count,
+                prefetched,
+            } => match match prefetched {
+                Some(task) => match task.await {
+                    Ok(Ok(data)) => Ok(data),
+                    _ => backend.read(handle, offset, length).await,
+                },
+                None => backend.read(handle, offset, length).await,
+            } {
+                Ok(data) if data.is_empty() || (data.len() as u32) < minimum_count => {
+                    Out::err(status::END_OF_FILE)
+                }
+                Ok(data) => {
+                    let mut w = Writer::new();
+                    encode_read_resp(&mut w, &data);
+                    Out::ok(w.into_vec())
+                }
+                Err(e) => Out::err(status_of(&e)),
+            },
+            IoJob::Write {
+                handle,
+                offset,
+                data,
+                flush,
+            } => {
+                if !data.is_empty()
+                    && let Err(e) = backend.write(handle, offset, &data).await
+                {
+                    return Out::err(status_of(&e));
+                }
+                if flush && let Err(e) = backend.flush(handle, false).await {
+                    return Out::err(status_of(&e));
+                }
+                let mut w = Writer::new();
+                encode_write_resp(&mut w, data.len() as u32);
+                Out::ok(w.into_vec())
+            }
+        }
+    }
+}
+
+/// Chunks kept in flight ahead of a sequential reader, and the smallest read that starts it.
+const READAHEAD_DEPTH: usize = 3;
+const READAHEAD_MIN_LEN: u32 = 65536;
+
+/// Where readahead may start tasks: the backend to read from and the connection's write epoch.
+pub(crate) struct ReadaheadCtx<'a, B> {
+    pub backend: &'a std::sync::Arc<B>,
+    pub epoch: u64,
+}
+
+/// `Err` carries a finished reply (an error, or the empty read that needs no backend call).
+pub(crate) fn prepare_read<B: StorageBackend>(
+    req: &ReadReq,
+    fid: [u8; 16],
+    tree_id: u32,
+    credit_charge: u16,
+    session: &mut Session,
+    ra: Option<ReadaheadCtx<'_, B>>,
+) -> Result<IoJob, Out> {
+    let Some(open) = session.open_mut(&fid, tree_id) else {
+        return Err(Out::err(status::FILE_CLOSED));
+    };
+    if open.directory {
+        return Err(Out::err(status::FILE_IS_A_DIRECTORY));
+    }
+    if !access_wants_read(open.access) {
+        return Err(Out::err(status::ACCESS_DENIED));
+    }
+    if req.channel != 0
+        || req.length > MAX_IO
+        || u32::from(credit_charge.max(1)) < required_credits(req.length)
+        || req.offset.checked_add(u64::from(req.length)).is_none()
+    {
+        return Err(Out::err(status::INVALID_PARAMETER));
+    }
+    if req.length == 0 {
+        let mut w = Writer::new();
+        encode_read_resp(&mut w, &[]);
+        return Err(Out::ok(w.into_vec()));
+    }
+    let mut prefetched = None;
+    if let Some(ra) = ra {
+        let state = &mut open.readahead;
+        // Take the prefetch for exactly this range, dropping (aborting) older or stale ones.
+        while let Some(mut pf) = state.queue.pop_front() {
+            if pf.epoch == ra.epoch && pf.offset == req.offset && pf.length == req.length {
+                prefetched = pf.task.take();
+                break;
+            }
+        }
+        let sequential = state.next_offset == req.offset;
+        state.next_offset = req.offset + u64::from(req.length);
+        if sequential && req.length >= READAHEAD_MIN_LEN {
+            let mut next = state
+                .queue
+                .back()
+                .map_or(state.next_offset, |p| p.offset + u64::from(p.length));
+            while state.queue.len() < READAHEAD_DEPTH {
+                let (backend, handle, offset, length) = (
+                    std::sync::Arc::clone(ra.backend),
+                    open.handle,
+                    next,
+                    req.length,
+                );
+                state.queue.push_back(crate::session::Prefetch {
+                    offset,
+                    length,
+                    epoch: ra.epoch,
+                    task: Some(tokio::spawn(async move {
+                        backend.read(handle, offset, length).await
+                    })),
+                });
+                next += u64::from(length);
+            }
+        }
+    }
+    Ok(IoJob::Read {
+        handle: open.handle,
+        offset: req.offset,
+        length: req.length,
+        minimum_count: req.minimum_count,
+        prefetched,
+    })
+}
+
+pub(crate) fn prepare_write(
+    req: WriteReq,
+    fid: [u8; 16],
+    tree_id: u32,
+    credit_charge: u16,
+    session: &mut Session,
+) -> Result<IoJob, Out> {
+    let Some(open) = session.open_mut(&fid, tree_id) else {
+        return Err(Out::err(status::FILE_CLOSED));
+    };
+    if open.directory {
+        return Err(Out::err(status::FILE_IS_A_DIRECTORY));
+    }
+    if !access_wants_write(open.access) {
+        return Err(Out::err(status::ACCESS_DENIED));
+    }
+    if req.channel != 0
+        || req.data.len() as u64 > u64::from(MAX_IO)
+        || u32::from(credit_charge.max(1)) < required_credits(req.data.len() as u32)
+        || req.offset.checked_add(req.data.len() as u64).is_none()
+    {
+        return Err(Out::err(status::INVALID_PARAMETER));
+    }
+    Ok(IoJob::Write {
+        handle: open.handle,
+        offset: req.offset,
+        flush: req.flags & (write_flags::WRITE_THROUGH | write_flags::UNBUFFERED) != 0,
+        data: req.data,
+    })
+}
+
 pub(crate) async fn read<B: StorageBackend>(
     backend: &B,
     req: &ReadReq,
     fid: [u8; 16],
     tree_id: u32,
+    credit_charge: u16,
     session: &mut Session,
 ) -> Out {
-    let Some(open) = session.open_mut(&fid, tree_id) else {
-        return Out::err(status::FILE_CLOSED);
-    };
-    if open.directory {
-        return Out::err(status::FILE_IS_A_DIRECTORY);
-    }
-    if !access_wants_read(open.access) {
-        return Out::err(status::ACCESS_DENIED);
-    }
-    if req.channel != 0
-        || req.length > MAX_IO
-        || req.offset.checked_add(u64::from(req.length)).is_none()
-    {
-        return Out::err(status::INVALID_PARAMETER);
-    }
-    if req.length == 0 {
-        let mut w = Writer::new();
-        encode_read_resp(&mut w, &[]);
-        return Out::ok(w.into_vec());
-    }
-    match backend.read(open.handle, req.offset, req.length).await {
-        Ok(data) if data.is_empty() || (data.len() as u32) < req.minimum_count => {
-            Out::err(status::END_OF_FILE)
-        }
-        Ok(data) => {
-            let mut w = Writer::new();
-            encode_read_resp(&mut w, &data);
-            Out::ok(w.into_vec())
-        }
-        Err(e) => Out::err(status_of(&e)),
+    match prepare_read::<B>(req, fid, tree_id, credit_charge, session, None) {
+        Ok(job) => job.run(backend).await,
+        Err(out) => out,
     }
 }
 
 pub(crate) async fn write<B: StorageBackend>(
     backend: &B,
-    req: &WriteReq,
+    req: WriteReq,
     fid: [u8; 16],
     tree_id: u32,
+    credit_charge: u16,
     session: &mut Session,
 ) -> Out {
-    let Some(open) = session.open_mut(&fid, tree_id) else {
-        return Out::err(status::FILE_CLOSED);
-    };
-    if open.directory {
-        return Out::err(status::FILE_IS_A_DIRECTORY);
+    match prepare_write(req, fid, tree_id, credit_charge, session) {
+        Ok(job) => job.run(backend).await,
+        Err(out) => out,
     }
-    if !access_wants_write(open.access) {
-        return Out::err(status::ACCESS_DENIED);
-    }
-    if req.channel != 0
-        || req.data.len() as u64 > u64::from(MAX_IO)
-        || req.offset.checked_add(req.data.len() as u64).is_none()
-    {
-        return Out::err(status::INVALID_PARAMETER);
-    }
-    if !req.data.is_empty()
-        && let Err(e) = backend.write(open.handle, req.offset, &req.data).await
-    {
-        return Out::err(status_of(&e));
-    }
-    if req.flags & (write_flags::WRITE_THROUGH | write_flags::UNBUFFERED) != 0
-        && let Err(e) = backend.flush(open.handle, false).await
-    {
-        return Out::err(status_of(&e));
-    }
-    let mut w = Writer::new();
-    encode_write_resp(&mut w, req.data.len() as u32);
-    Out::ok(w.into_vec())
 }
 
 pub(crate) async fn flush<B: StorageBackend>(

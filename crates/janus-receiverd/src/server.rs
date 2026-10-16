@@ -12,6 +12,7 @@ use std::sync::Arc;
 use janus_proto::v1::band_transport_server::BandTransportServer;
 use janus_proto::v1::receiver_control_server::ReceiverControlServer;
 use tokio::net::TcpListener;
+use tonic::codec::CompressionEncoding;
 
 use crate::control::{ReceiverControlService, ReceiverState};
 use crate::identity::IdentityMap;
@@ -151,7 +152,10 @@ pub async fn serve_router_on_listener(
     tls: Option<Arc<rustls::ServerConfig>>,
     shutdown: impl std::future::Future<Output = ()> + Send + 'static,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let svc = BandTransportServer::new(RouterService(router));
+    // zstd both ways; clients that do not ask for it get plain messages.
+    let svc = BandTransportServer::new(RouterService(router))
+        .accept_compressed(CompressionEncoding::Zstd)
+        .send_compressed(CompressionEncoding::Zstd);
     let mut builder = tonic::transport::Server::builder();
     match tls {
         None => {

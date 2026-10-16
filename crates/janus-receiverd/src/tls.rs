@@ -145,6 +145,9 @@ pub fn incoming(
                 },
                 _ = tx.closed() => return,
             };
+            // tonic only sets this on listeners it accepts itself; without it Nagle + delayed
+            // ACK stall the h2 WINDOW_UPDATE/response frames and cap uploads at ~1/3 of the link.
+            let _ = tcp.set_nodelay(true);
             let acceptor = acceptor.clone();
             let tx = tx.clone();
             tokio::spawn(async move {

@@ -10,6 +10,8 @@ license.workspace = true
 smb-wire = { path = "../smb-wire" }
 janus-lib = { path = "../janus-lib" }
 tokio = { workspace = true }
+# FuturesUnordered: READ/WRITE backend calls of one connection run concurrently.
+futures-util = { version = "0.3", default-features = false, features = ["alloc"] }
 getrandom = "0.3"
 
 [dev-dependencies]

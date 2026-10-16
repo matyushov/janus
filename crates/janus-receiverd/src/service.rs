@@ -164,10 +164,17 @@ impl BandTransport for BandTransportService {
     async fn ping(&self, req: Request<PingRequest>) -> Result<Response<PingReply>, Status> {
         self.touch();
         let _client = req.into_inner().client_version;
-        Ok(Response::new(PingReply {
+        let mut reply = Response::new(PingReply {
             server_version: env!("CARGO_PKG_VERSION").to_string(),
             proto_rev: PROTO_REV,
-        }))
+        });
+        // The client starts sending zstd-compressed requests once it sees this (server.rs
+        // enables `accept_compressed`). Older receivers do not send it.
+        reply.metadata_mut().insert(
+            "janus-accept-encoding",
+            "zstd".parse().expect("static value"),
+        );
+        Ok(reply)
     }
 
     async fn stat_fs(&self, _req: Request<StatFsRequest>) -> Result<Response<StatFsReply>, Status> {

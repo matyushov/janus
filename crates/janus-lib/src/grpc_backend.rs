@@ -15,7 +15,7 @@
 //! `AlreadyExists`/`NotFound`.
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -35,6 +35,30 @@ use crate::vfs::{
 pub const MAX_CHUNK: usize = 1 << 20;
 /// Volume size reported when neither the receiver nor the configuration gives a quota (1 TiB).
 const DEFAULT_QUOTA: u64 = 1 << 40;
+
+/// How long a cached stat or listing may be served. This gateway is the only writer of its
+/// machine's store, and every mutation made through it invalidates what it touches, so the TTL
+/// only bounds staleness against changes made on the receiver itself (cleanup, retention).
+const META_TTL: Duration = Duration::from_secs(2);
+/// Entry caps; a cache that grows past them is simply emptied.
+const META_MAX_STATS: usize = 4096;
+const META_MAX_LISTINGS: usize = 64;
+/// Larger directories are not cached (a band directory can hold tens of thousands of files).
+const META_MAX_LISTING_LEN: usize = 2048;
+
+/// Short-lived cache of `stat` and `list` answers. macOS opens the same few paths (the
+/// AppleDouble `._name`, the parent directory) dozens of times per copied file, and each
+/// uncached `Stat` is a full round trip to the receiver.
+#[derive(Default)]
+struct MetaCache {
+    /// `None` = the path was absent.
+    stats: HashMap<String, (Instant, Option<FileStat>)>,
+    lists: HashMap<String, (Instant, Vec<FileStat>)>,
+}
+
+fn parent_of(path: &str) -> &str {
+    path.rsplit_once('/').map_or("", |(dir, _)| dir)
+}
 
 /// Retry policy for idempotent calls.
 #[derive(Debug, Clone, Copy)]
@@ -69,7 +93,15 @@ impl HandleEntry {
 }
 
 pub struct GrpcBackend {
-    client: BandTransportClient<Channel>,
+    /// Connection pool, never empty; calls are spread round-robin.
+    clients: Vec<BandTransportClient<Channel>>,
+    /// The same pool sending zstd-compressed requests, and whether to use it.
+    zstd_clients: Vec<BandTransportClient<Channel>>,
+    zstd: Arc<AtomicBool>,
+    zstd_allowed: bool,
+    zstd_probed: AtomicBool,
+    zstd_next_probe: Mutex<Option<Instant>>,
+    next_client: AtomicUsize,
     retry: RetryPolicy,
     timeouts: Timeouts,
     /// When a call last timed out (a silent peer); cleared by the next success. Errors the receiver
@@ -80,12 +112,21 @@ pub struct GrpcBackend {
     next_handle: AtomicU64,
     next_write_id: AtomicU64,
     handles: Mutex<HashMap<u64, Arc<HandleEntry>>>,
+    meta: Mutex<MetaCache>,
+    /// Bumped by every invalidation: a lookup that overlapped one is not cached.
+    mutations: AtomicU64,
 }
 
 impl GrpcBackend {
     pub fn new(client: BandTransportClient<Channel>, fallback_quota: u64) -> GrpcBackend {
         GrpcBackend {
-            client,
+            clients: vec![client],
+            zstd_clients: Vec::new(),
+            zstd: Arc::new(AtomicBool::new(false)),
+            zstd_allowed: false,
+            zstd_probed: AtomicBool::new(false),
+            zstd_next_probe: Mutex::new(None),
+            next_client: AtomicUsize::new(0),
             retry: RetryPolicy::default(),
             timeouts: Timeouts::default(),
             degraded: Mutex::new(None),
@@ -97,16 +138,87 @@ impl GrpcBackend {
             next_handle: AtomicU64::new(1),
             next_write_id: AtomicU64::new(1),
             handles: Mutex::new(HashMap::new()),
+            meta: Mutex::new(MetaCache::default()),
+            mutations: AtomicU64::new(0),
         }
     }
 
     pub fn from_remote(remote: &RemoteClient, fallback_quota: u64) -> GrpcBackend {
-        GrpcBackend::new(remote.transport(), fallback_quota).with_timeouts(remote.timeouts())
+        let mut b =
+            GrpcBackend::new(remote.transport(), fallback_quota).with_timeouts(remote.timeouts());
+        b.clients = remote.transports();
+        (b.zstd_clients, b.zstd) = remote.compressed_transports();
+        b.zstd_allowed = remote.compression_allowed();
+        b
     }
 
     pub fn with_timeouts(mut self, timeouts: Timeouts) -> Self {
         self.timeouts = timeouts;
         self
+    }
+
+    /// Forget what is cached about `paths` and their parent directories. Call after a
+    /// mutation has finished (successfully or not).
+    fn invalidate(&self, paths: &[&str]) {
+        self.mutations.fetch_add(1, Ordering::SeqCst);
+        let mut m = self.meta.lock().expect("meta cache poisoned");
+        for p in paths {
+            for key in [*p, parent_of(p)] {
+                m.stats.remove(key);
+                m.lists.remove(key);
+            }
+        }
+    }
+
+    /// Delete and rename can affect whole subtrees: drop everything.
+    fn invalidate_all(&self) {
+        self.mutations.fetch_add(1, Ordering::SeqCst);
+        let mut m = self.meta.lock().expect("meta cache poisoned");
+        m.stats.clear();
+        m.lists.clear();
+    }
+
+    /// Ask the receiver (`Ping`) whether it can read zstd-compressed requests. Done until it
+    /// has answered once; after a failed probe the next one waits `PROBE_RETRY` so that a
+    /// silent receiver is not asked on every call.
+    async fn probe_compression(&self) {
+        const PROBE_RETRY: Duration = Duration::from_secs(10);
+        const PROBE_TIMEOUT: Duration = Duration::from_secs(1);
+        if !self.zstd_allowed || self.zstd_probed.load(Ordering::Acquire) {
+            return;
+        }
+        {
+            let mut next = self.zstd_next_probe.lock().expect("probe poisoned");
+            if next.is_some_and(|t| Instant::now() < t) {
+                return;
+            }
+            *next = Some(Instant::now() + PROBE_RETRY);
+        }
+        let mut c = self.clients[0].clone();
+        let ping = c.ping(pb::PingRequest {
+            client_version: env!("CARGO_PKG_VERSION").to_string(),
+        });
+        if let Ok(Ok(r)) =
+            tokio::time::timeout(PROBE_TIMEOUT.min(self.timeouts.request), ping).await
+        {
+            self.zstd_probed.store(true, Ordering::Release);
+            if crate::remote::accepts_zstd(r.metadata()) {
+                self.zstd.store(true, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Requests are being sent zstd-compressed (the receiver said it can read them).
+    pub fn compressing(&self) -> bool {
+        self.zstd.load(Ordering::Relaxed)
+    }
+
+    fn pick_client(&self) -> BandTransportClient<Channel> {
+        let i = self.next_client.fetch_add(1, Ordering::Relaxed);
+        if self.zstd.load(Ordering::Relaxed) && !self.zstd_clients.is_empty() {
+            return self.zstd_clients[i % self.zstd_clients.len()].clone();
+        }
+        self.clients[i % self.clients.len()].clone()
     }
 
     fn mark_degraded(&self) {
@@ -143,6 +255,9 @@ impl GrpcBackend {
             return Err(BackendError::RemoteUnavailable);
         }
         let degraded = last_failure.is_some();
+        if !degraded {
+            self.probe_compression().await;
+        }
         let attempts = if idempotent && !degraded {
             self.retry.attempts.max(1)
         } else {
@@ -161,19 +276,15 @@ impl GrpcBackend {
         let mut attempt = 1;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
-            let outcome = match tokio::time::timeout(
-                per_attempt.min(left),
-                call(self.client.clone()),
-            )
-            .await
-            {
-                Ok(r) => r,
-                Err(_) => {
-                    // A silent peer: later calls must not each wait a full budget.
-                    self.mark_degraded();
-                    Err(Status::unavailable("transport error: request timed out"))
-                }
-            };
+            let outcome =
+                match tokio::time::timeout(per_attempt.min(left), call(self.pick_client())).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        // A silent peer: later calls must not each wait a full budget.
+                        self.mark_degraded();
+                        Err(Status::unavailable("transport error: request timed out"))
+                    }
+                };
             match outcome {
                 Ok(r) => {
                     *self.degraded.lock().expect("degraded poisoned") = None;
@@ -198,12 +309,26 @@ impl GrpcBackend {
         idempotent: bool,
         op: bundle_op_request::Op,
     ) -> Result<bundle_op_reply::Result> {
-        let reply = self
+        let path_of = |f: &Option<pb::FileRef>| f.as_ref().map(|f| f.rel_path.clone());
+        let touched: Option<Option<String>> = match &op {
+            bundle_op_request::Op::Create(o) => Some(path_of(&o.file)),
+            bundle_op_request::Op::Truncate(o) => Some(path_of(&o.file)),
+            bundle_op_request::Op::SetTimes(o) => Some(path_of(&o.file)),
+            bundle_op_request::Op::Delete(_) | bundle_op_request::Op::Rename(_) => Some(None),
+            _ => None,
+        };
+        let outcome = self
             .rpc(idempotent, false, |mut c| {
                 let op = op.clone();
                 async move { c.bundle_op(pb::BundleOpRequest { op: Some(op) }).await }
             })
-            .await?;
+            .await;
+        match touched {
+            Some(Some(p)) => self.invalidate(&[&p]),
+            Some(None) => self.invalidate_all(),
+            None => {}
+        }
+        let reply = outcome?;
         reply
             .result
             .ok_or_else(|| BackendError::Io(std::io::Error::other("empty BundleOp reply")))
@@ -217,6 +342,38 @@ impl GrpcBackend {
     }
 
     async fn stat_path(&self, rel: &str) -> Result<FileStat> {
+        let hit = {
+            let m = self.meta.lock().expect("meta cache poisoned");
+            m.stats
+                .get(rel)
+                .filter(|(at, _)| at.elapsed() < META_TTL)
+                .map(|(_, s)| s.clone())
+        };
+        match hit {
+            Some(Some(s)) => return Ok(s),
+            Some(None) => return Err(BackendError::NotFound),
+            None => {}
+        }
+        let epoch = self.mutations.load(Ordering::SeqCst);
+        let fetched = self.stat_path_uncached(rel).await;
+        let entry = match &fetched {
+            Ok(s) => Some(Some(s.clone())),
+            Err(BackendError::NotFound) => Some(None),
+            Err(_) => None,
+        };
+        if let Some(entry) = entry
+            && self.mutations.load(Ordering::SeqCst) == epoch
+        {
+            let mut m = self.meta.lock().expect("meta cache poisoned");
+            if m.stats.len() >= META_MAX_STATS {
+                m.stats.clear();
+            }
+            m.stats.insert(rel.to_owned(), (Instant::now(), entry));
+        }
+        fetched
+    }
+
+    async fn stat_path_uncached(&self, rel: &str) -> Result<FileStat> {
         match self
             .bundle(
                 true,
@@ -491,22 +648,28 @@ impl GrpcBackend {
             )));
         }
         let path = e.path();
-        for (i, chunk) in data.chunks(MAX_CHUNK).enumerate() {
-            let pos = offset + (i * MAX_CHUNK) as u64;
-            let write_id = self.next_write_id.fetch_add(1, Ordering::Relaxed);
-            // Repeating a WriteRange is safe (same offset, same bytes).
-            self.rpc(true, true, |mut c| {
-                let req = pb::WriteRangeRequest {
-                    file: file_ref(&path),
-                    offset: pos,
-                    data: chunk.to_vec(),
-                    write_id,
-                };
-                async move { c.write_range(req).await }
-            })
-            .await?;
+        let written = async {
+            for (i, chunk) in data.chunks(MAX_CHUNK).enumerate() {
+                let pos = offset + (i * MAX_CHUNK) as u64;
+                let write_id = self.next_write_id.fetch_add(1, Ordering::Relaxed);
+                // Repeating a WriteRange is safe (same offset, same bytes).
+                self.rpc(true, true, |mut c| {
+                    let req = pb::WriteRangeRequest {
+                        file: file_ref(&path),
+                        offset: pos,
+                        data: chunk.to_vec(),
+                        write_id,
+                    };
+                    async move { c.write_range(req).await }
+                })
+                .await?;
+            }
+            Ok(())
         }
-        Ok(())
+        .await;
+        // Size and mtime changed (even a failed write may have landed partly).
+        self.invalidate(&[&path]);
+        written
     }
 }
 
@@ -649,20 +812,39 @@ impl StorageBackend for GrpcBackend {
 
     async fn list(&self, rel_dir: &str) -> Result<Vec<FileStat>> {
         let dir = normalize(rel_dir)?;
-        match self
+        {
+            let m = self.meta.lock().expect("meta cache poisoned");
+            if let Some((at, v)) = m.lists.get(&dir)
+                && at.elapsed() < META_TTL
+            {
+                return Ok(v.clone());
+            }
+        }
+        let epoch = self.mutations.load(Ordering::SeqCst);
+        let out = match self
             .bundle(
                 true,
-                bundle_op_request::Op::List(pb::ListOp { rel_dir: dir }),
+                bundle_op_request::Op::List(pb::ListOp {
+                    rel_dir: dir.clone(),
+                }),
             )
             .await?
         {
             bundle_op_reply::Result::Listing(l) => {
                 let mut out: Vec<FileStat> = l.entries.into_iter().map(stat_from_proto).collect();
                 out.sort_by(|a, b| a.name.cmp(&b.name));
-                Ok(out)
+                out
             }
-            other => Err(unexpected(other)),
+            other => return Err(unexpected(other)),
+        };
+        if out.len() <= META_MAX_LISTING_LEN && self.mutations.load(Ordering::SeqCst) == epoch {
+            let mut m = self.meta.lock().expect("meta cache poisoned");
+            if m.lists.len() >= META_MAX_LISTINGS {
+                m.lists.clear();
+            }
+            m.lists.insert(dir, (Instant::now(), out.clone()));
         }
+        Ok(out)
     }
 
     async fn stat(&self, rel_path: &str) -> Result<FileStat> {

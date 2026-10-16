@@ -3,10 +3,10 @@
 //! MILESTONE 1 (J1): sessions live in `ConnState` (per connection). UPGRADE: move to
 //! `ServerShared` (shared table, multichannel/binding, surviving the connection).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::time::Instant;
 
-use janus_lib::vfs::BackendHandle;
+use janus_lib::vfs::{BackendError, BackendHandle};
 use smb_wire::fileinfo::DirEntry;
 use smb_wire::ntlm::NtlmServer;
 
@@ -50,6 +50,34 @@ pub struct Open {
     pub delete_pending: bool,
     /// Directory enumeration state (QUERY_DIRECTORY).
     pub scan: Option<DirScan>,
+    /// Sequential-read prefetch state.
+    pub readahead: Readahead,
+}
+
+/// A read started ahead of the client asking for it.
+pub struct Prefetch {
+    pub offset: u64,
+    pub length: u32,
+    /// `ConnState::io_epoch` when it was started; any later write makes it stale.
+    pub epoch: u64,
+    /// `None` once the task has been handed to the READ that consumes it.
+    pub task: Option<tokio::task::JoinHandle<Result<Vec<u8>, BackendError>>>,
+}
+
+impl Drop for Prefetch {
+    fn drop(&mut self) {
+        if let Some(t) = &self.task {
+            t.abort();
+        }
+    }
+}
+
+/// Per-open readahead: prefetched ranges in offset order, and where the last read ended
+/// (the next read is "sequential" when it starts there).
+#[derive(Default)]
+pub struct Readahead {
+    pub queue: VecDeque<Prefetch>,
+    pub next_offset: u64,
 }
 
 /// A directory listing snapshotted when the enumeration starts: the client sees a stable

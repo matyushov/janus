@@ -366,3 +366,102 @@ async fn a_stopped_receiver_fails_writes_quickly_and_work_resumes_after_restart(
     drop(srv2.store);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+// ---- metadata cache ---------------------------------------------------------------------
+
+#[tokio::test]
+async fn repeated_stats_cost_one_round_trip_until_a_write_invalidates_them() {
+    let mock = Arc::new(Mock::default());
+    let b = backend_for(start_mock(mock.clone()).await);
+    let stats = |m: &Mock| {
+        m.bundle_ops
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|n| **n == "stat")
+            .count()
+    };
+    b.stat("x").await.unwrap();
+    b.stat("x").await.unwrap();
+    b.stat("x").await.unwrap();
+    assert_eq!(stats(&mock), 1, "served from the cache");
+    let o = b.open("f", req(Disposition::Open)).await.unwrap();
+    let before = stats(&mock);
+    b.stat("f").await.unwrap();
+    b.stat("f").await.unwrap();
+    assert_eq!(stats(&mock), before, "open() already cached it");
+    b.write(o.handle, 0, b"data").await.unwrap();
+    b.stat("f").await.unwrap();
+    assert_eq!(stats(&mock), before + 1, "a write drops the entry");
+    // an unrelated path is untouched
+    b.stat("x").await.unwrap();
+    assert_eq!(stats(&mock), before + 1);
+}
+
+#[tokio::test]
+async fn cached_answers_never_hide_our_own_changes() {
+    let srv = TestServer::start("grpc-meta", 0).await.unwrap();
+    let b = backend_for(srv.addr);
+    // a negative answer must not outlive the file's creation
+    assert!(matches!(b.stat("a").await, Err(BackendError::NotFound)));
+    assert!(matches!(b.stat("a").await, Err(BackendError::NotFound)));
+    let a = b.open("a", req(Disposition::Create)).await.unwrap();
+    assert_eq!(b.stat("a").await.unwrap().size, 0);
+    // the size follows writes
+    b.write(a.handle, 0, &[9u8; 100]).await.unwrap();
+    assert_eq!(b.stat("a").await.unwrap().size, 100);
+    b.truncate(a.handle, 10).await.unwrap();
+    assert_eq!(b.stat("a").await.unwrap().size, 10);
+    // listings follow creates, renames and deletes
+    let names =
+        |v: Vec<janus_lib::vfs::FileStat>| v.into_iter().map(|s| s.name).collect::<Vec<_>>();
+    assert_eq!(names(b.list("").await.unwrap()), ["a"]);
+    assert_eq!(names(b.list("").await.unwrap()), ["a"]);
+    let c = b.open("c", req(Disposition::Create)).await.unwrap();
+    assert_eq!(names(b.list("").await.unwrap()), ["a", "c"]);
+    b.rename("a", "b", false).await.unwrap();
+    assert_eq!(names(b.list("").await.unwrap()), ["b", "c"]);
+    assert!(matches!(b.stat("a").await, Err(BackendError::NotFound)));
+    assert_eq!(b.stat("b").await.unwrap().size, 10);
+    b.set_delete_on_close(c.handle, true).await.unwrap();
+    b.close(c.handle).await.unwrap();
+    assert_eq!(names(b.list("").await.unwrap()), ["b"]);
+    assert!(matches!(b.stat("c").await, Err(BackendError::NotFound)));
+}
+
+// ---- compression ------------------------------------------------------------------------
+
+#[tokio::test]
+async fn compression_starts_when_the_receiver_advertises_it_and_data_survives() {
+    let srv = TestServer::start("grpc-zstd", 0).await.unwrap();
+    let b = backend_for(srv.addr);
+    assert!(!b.compressing(), "nothing is known before the first reply");
+    b.statfs().await.unwrap();
+    assert!(b.compressing(), "the real receiver advertises zstd");
+    // compressible and incompressible payloads, larger than one chunk
+    let text: Vec<u8> = b"time machine band data "
+        .iter()
+        .copied()
+        .cycle()
+        .take(3 * MIB + 17)
+        .collect();
+    let mut noise = vec![0u8; 2 * MIB + 5];
+    getrandom::fill(&mut noise).unwrap();
+    for (name, data) in [("text", text), ("noise", noise)] {
+        let o = b.open(name, req(Disposition::Create)).await.unwrap();
+        b.write(o.handle, 0, &data).await.unwrap();
+        b.flush(o.handle, false).await.unwrap();
+        let back = b.read(o.handle, 0, data.len() as u32).await.unwrap();
+        assert_eq!(back, data, "{name} round trip");
+    }
+}
+
+#[tokio::test]
+async fn a_receiver_without_zstd_is_never_sent_compressed_requests() {
+    let mock = Arc::new(Mock::default());
+    let b = backend_for(start_mock(mock.clone()).await);
+    let o = b.open("f", req(Disposition::Open)).await.unwrap();
+    b.write(o.handle, 0, b"payload").await.unwrap();
+    assert!(!b.compressing());
+    assert_eq!(mock.writes.lock().unwrap().len(), 1);
+}

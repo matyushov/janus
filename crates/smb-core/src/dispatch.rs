@@ -8,6 +8,7 @@
 //! remaining commands get `STATUS_NOT_IMPLEMENTED` (signed). Signing is mandatory: after SESSION_SETUP, frames without a valid
 //! signature are rejected and replies are signed.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -122,6 +123,14 @@ impl Element {
 
 /// Maximum number of elements in a compound chain.
 const MAX_COMPOUND: usize = 32;
+/// SMB2 capability bit: multi-credit READ/WRITE and sizes above 64 KiB (MS-SMB2 §2.2.4).
+const CAP_LARGE_MTU: u32 = 0x0000_0004;
+
+/// What `finish_io` needs to build the reply of a deferred READ/WRITE.
+pub(crate) struct IoMeta {
+    header: Header,
+    key: [u8; 16],
+}
 
 pub struct Dispatcher;
 
@@ -197,6 +206,83 @@ impl Dispatcher {
             elements.push(element);
         }
         Ok(Reply::Now(assemble(elements)))
+    }
+
+    /// Fast path for pipelining: if `payload` is a plain, valid READ or WRITE, do everything
+    /// that needs the connection state (signature, credits, open lookup, validation) right now
+    /// and hand back the backend call as a job, so the caller can run several in flight.
+    ///
+    /// Returns `None`, with the connection state untouched, for anything else: compound chains,
+    /// other commands and every request that would fail. The caller then takes the ordinary
+    /// `handle` path, which produces the right error reply.
+    pub(crate) fn try_defer_io<B: StorageBackend>(
+        payload: &[u8],
+        conn: &mut ConnState,
+        backend: &Arc<B>,
+    ) -> Option<(IoMeta, files::IoJob)> {
+        if smb_wire::messages::is_smb1(payload)
+            || (payload.len() >= 4 && payload[..4] == SMB2_TRANSFORM_MAGIC)
+            || conn.dialect.is_none()
+        {
+            return None;
+        }
+        let parts = split_compound(payload).ok()?;
+        let [raw] = parts.as_slice() else {
+            return None;
+        };
+        let msg = Message::decode_single(raw).ok()?;
+        let h = &msg.header;
+        if !matches!(h.command, Command::Read | Command::Write)
+            || h.flags & (flags::SERVER_TO_REDIR | flags::RELATED_OPERATIONS) != 0
+            || u32::from(h.credit_charge.max(1)) > conn.credits.outstanding()
+        {
+            return None;
+        }
+        let epoch = conn.io_epoch;
+        let session = conn.sessions.get_mut(&h.session_id)?;
+        let key = session.signing_key()?;
+        if h.flags & flags::SIGNED == 0 || !crypto::verify(&key, raw, &h.signature) {
+            return None;
+        }
+        if !session.trees.contains_key(&h.tree_id) {
+            return None;
+        }
+        let job = if h.command == Command::Read {
+            let req = ReadReq::decode(&mut Reader::new(&msg.body)).ok()?;
+            let ra = files::ReadaheadCtx { backend, epoch };
+            files::prepare_read(
+                &req,
+                req.file_id,
+                h.tree_id,
+                h.credit_charge,
+                session,
+                Some(ra),
+            )
+        } else {
+            let req = WriteReq::decode(&mut Reader::new(&msg.body)).ok()?;
+            let fid = req.file_id;
+            files::prepare_write(req, fid, h.tree_id, h.credit_charge, session)
+        }
+        .ok()?;
+        conn.credits
+            .charge(h.credit_charge)
+            .expect("credits checked above");
+        if h.command == Command::Write {
+            conn.io_epoch += 1; // prefetched data may now be stale
+        }
+        Some((
+            IoMeta {
+                header: h.clone(),
+                key,
+            },
+            job,
+        ))
+    }
+
+    /// Build the signed reply of a deferred READ/WRITE once its backend call has finished.
+    pub(crate) fn finish_io(meta: &IoMeta, out: Out, conn: &mut ConnState) -> Vec<u8> {
+        let elem = reply(&meta.header, conn, out.status, out.body, Some(meta.key));
+        assemble(vec![elem])
     }
 
     // --- SMB1 multi-protocol NEGOTIATE ---------------------------------------
@@ -295,12 +381,13 @@ impl Dispatcher {
             dialect_revision: dialect as u16,
             server_guid: ctx.server_guid,
             security_mode: security_mode::SIGNING_ENABLED | security_mode::SIGNING_REQUIRED,
-            // Minimal capabilities: no DFS and no leasing (J4 will add them), no LARGE_MTU
-            // (J2 together with READ/WRITE), hence sizes of at most 64 KiB.
-            capabilities: 0,
-            max_transact_size: 65536,
-            max_read_size: 65536,
-            max_write_size: 65536,
+            // Minimal capabilities: no DFS and no leasing (J4 will add them). LARGE_MTU lets
+            // READ/WRITE carry up to MAX_IO bytes per request (multi-credit), which is what
+            // keeps a high-latency backend busy.
+            capabilities: CAP_LARGE_MTU,
+            max_transact_size: files::MAX_IO,
+            max_read_size: files::MAX_IO,
+            max_write_size: files::MAX_IO,
             system_time: ctx.filetime,
             security_buffer: auth::neg_token_init_ntlm(),
             preauth_salt: salt,
@@ -579,12 +666,12 @@ impl Dispatcher {
             Command::Read => {
                 let req = ReadReq::decode(&mut Reader::new(&msg.body))?;
                 let fid = resolve_file_id(req.file_id, compound_file);
-                files::read(backend, &req, fid, h.tree_id, session).await
+                files::read(backend, &req, fid, h.tree_id, h.credit_charge, session).await
             }
             Command::Write => {
                 let req = WriteReq::decode(&mut Reader::new(&msg.body))?;
                 let fid = resolve_file_id(req.file_id, compound_file);
-                files::write(backend, &req, fid, h.tree_id, session).await
+                files::write(backend, req, fid, h.tree_id, h.credit_charge, session).await
             }
             Command::Flush => {
                 let req = FlushReq::decode(&mut Reader::new(&msg.body))?;
@@ -945,9 +1032,20 @@ mod tests {
         assert_eq!(&b[8..24], &[9; 16], "ServerGuid");
         assert_eq!(
             u32::from_le_bytes(b[24..28].try_into().unwrap()),
-            0,
+            CAP_LARGE_MTU,
             "capabilities"
         );
+        for (at, what) in [
+            (28, "MaxTransactSize"),
+            (32, "MaxReadSize"),
+            (36, "MaxWriteSize"),
+        ] {
+            assert_eq!(
+                u32::from_le_bytes(b[at..at + 4].try_into().unwrap()),
+                files::MAX_IO,
+                "{what}"
+            );
+        }
         let t = u64::from_le_bytes(b[40..48].try_into().unwrap());
         assert_eq!(t, 133_000_000_000_000_000, "real FILETIME from ctx");
         assert_eq!(
@@ -2195,6 +2293,96 @@ mod tests {
         );
         assert_eq!(r.status(), status::SUCCESS);
         assert_eq!(std::fs::read(fx.dir.0.join("f")).unwrap(), b"hello!");
+    }
+
+    #[test]
+    fn large_io_is_charged_per_64k_and_round_trips() {
+        let (mut fx, mut c, tid) = connected();
+        let fid = open_ok(
+            &mut fx,
+            &mut c,
+            tid,
+            "big",
+            RW,
+            disposition::CREATE,
+            OPT_FILE,
+        );
+        let data: Vec<u8> = (0..files::MAX_IO as usize)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let send = |fx: &mut Fixture, c: &mut Client, cmd: Command, body: &[u8], charge: u16| {
+            let r = fx
+                .send(&c.signed_request_charged(cmd, tid, body, charge))
+                .unwrap();
+            assert!(c.verify_response(&r), "{cmd:?}: reply signature");
+            Response::parse(&r).unwrap()
+        };
+        // 1 MiB needs 16 credits; fewer is rejected, exactly 16 passes
+        let w = write_body(fid, 0, &data, 0);
+        assert_eq!(
+            send(&mut fx, &mut c, Command::Write, &w, 15).status(),
+            status::INVALID_PARAMETER
+        );
+        assert_eq!(
+            send(&mut fx, &mut c, Command::Write, &w, 16).status(),
+            status::SUCCESS
+        );
+        assert_eq!(std::fs::read(fx.dir.0.join("big")).unwrap(), data);
+        let rb = read_body(fid, files::MAX_IO, 0);
+        assert_eq!(
+            send(&mut fx, &mut c, Command::Read, &rb, 1).status(),
+            status::INVALID_PARAMETER
+        );
+        let r = send(&mut fx, &mut c, Command::Read, &rb, 16);
+        assert_eq!(r.status(), status::SUCCESS);
+        assert_eq!(read_reply_data(&r.message.body), data);
+        // 64 KiB + 1 byte needs 2 credits; above MAX_IO is invalid whatever the charge
+        let w = write_body(fid, 0, &data[..65537], 0);
+        assert_eq!(
+            send(&mut fx, &mut c, Command::Write, &w, 1).status(),
+            status::INVALID_PARAMETER
+        );
+        assert_eq!(
+            send(&mut fx, &mut c, Command::Write, &w, 2).status(),
+            status::SUCCESS
+        );
+        let rb = read_body(fid, files::MAX_IO + 1, 0);
+        assert_eq!(
+            send(&mut fx, &mut c, Command::Read, &rb, 17).status(),
+            status::INVALID_PARAMETER
+        );
+    }
+
+    #[test]
+    fn try_defer_io_leaves_the_connection_untouched_unless_it_takes_the_request() {
+        let (mut fx, mut c, tid) = connected();
+        let fid = open_ok(&mut fx, &mut c, tid, "d", RW, disposition::CREATE, OPT_FILE);
+        let before = fx.conn.credits.outstanding();
+        let be = Arc::new(janus_lib::vfs::LocalFsBackend::new(&fx.dir.0).unwrap());
+
+        // a bad signature, a write to an unknown FileId, a directory-less read of length 0
+        let mut bad = c.signed_request(Command::Write, tid, &write_body(fid, 0, b"x", 0));
+        let n = bad.len() - 1;
+        bad[n] ^= 1;
+        assert!(Dispatcher::try_defer_io(&bad, &mut fx.conn, &be).is_none());
+        let unknown = c.signed_request(Command::Write, tid, &write_body([7; 16], 0, b"x", 0));
+        assert!(Dispatcher::try_defer_io(&unknown, &mut fx.conn, &be).is_none());
+        let empty = c.signed_request(Command::Read, tid, &read_body(fid, 0, 0));
+        assert!(Dispatcher::try_defer_io(&empty, &mut fx.conn, &be).is_none());
+        // not READ/WRITE at all
+        let close = c.signed_request(Command::Close, tid, &close_body(fid));
+        assert!(Dispatcher::try_defer_io(&close, &mut fx.conn, &be).is_none());
+        assert_eq!(fx.conn.credits.outstanding(), before, "nothing was charged");
+
+        // a valid write is taken and charged exactly once
+        let ok = c.signed_request(Command::Write, tid, &write_body(fid, 0, b"hello", 0));
+        let (meta, job) = Dispatcher::try_defer_io(&ok, &mut fx.conn, &be).expect("deferred");
+        assert_eq!(fx.conn.credits.outstanding(), before - 1);
+        let out = fx.rt.block_on(job.run(&fx.backend));
+        assert_eq!(out.status, status::SUCCESS);
+        let bytes = Dispatcher::finish_io(&meta, out, &mut fx.conn);
+        assert!(c.verify_response(&bytes), "deferred reply is signed");
+        assert_eq!(std::fs::read(fx.dir.0.join("d")).unwrap(), b"hello");
     }
 
     #[test]

@@ -20,6 +20,7 @@ pub mod fileinfo;
 pub mod frame;
 pub mod header;
 pub mod io;
+pub mod lease;
 #[cfg(test)]
 mod macos_vectors;
 pub mod messages;

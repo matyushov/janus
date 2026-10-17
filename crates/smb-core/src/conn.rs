@@ -41,6 +41,8 @@ pub struct ConnState {
     /// Bumped by every WRITE and every command that is not a plain READ/WRITE. Prefetched
     /// reads started under an older value may predate a change and are discarded.
     pub io_epoch: u64,
+    /// ClientGuid from NEGOTIATE (durable handles are reclaimed by the same client only).
+    pub client_guid: [u8; 16],
 }
 
 impl Default for ConnState {
@@ -56,6 +58,7 @@ impl Default for ConnState {
             smb1_negotiated: false,
             compound_file: None,
             io_epoch: 0,
+            client_guid: [0; 16],
         }
     }
 }

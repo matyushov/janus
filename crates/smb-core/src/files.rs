@@ -12,8 +12,9 @@ use janus_lib::vfs::{
 };
 use smb_wire::bytes::Writer;
 use smb_wire::create::{
-    ACCESS_DELETE, ACTION_CREATED, ACTION_OPENED, ACTION_OVERWRITTEN, ACTION_SUPERSEDED,
-    ATTR_ARCHIVE, ATTR_DIRECTORY, ATTR_READONLY, CreateContext, CreateReq, CreateResp,
+    ACCESS_APPEND_DATA, ACCESS_DELETE, ACCESS_EXECUTE, ACCESS_READ_DATA, ACCESS_WRITE_DATA,
+    ACTION_CREATED, ACTION_OPENED, ACTION_OVERWRITTEN, ACTION_SUPERSEDED, ATTR_ARCHIVE,
+    ATTR_DIRECTORY, ATTR_READONLY, CreateContext, CreateReq, CreateResp, LEASE_HANDLE,
     OPT_DELETE_ON_CLOSE, OPT_DIRECTORY_FILE, OPT_NON_DIRECTORY_FILE, access_wants_read,
     access_wants_write, disposition, expand_access,
 };
@@ -29,8 +30,10 @@ use smb_wire::io::{
 };
 use smb_wire::messages::ACCESS_ALL;
 
+use crate::apple::AppleExt;
 use crate::dispatch::{Out, ServerCtx, status};
-use crate::session::{DirScan, Open, Session};
+use crate::session::{DirScan, DurableInfo, Open, Session};
+use crate::shared::{OpenIntent, ReconnectError, Shared};
 
 /// Largest READ/WRITE payload. With LARGE_MTU one request may carry up to 1 MiB, which
 /// the client pays for with multiple credits (see `required_credits`). 1 MiB is also the
@@ -122,6 +125,7 @@ pub(crate) async fn create<B: StorageBackend>(
     tree_id: u32,
     session: &mut Session,
     ctx: &ServerCtx<'_>,
+    client_guid: [u8; 16],
 ) -> Out {
     if !session.trees.contains_key(&tree_id) {
         return Out::err(status::NETWORK_NAME_DELETED);
@@ -154,6 +158,27 @@ pub(crate) async fn create<B: StorageBackend>(
         return Out::err(status::INSUFFICIENT_RESOURCES);
     }
 
+    if ctx.caps.leasing
+        && let Some(CreateContext::DurableHandleReconnectV2 {
+            file_id,
+            create_guid,
+            ..
+        }) = req
+            .contexts
+            .iter()
+            .find(|c| matches!(c, CreateContext::DurableHandleReconnectV2 { .. }))
+    {
+        return reconnect(
+            backend,
+            (*file_id, *create_guid),
+            tree_id,
+            session,
+            ctx,
+            client_guid,
+        )
+        .await;
+    }
+
     let opened = match backend
         .open(
             &path,
@@ -182,6 +207,140 @@ pub(crate) async fn create<B: StorageBackend>(
         ACTION_OPENED
     };
     let st = &opened.stat;
+    let mut lease_key = None;
+    let mut lease_reply = None;
+    let mut durable = None;
+    let mut durable_reply = None;
+    if ctx.caps.leasing && !st.directory {
+        let lease_req = req.contexts.iter().find_map(|c| match c {
+            CreateContext::Lease(l) => Some(l),
+            _ => None,
+        });
+        let writes = access_wants_write(access)
+            || matches!(
+                disposition,
+                Disposition::Supersede | Disposition::Overwrite | Disposition::OverwriteOrCreate
+            );
+        let outcome = ctx.shared.lease_for_open(
+            OpenIntent {
+                conn: ctx.conn_id,
+                path: &path,
+                data_access: writes || access & DATA_ACCESS != 0,
+                writes,
+            },
+            lease_req,
+        );
+        // A conflicting holder on another connection answers first (or is cut off by timeout).
+        ctx.shared.wait_breaks(&outcome.wait_for).await;
+        if let Some(granted) = outcome.reply {
+            lease_key = Some(granted.key);
+            // Durable only with handle caching: the client keeps the handle across a drop.
+            if granted.state & LEASE_HANDLE != 0
+                && let Some(CreateContext::DurableHandleRequestV2 {
+                    timeout_ms,
+                    create_guid,
+                    ..
+                }) = req
+                    .contexts
+                    .iter()
+                    .find(|c| matches!(c, CreateContext::DurableHandleRequestV2 { .. }))
+            {
+                let timeout = Shared::durable_timeout(*timeout_ms);
+                durable = Some(DurableInfo {
+                    create_guid: *create_guid,
+                    timeout,
+                });
+                durable_reply = Some((timeout.as_millis() as u32, 0));
+            }
+            lease_reply = Some(granted);
+        }
+    }
+    let mut body = create_response(
+        st,
+        action,
+        req.contexts
+            .iter()
+            .any(|c| matches!(c, CreateContext::QueryMaximalAccess))
+            .then_some(ACCESS_ALL),
+        req.contexts.iter().find_map(|c| match c {
+            CreateContext::Aapl(q) => AppleExt::reply_to_query(&ctx.caps, q),
+            _ => None,
+        }),
+        durable_reply,
+        lease_reply,
+    );
+    let file_id = session.add_open(Open {
+        readahead: Default::default(),
+        tree_id,
+        rel_path: path,
+        handle: opened.handle,
+        directory: st.directory,
+        access,
+        delete_pending: delete_on_close,
+        scan: None,
+        lease: lease_key,
+        durable,
+    });
+    if let Some(d) = durable {
+        register_durable(session, ctx, client_guid, file_id, d);
+    }
+    // FileId sits at offset 64 of the CREATE response body (§2.2.14).
+    body[64..80].copy_from_slice(&file_id);
+    Out {
+        created_file: Some(file_id),
+        ..Out::ok(body)
+    }
+}
+
+/// Records a durable open in the shared state (and on disk), keyed by its CreateGuid.
+fn register_durable(
+    session: &Session,
+    ctx: &ServerCtx<'_>,
+    client_guid: [u8; 16],
+    file_id: [u8; 16],
+    d: DurableInfo,
+) {
+    let Some(key) = file_id_key(&file_id) else {
+        return;
+    };
+    let Some(open) = session.opens.get(&key) else {
+        return;
+    };
+    ctx.shared
+        .register_durable(janus_lib::journal::ParkedRecord {
+            create_guid: d.create_guid,
+            file_id,
+            client_guid,
+            owner: session.user().unwrap_or_default().to_owned(),
+            rel_path: open.rel_path.clone(),
+            access: open.access,
+            delete_pending: open.delete_pending,
+            lease_key: open.lease,
+            lease_state: 0,
+            timeout_ms: d.timeout.as_millis() as u32,
+            expires_unix_ms: 0,
+        });
+}
+
+/// The session-table key of a FileId issued by `Session::add_open` (both halves equal).
+fn file_id_key(file_id: &[u8; 16]) -> Option<u64> {
+    let a = u64::from_le_bytes(file_id[..8].try_into().ok()?);
+    let b = u64::from_le_bytes(file_id[8..].try_into().ok()?);
+    (a == b).then_some(a)
+}
+
+/// Opens that read or write file data (an attributes-only open breaks no lease).
+const DATA_ACCESS: u32 = ACCESS_READ_DATA | ACCESS_WRITE_DATA | ACCESS_APPEND_DATA | ACCESS_EXECUTE;
+
+/// The CREATE response body for `st` (the FileId is patched in by the caller).
+fn create_response(
+    st: &FileStat,
+    action: u32,
+    maximal_access: Option<u32>,
+    aapl: Option<smb_wire::create::AaplReply>,
+    durable: Option<(u32, u32)>,
+    lease: Option<smb_wire::create::LeaseReq>,
+) -> Vec<u8> {
     let mut w = Writer::new();
     CreateResp {
         create_action: action,
@@ -192,30 +351,96 @@ pub(crate) async fn create<B: StorageBackend>(
         allocation_size: allocation(st),
         end_of_file: st.size,
         file_attributes: attributes(st),
-        file_id: [0; 16], // patched below, once the table assigns the id
-        maximal_access: req
-            .contexts
-            .iter()
-            .any(|c| matches!(c, CreateContext::QueryMaximalAccess))
-            .then_some(ACCESS_ALL),
+        file_id: [0; 16],
+        maximal_access,
+        aapl,
+        durable,
+        lease,
     }
     .encode(&mut w);
-    let file_id = session.add_open(Open {
+    w.into_vec()
+}
+
+/// DH2C: take a parked durable handle back onto this connection.
+async fn reconnect<B: StorageBackend>(
+    backend: &B,
+    (file_id, create_guid): ([u8; 16], [u8; 16]),
+    tree_id: u32,
+    session: &mut Session,
+    ctx: &ServerCtx<'_>,
+    client_guid: [u8; 16],
+) -> Out {
+    let owner = session.user().unwrap_or_default().to_owned();
+    let got = match ctx
+        .shared
+        .reconnect(file_id, create_guid, &owner, client_guid, ctx.conn_id)
+    {
+        Ok(g) => g,
+        Err(ReconnectError::NotFound) => return Out::err(status::OBJECT_NAME_NOT_FOUND),
+        Err(ReconnectError::Denied) => return Out::err(status::ACCESS_DENIED),
+    };
+    let rec = got.record;
+    let fail = |e: &BackendError| {
+        if let Some(key) = &rec.lease_key {
+            ctx.shared.release_lease(key);
+        }
+        Out::err(status_of(e))
+    };
+    let handle = match got.handle {
+        Some(h) => h,
+        // After a daemon restart the backend handle is gone: open the file again by path.
+        None => match backend
+            .open(
+                &rec.rel_path,
+                OpenRequest {
+                    disposition: Disposition::Open,
+                    kind: Kind::File,
+                    write: access_wants_write(rec.access),
+                    delete_on_close: rec.delete_pending,
+                },
+            )
+            .await
+        {
+            Ok(o) => o.handle,
+            Err(e) => return fail(&e),
+        },
+    };
+    let st = match backend.stat_handle(handle).await {
+        Ok(st) => st,
+        Err(e) => {
+            let _ = backend.close(handle).await;
+            return fail(&e);
+        }
+    };
+    let mut body = create_response(&st, ACTION_OPENED, None, None, None, got.lease);
+    let new_id = session.add_open(Open {
         readahead: Default::default(),
         tree_id,
-        rel_path: path,
-        handle: opened.handle,
-        directory: st.directory,
-        access,
-        delete_pending: delete_on_close,
+        rel_path: rec.rel_path,
+        handle,
+        directory: false,
+        access: rec.access,
+        delete_pending: rec.delete_pending,
         scan: None,
+        lease: rec.lease_key,
+        durable: Some(DurableInfo {
+            create_guid,
+            timeout: std::time::Duration::from_millis(u64::from(rec.timeout_ms)),
+        }),
     });
-    let mut body = w.into_vec();
-    // FileId sits at offset 64 of the CREATE response body (§2.2.14).
-    body[64..80].copy_from_slice(&file_id);
-    let _ = ctx;
+    register_durable(
+        session,
+        ctx,
+        client_guid,
+        new_id,
+        DurableInfo {
+            create_guid,
+            timeout: std::time::Duration::from_millis(u64::from(rec.timeout_ms)),
+        },
+    );
+    body[64..80].copy_from_slice(&new_id);
     Out {
-        created_file: Some(file_id),
+        created_file: Some(new_id),
         ..Out::ok(body)
     }
 }

@@ -8,6 +8,7 @@
 #   ca.pem ca.key                 CA that signs both server and client certificates
 #   server.pem server.key         server certificate for localhost / 127.0.0.1
 #   <machine>.pem <machine>.key   client certificate per machine id
+#   (env JANUS_DEV_SAN_EXTRA adds names to the server certificate, see below)
 #   machines.json                 IdentityMap file (fingerprint -> machine -> store -> quota)
 #
 # Then:
@@ -45,7 +46,9 @@ issue() { # name, extension-file-content
   rm -f "$name.csr" "$name.ext"
 }
 
-issue server "subjectAltName=DNS:localhost,IP:127.0.0.1
+# JANUS_DEV_SAN_EXTRA="IP:192.168.1.5,DNS:host.local" adds names the server certificate is valid for
+# (a receiver that other machines, such as a VM, reach over the network).
+issue server "subjectAltName=DNS:localhost,IP:127.0.0.1${JANUS_DEV_SAN_EXTRA:+,$JANUS_DEV_SAN_EXTRA}
 extendedKeyUsage=serverAuth"
 
 fingerprint() { # SHA-256 of the DER certificate, lowercase hex

@@ -528,10 +528,98 @@ impl DirtyIndex {
 
 // ---- the journal --------------------------------------------------------------------------
 
-/// Persistence of the durable state of smb-core handles (create_guid, path, lease).
-/// J4; not implemented in J3b.
+/// One parked durable handle, as it survives a daemon restart. The backend handle itself does
+/// not (the receiver side is addressed by path), so a reconnect after a restart reopens the file.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ParkedRecord {
+    /// The `CreateGuid` of the DH2Q that made the handle durable (the reconnect key).
+    pub create_guid: [u8; 16],
+    /// The FileId the client knows.
+    pub file_id: [u8; 16],
+    /// ClientGuid of the connection that owned the handle (NEGOTIATE).
+    pub client_guid: [u8; 16],
+    /// The authenticated user of the owning session.
+    pub owner: String,
+    pub rel_path: String,
+    pub access: u32,
+    pub delete_pending: bool,
+    pub lease_key: Option<[u8; 16]>,
+    pub lease_state: u32,
+    /// The durable timeout to park for again after the next drop (ms).
+    pub timeout_ms: u32,
+    /// Absolute deadline (Unix ms), the only clock that survives a restart. `0` marks a handle
+    /// that was still open on a live connection when the file was written: its deadline is
+    /// `heartbeat + timeout`, because the daemon died at some point after the last heartbeat.
+    pub expires_unix_ms: u64,
+}
+
+/// What `ParkedHandleStore` keeps on disk.
+#[derive(Debug, Default, serde::Serialize, serde::Deserialize)]
+struct ParkedFile {
+    /// When the daemon last wrote the file (Unix ms), refreshed every second while durable
+    /// handles are open. A `kill -9` leaves the file as it was: the time of death is only
+    /// known to be after this.
+    heartbeat_unix_ms: u64,
+    records: Vec<ParkedRecord>,
+}
+
+/// Persistence of the durable state of smb-core handles: `parked-handles.json` next to the
+/// journal segments (the journal ignores files that are not segments). Rewritten atomically
+/// (temp file + rename) on every change; the set is tiny.
 #[derive(Debug, Default)]
-pub struct ParkedHandleStore;
+pub struct ParkedHandleStore {
+    path: Option<std::path::PathBuf>,
+}
+
+impl ParkedHandleStore {
+    pub const FILE_NAME: &'static str = "parked-handles.json";
+
+    /// A store that keeps nothing (tests, no journal directory).
+    pub fn in_memory() -> Self {
+        ParkedHandleStore { path: None }
+    }
+
+    /// A store in `dir`; the directory is created if needed.
+    pub fn in_dir(dir: &Path) -> std::io::Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        Ok(ParkedHandleStore {
+            path: Some(dir.join(Self::FILE_NAME)),
+        })
+    }
+
+    /// What the previous run left behind: `(heartbeat, records)`. A missing or unreadable file
+    /// is an empty set.
+    pub fn load(&self) -> (u64, Vec<ParkedRecord>) {
+        let Some(p) = &self.path else {
+            return (0, Vec::new());
+        };
+        std::fs::read(p)
+            .ok()
+            .and_then(|b| serde_json::from_slice::<ParkedFile>(&b).ok())
+            .map(|f| (f.heartbeat_unix_ms, f.records))
+            .unwrap_or_default()
+    }
+
+    /// Replace the persisted set.
+    pub fn save(&self, heartbeat_unix_ms: u64, records: &[ParkedRecord]) -> std::io::Result<()> {
+        let Some(p) = &self.path else { return Ok(()) };
+        let tmp = p.with_extension("tmp");
+        let file = ParkedFile {
+            heartbeat_unix_ms,
+            records: records.to_vec(),
+        };
+        std::fs::write(
+            &tmp,
+            serde_json::to_vec(&file).map_err(std::io::Error::other)?,
+        )?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))?;
+        }
+        std::fs::rename(&tmp, p)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct JournalOptions {
@@ -2065,5 +2153,34 @@ mod tests {
             assert_eq!(mode(&e.unwrap().path()), 0o600);
         }
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn parked_handle_store_roundtrips_and_tolerates_garbage() {
+        let d = tmpdir("parked");
+        let store = ParkedHandleStore::in_dir(&d).unwrap();
+        assert!(store.load().1.is_empty());
+        let rec = ParkedRecord {
+            create_guid: [1; 16],
+            file_id: [2; 16],
+            client_guid: [3; 16],
+            owner: "janus".into(),
+            rel_path: "a/b.band".into(),
+            access: 0x12019f,
+            delete_pending: false,
+            lease_key: Some([4; 16]),
+            lease_state: 3,
+            timeout_ms: 30_000,
+            expires_unix_ms: 123,
+        };
+        store.save(77, std::slice::from_ref(&rec)).unwrap();
+        assert_eq!(store.load(), (77, vec![rec]));
+        // the journal does not mistake the file for a segment
+        let (_, report) = open(&d);
+        assert_eq!(report.segments_found, 0);
+        std::fs::write(d.join(ParkedHandleStore::FILE_NAME), b"{not json").unwrap();
+        assert!(store.load().1.is_empty());
+        assert!(ParkedHandleStore::in_memory().load().1.is_empty());
+        ParkedHandleStore::in_memory().save(0, &[]).unwrap();
     }
 }

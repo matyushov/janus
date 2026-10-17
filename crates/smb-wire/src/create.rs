@@ -32,14 +32,10 @@ pub enum CreateContext {
         create_guid: [u8; 16],
         flags: u32,
     },
-    /// SMB2_CREATE_REQUEST_LEASE_V2.
-    LeaseV2Request {
-        lease_key: [u8; 16],
-        lease_state: u32,
-        epoch: u16,
-    },
+    /// SMB2_CREATE_REQUEST_LEASE (v1, 32 bytes) or _V2 (52 bytes).
+    Lease(LeaseReq),
     /// Apple "AAPL" server query context (see the Apple TM-over-SMB spec).
-    Aapl(AaplContext),
+    Aapl(AaplQuery),
     QueryMaximalAccess,
     /// Unknown tag: the body is kept as is.
     Unknown {
@@ -48,26 +44,150 @@ pub enum CreateContext {
     },
 }
 
-/// The AAPL context (request and reply are structurally close; the reply side is
-/// something no open Rust crate has, so we write it ourselves).
-#[derive(Debug)]
-pub struct AaplContext {
-    pub command: AaplCommand,
-    /// Bit mask of server capabilities.
+/// Lease state bits (MS-SMB2 §2.2.13.2.8).
+pub const LEASE_READ: u32 = 0x01;
+pub const LEASE_HANDLE: u32 = 0x02;
+pub const LEASE_WRITE: u32 = 0x04;
+/// `SMB2_LEASE_FLAG_PARENT_LEASE_KEY_SET`.
+pub const LEASE_FLAG_PARENT_KEY_SET: u32 = 0x04;
+/// DH2Q flag: the client asks for a persistent handle.
+pub const DH2_FLAG_PERSISTENT: u32 = 0x02;
+
+/// A lease request (`RqLs`), v1 or v2. The same shape is used for the granted reply.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LeaseReq {
+    pub key: [u8; 16],
+    pub state: u32,
+    pub flags: u32,
+    pub parent_key: [u8; 16],
+    pub epoch: u16,
+    /// 52-byte v2 layout (parent key and epoch present).
+    pub v2: bool,
+}
+
+impl LeaseReq {
+    fn decode(data: &[u8]) -> Option<LeaseReq> {
+        let v2 = match data.len() {
+            32 => false,
+            52 => true,
+            _ => return None,
+        };
+        let mut r = Reader::new(data);
+        let key = r.array::<16>().ok()?;
+        let state = r.u32().ok()?;
+        let flags = r.u32().ok()?;
+        let _duration = r.u64().ok()?;
+        let (parent_key, epoch) = if v2 {
+            (r.array::<16>().ok()?, r.u16().ok()?)
+        } else {
+            ([0; 16], 0)
+        };
+        Some(LeaseReq {
+            key,
+            state,
+            flags,
+            parent_key,
+            epoch,
+            v2,
+        })
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.bytes(&self.key);
+        w.u32(self.state);
+        w.u32(self.flags);
+        w.u64(0); // LeaseDuration
+        if self.v2 {
+            w.bytes(&self.parent_key);
+            w.u16(self.epoch);
+            w.u16(0);
+        }
+        w.into_vec()
+    }
+}
+
+/// An AAPL server query (command 1): what the client asks for and what it supports.
+/// The AAPL contexts are an Apple extension outside MS-SMB2; layout per the Apple
+/// "Time Machine over SMB" specification, checked against live `mount_smbfs`/`tmutil` traces.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AaplQuery {
+    /// `kAAPL_*` bits the client wants in the reply.
+    pub request_bitmap: u64,
+    pub client_caps: u64,
+}
+
+/// The reply to an AAPL server query. Which fields go on the wire is decided by `bitmap`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AaplReply {
+    pub bitmap: u64,
     pub server_caps: u64,
     pub volume_caps: u64,
-    pub model_string: String,
+    pub model: String,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AaplCommand {
-    ServerQuery,
-    ResolveId,
+/// AAPL command codes.
+pub const AAPL_CMD_SERVER_QUERY: u32 = 1;
+
+/// Request/reply bitmap bits of a server query.
+pub const AAPL_BIT_SERVER_CAPS: u64 = 0x1;
+pub const AAPL_BIT_VOLUME_CAPS: u64 = 0x2;
+pub const AAPL_BIT_MODEL_INFO: u64 = 0x4;
+
+/// Server capabilities (kAAPL_SERVER_CAPS).
+pub const AAPL_SUPPORTS_READ_DIR_ATTR: u64 = 0x1;
+pub const AAPL_SUPPORTS_OSX_COPYFILE: u64 = 0x2;
+pub const AAPL_UNIX_BASED: u64 = 0x4;
+pub const AAPL_SUPPORTS_NFS_ACE: u64 = 0x8;
+
+/// Volume capabilities (kAAPL_VOLUME_CAPS).
+pub const AAPL_SUPPORTS_RESOLVE_ID: u64 = 0x1;
+pub const AAPL_CASE_SENSITIVE: u64 = 0x2;
+/// kAAPL_SUPPORTS_FULL_SYNC: the volume supports SMB2 FLUSH with F_FULLFSYNC.
+/// Without this bit `tmutil`/`backupd` refuse the share ("does not support SMB FullFSync").
+pub const AAPL_SUPPORTS_FULL_SYNC: u64 = 0x4;
+
+impl AaplQuery {
+    /// `data` is the context body: command(4) reserved(4) request_bitmap(8) client_caps(8).
+    /// Other commands (e.g. resolve-id) are not decoded.
+    fn decode(data: &[u8]) -> Option<AaplQuery> {
+        let mut r = Reader::new(data);
+        if r.u32().ok()? != AAPL_CMD_SERVER_QUERY {
+            return None;
+        }
+        let _reserved = r.u32().ok()?;
+        Some(AaplQuery {
+            request_bitmap: r.u64().ok()?,
+            client_caps: r.u64().unwrap_or(0),
+        })
+    }
 }
 
-/// kAAPL_SUPPORTS_FULL_SYNC: the server supports SMB2 FLUSH with F_FULLFSYNC.
-/// Without this bit backupd will not trust F_FULLFSYNC (Apple spec).
-pub const AAPL_SUPPORTS_FULL_SYNC: u64 = 0x0000_0000_0000_0004;
+impl AaplReply {
+    fn encode(&self) -> Vec<u8> {
+        let mut w = Writer::new();
+        w.u32(AAPL_CMD_SERVER_QUERY);
+        w.u32(0);
+        w.u64(self.bitmap);
+        if self.bitmap & AAPL_BIT_SERVER_CAPS != 0 {
+            w.u64(self.server_caps);
+        }
+        if self.bitmap & AAPL_BIT_VOLUME_CAPS != 0 {
+            w.u64(self.volume_caps);
+        }
+        if self.bitmap & AAPL_BIT_MODEL_INFO != 0 {
+            let utf16: Vec<u8> = self
+                .model
+                .encode_utf16()
+                .flat_map(u16::to_le_bytes)
+                .collect();
+            w.u32(0); // pad
+            w.u32(utf16.len() as u32);
+            w.bytes(&utf16);
+        }
+        w.into_vec()
+    }
+}
 
 // === CREATE codec (MS-SMB2 §2.2.13 / §2.2.14) =============================
 
@@ -243,6 +363,10 @@ fn decode_contexts(chain: &[u8]) -> Result<Vec<CreateContext>, WireError> {
         if let Ok(tag) = <[u8; 4]>::try_from(name) {
             out.push(if &tag == b"MxAc" {
                 CreateContext::QueryMaximalAccess
+            } else if let Some(q) = (&tag == b"AAPL").then(|| AaplQuery::decode(data)).flatten() {
+                CreateContext::Aapl(q)
+            } else if let Some(c) = decode_durable_or_lease(&tag, data) {
+                c
             } else {
                 CreateContext::Unknown {
                     tag,
@@ -260,6 +384,34 @@ fn decode_contexts(chain: &[u8]) -> Result<Vec<CreateContext>, WireError> {
     }
 }
 
+/// `DH2Q`, `DH2C` and `RqLs`; `None` for other tags and for bodies of the wrong size.
+fn decode_durable_or_lease(tag: &[u8; 4], data: &[u8]) -> Option<CreateContext> {
+    let mut r = Reader::new(data);
+    match tag {
+        b"DH2Q" if data.len() == 32 => {
+            let timeout_ms = r.u32().ok()?;
+            let flags = r.u32().ok()?;
+            let _reserved = r.u64().ok()?;
+            Some(CreateContext::DurableHandleRequestV2 {
+                timeout_ms,
+                flags,
+                create_guid: r.array::<16>().ok()?,
+            })
+        }
+        b"DH2C" if data.len() == 36 => {
+            let file_id = r.array::<16>().ok()?;
+            let create_guid = r.array::<16>().ok()?;
+            Some(CreateContext::DurableHandleReconnectV2 {
+                file_id,
+                create_guid,
+                flags: r.u32().ok()?,
+            })
+        }
+        b"RqLs" => LeaseReq::decode(data).map(CreateContext::Lease),
+        _ => None,
+    }
+}
+
 /// A CREATE reply (the share root).
 #[derive(Debug)]
 pub struct CreateResp {
@@ -274,12 +426,34 @@ pub struct CreateResp {
     pub file_id: FileId,
     /// Reply to the MxAc context: MaximalAccess.
     pub maximal_access: Option<u32>,
+    /// Reply to the AAPL server query.
+    pub aapl: Option<AaplReply>,
+    /// Reply to `DH2Q`: granted timeout (ms) and flags.
+    pub durable: Option<(u32, u32)>,
+    /// Reply to `RqLs`: the granted lease. Sets OplockLevel to LEASE (0xFF).
+    pub lease: Option<LeaseReq>,
+}
+
+/// One create context in a response: header (16) + name (4) + pad (4) + data, 8-aligned.
+fn push_context(out: &mut Vec<u8>, name: &[u8; 4], data: &[u8], last: bool) {
+    let len = 24 + data.len();
+    let padded = len.next_multiple_of(8);
+    out.extend_from_slice(&(if last { 0 } else { padded as u32 }).to_le_bytes());
+    out.extend_from_slice(&16u16.to_le_bytes()); // NameOffset
+    out.extend_from_slice(&4u16.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes());
+    out.extend_from_slice(&24u16.to_le_bytes()); // DataOffset
+    out.extend_from_slice(&(data.len() as u32).to_le_bytes());
+    out.extend_from_slice(name);
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(data);
+    out.resize(out.len() + (padded - len), 0);
 }
 
 impl CreateResp {
     pub fn encode(&self, w: &mut Writer) {
         w.u16(89);
-        w.u8(0); // OplockLevel: NONE
+        w.u8(if self.lease.is_some() { 0xFF } else { 0 }); // OplockLevel: LEASE or NONE
         w.u8(0); // Flags
         w.u32(self.create_action);
         w.u64(self.creation_time);
@@ -293,25 +467,36 @@ impl CreateResp {
         w.bytes(&self.file_id);
         // Contexts start right after the fixed part (88 bytes of body), 8-byte aligned.
         let ctx_off = (crate::header::HEADER_LEN + 88) as u32;
-        match self.maximal_access {
-            Some(access) => {
-                w.u32(ctx_off);
-                w.u32(32);
-                w.u32(0); // Next
-                w.u16(16); // NameOffset
-                w.u16(4);
-                w.u16(0);
-                w.u16(24); // DataOffset
-                w.u32(8);
-                w.bytes(b"MxAc");
-                w.zeros(4);
-                w.u32(0); // QueryStatus
-                w.u32(access);
-            }
-            None => {
-                w.u32(0);
-                w.u32(0);
-            }
+        let mut parts: Vec<([u8; 4], Vec<u8>)> = Vec::new();
+        if let Some(access) = self.maximal_access {
+            let mut d = Vec::with_capacity(8);
+            d.extend_from_slice(&0u32.to_le_bytes()); // QueryStatus
+            d.extend_from_slice(&access.to_le_bytes());
+            parts.push((*b"MxAc", d));
+        }
+        if let Some((timeout_ms, flags)) = self.durable {
+            let mut d = Vec::with_capacity(8);
+            d.extend_from_slice(&timeout_ms.to_le_bytes());
+            d.extend_from_slice(&flags.to_le_bytes());
+            parts.push((*b"DH2Q", d));
+        }
+        if let Some(lease) = &self.lease {
+            parts.push((*b"RqLs", lease.encode()));
+        }
+        if let Some(aapl) = &self.aapl {
+            parts.push((*b"AAPL", aapl.encode()));
+        }
+        let mut chain = Vec::new();
+        for (i, (name, data)) in parts.iter().enumerate() {
+            push_context(&mut chain, name, data, i + 1 == parts.len());
+        }
+        if chain.is_empty() {
+            w.u32(0);
+            w.u32(0);
+        } else {
+            w.u32(ctx_off);
+            w.u32(chain.len() as u32);
+            w.bytes(&chain);
         }
     }
 }
@@ -339,6 +524,177 @@ mod tests {
             req.contexts.as_slice(),
             [CreateContext::QueryMaximalAccess]
         ));
+    }
+
+    /// The AAPL data macOS sends (`mount_smbfs` and `tmutil`, live traces): server query asking
+    /// for server caps, volume caps and the model string; client caps 0x3f.
+    const MACOS_AAPL_DATA: &str = "010000000000000007000000000000003f00000000000000";
+
+    #[test]
+    fn decodes_aapl_server_query() {
+        let q = AaplQuery::decode(&unhex(MACOS_AAPL_DATA)).unwrap();
+        assert_eq!(q.request_bitmap, 7);
+        assert_eq!(q.client_caps, 0x3f);
+        // other commands and truncated data are not queries
+        let mut other = unhex(MACOS_AAPL_DATA);
+        other[0] = 2;
+        assert!(AaplQuery::decode(&other).is_none());
+        for n in 0..16 {
+            assert!(
+                AaplQuery::decode(&unhex(MACOS_AAPL_DATA)[..n]).is_none(),
+                "len {n}"
+            );
+        }
+    }
+
+    /// `DH2Q`/`RqLs` data as sent by `tmutil` for `.com.apple.timemachine.supported-<uuid>`
+    /// (live trace, macOS 26): a 30 s durable handle and a lease RH with a parent key.
+    const MACOS_DH2Q: &str = "307500000000000000000000000000004a2df37211224b90bfa1e9df022947d1";
+    const MACOS_RQLS_V2: &str = "b5ea5a075714fd634cee9b9a8b5c44300300000004000000000000000000000042cdc50460d344d68c0dcac3e23a4ca400000000";
+
+    #[test]
+    fn decodes_durable_v2_request_and_lease_v2_from_macos() {
+        let dh = decode_durable_or_lease(b"DH2Q", &unhex(MACOS_DH2Q)).unwrap();
+        match dh {
+            CreateContext::DurableHandleRequestV2 {
+                timeout_ms,
+                flags,
+                create_guid,
+            } => {
+                assert_eq!((timeout_ms, flags), (30_000, 0));
+                assert_eq!(create_guid[0], 0x4a);
+            }
+            other => panic!("{other:?}"),
+        }
+        let CreateContext::Lease(l) =
+            decode_durable_or_lease(b"RqLs", &unhex(MACOS_RQLS_V2)).unwrap()
+        else {
+            panic!("not a lease")
+        };
+        assert!(l.v2);
+        assert_eq!(l.state, LEASE_READ | LEASE_HANDLE);
+        assert_eq!(l.flags, LEASE_FLAG_PARENT_KEY_SET);
+        assert_eq!(l.key[0], 0xb5);
+        assert_eq!(l.parent_key[0], 0x42);
+        // a lease reply round-trips through the request decoder
+        assert_eq!(LeaseReq::decode(&l.encode()), Some(l));
+    }
+
+    #[test]
+    fn durable_and_lease_decoders_reject_wrong_sizes() {
+        assert!(decode_durable_or_lease(b"DH2Q", &unhex(MACOS_DH2Q)[..31]).is_none());
+        assert!(decode_durable_or_lease(b"RqLs", &[0; 40]).is_none());
+        assert!(decode_durable_or_lease(b"DH2C", &[0; 35]).is_none());
+        let rec = decode_durable_or_lease(b"DH2C", &[7; 36]).unwrap();
+        assert!(
+            matches!(rec, CreateContext::DurableHandleReconnectV2 { file_id, .. } if file_id == [7; 16])
+        );
+        let v1 = decode_durable_or_lease(b"RqLs", &[1; 32]).unwrap();
+        assert!(matches!(
+            v1,
+            CreateContext::Lease(LeaseReq { v2: false, .. })
+        ));
+    }
+
+    #[test]
+    fn create_resp_carries_durable_and_lease_replies() {
+        let lease = LeaseReq {
+            key: [3; 16],
+            state: LEASE_READ,
+            flags: 0,
+            parent_key: [0; 16],
+            epoch: 1,
+            v2: true,
+        };
+        let mut w = Writer::new();
+        CreateResp {
+            create_action: ACTION_CREATED,
+            creation_time: 0,
+            last_access_time: 0,
+            last_write_time: 0,
+            change_time: 0,
+            allocation_size: 0,
+            end_of_file: 0,
+            file_attributes: ATTR_ARCHIVE,
+            file_id: [0; 16],
+            maximal_access: None,
+            aapl: None,
+            durable: Some((30_000, 0)),
+            lease: Some(lease),
+        }
+        .encode(&mut w);
+        let b = w.into_vec();
+        assert_eq!(b[2], 0xFF, "OplockLevel = LEASE");
+        let chain = &b[88..];
+        assert_eq!(&chain[16..20], b"DH2Q");
+        assert_eq!(
+            u32::from_le_bytes(chain[24..28].try_into().unwrap()),
+            30_000
+        );
+        let next = u32::from_le_bytes(chain[0..4].try_into().unwrap()) as usize;
+        assert_eq!(&chain[next + 16..next + 20], b"RqLs");
+        assert_eq!(
+            u32::from_le_bytes(chain[next + 12..next + 16].try_into().unwrap()),
+            52
+        );
+    }
+
+    #[test]
+    fn aapl_reply_layout_follows_the_bitmap() {
+        let reply = AaplReply {
+            bitmap: AAPL_BIT_SERVER_CAPS | AAPL_BIT_VOLUME_CAPS | AAPL_BIT_MODEL_INFO,
+            server_caps: 0,
+            volume_caps: AAPL_SUPPORTS_FULL_SYNC | AAPL_CASE_SENSITIVE,
+            model: "Jn".into(),
+        };
+        let d = reply.encode();
+        assert_eq!(u32::from_le_bytes(d[0..4].try_into().unwrap()), 1);
+        assert_eq!(u64::from_le_bytes(d[8..16].try_into().unwrap()), 7);
+        assert_eq!(u64::from_le_bytes(d[16..24].try_into().unwrap()), 0);
+        assert_eq!(u64::from_le_bytes(d[24..32].try_into().unwrap()), 6);
+        assert_eq!(u32::from_le_bytes(d[36..40].try_into().unwrap()), 4); // "Jn" in UTF-16
+        assert_eq!(&d[40..], &[b'J', 0, b'n', 0]);
+        let only_volume = AaplReply {
+            bitmap: AAPL_BIT_VOLUME_CAPS,
+            ..reply
+        }
+        .encode();
+        assert_eq!(only_volume.len(), 24);
+    }
+
+    #[test]
+    fn create_resp_chains_mxac_and_aapl() {
+        let mut w = Writer::new();
+        CreateResp {
+            create_action: ACTION_OPENED,
+            creation_time: 0,
+            last_access_time: 0,
+            last_write_time: 0,
+            change_time: 0,
+            allocation_size: 0,
+            end_of_file: 0,
+            file_attributes: ATTR_DIRECTORY,
+            file_id: [0; 16],
+            maximal_access: Some(1),
+            durable: None,
+            lease: None,
+            aapl: Some(AaplReply {
+                bitmap: AAPL_BIT_VOLUME_CAPS,
+                server_caps: 0,
+                volume_caps: AAPL_SUPPORTS_FULL_SYNC,
+                model: String::new(),
+            }),
+        }
+        .encode(&mut w);
+        let b = w.into_vec();
+        let total = u32::from_le_bytes(b[84..88].try_into().unwrap()) as usize;
+        assert_eq!(b.len(), 88 + total);
+        assert_eq!(u32::from_le_bytes(b[88..92].try_into().unwrap()), 32); // Next of MxAc
+        assert_eq!(&b[88 + 32 + 16..88 + 32 + 20], b"AAPL");
+        assert_eq!(
+            u32::from_le_bytes(b[88 + 32..88 + 36].try_into().unwrap()),
+            0
+        ); // last
     }
 
     #[test]
@@ -369,6 +725,9 @@ mod tests {
             file_attributes: ATTR_DIRECTORY,
             file_id: [9; 16],
             maximal_access: Some(0x001F_01FF),
+            aapl: None,
+            durable: None,
+            lease: None,
         }
         .encode(&mut w);
         let b = w.into_vec();

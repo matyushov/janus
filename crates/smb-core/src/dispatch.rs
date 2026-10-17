@@ -24,6 +24,7 @@ use smb_wire::crypto;
 use smb_wire::fileinfo::{CloseReq, QueryDirectoryReq, QueryInfoReq, SetInfoReq};
 use smb_wire::header::{Header, SMB2_TRANSFORM_MAGIC, flags};
 use smb_wire::io::{FlushReq, ReadReq, WriteReq};
+use smb_wire::lease::LeaseBreakAck;
 use smb_wire::messages::{
     ACCESS_ALL, HASH_SHA512, NegotiateReq, NegotiateResp, SessionSetupReq, SessionSetupResp,
     TreeConnectReq, TreeConnectResp, decode_simple_req, encode_simple_resp, security_mode,
@@ -34,7 +35,9 @@ use smb_wire::{Command, Message, WireError};
 
 use crate::conn::{AsyncConfig, ConnState, MAX_AUTH_FAILURES, MAX_PENDING_SESSIONS};
 use crate::files;
+use crate::server::ConnId;
 use crate::session::{PendingAuth, Session, SessionState};
+use crate::shared::Shared;
 
 /// Result of handling a packet.
 pub enum Reply {
@@ -99,6 +102,10 @@ pub struct ServerCtx<'a> {
     pub now: Instant,
     /// Source of randomness (server challenge, salt); replaced in tests.
     pub random: fn(&mut [u8]),
+    /// The connection this packet arrived on.
+    pub conn_id: ConnId,
+    /// Parked durable handles and leases (outlive the connection).
+    pub shared: &'a Arc<Shared>,
 }
 
 /// System source of randomness for `ServerCtx::random`.
@@ -127,6 +134,8 @@ impl Element {
 const MAX_COMPOUND: usize = 32;
 /// SMB2 capability bit: multi-credit READ/WRITE and sizes above 64 KiB (MS-SMB2 §2.2.4).
 const CAP_LARGE_MTU: u32 = 0x0000_0004;
+/// SMB2_GLOBAL_CAP_LEASING.
+const CAP_LEASING: u32 = 0x0000_0002;
 
 /// What `finish_io` needs to build the reply of a deferred READ/WRITE.
 pub(crate) struct DeferredSlow {
@@ -524,6 +533,7 @@ impl Dispatcher {
             return Err(WireError::Malformed("repeated NEGOTIATE"));
         }
         let req = NegotiateReq::decode(&mut Reader::new(&msg.body))?;
+        conn.client_guid = req.client_guid;
         let Some(dialect) = req.select_dialect() else {
             // No 3.1.1: refuse (the dialect is 3.1.1 only).
             return Ok(error_reply(h, conn, status::NOT_SUPPORTED, None));
@@ -546,10 +556,15 @@ impl Dispatcher {
             dialect_revision: dialect as u16,
             server_guid: ctx.server_guid,
             security_mode: security_mode::SIGNING_ENABLED | security_mode::SIGNING_REQUIRED,
-            // Minimal capabilities: no DFS and no leasing (J4 will add them). LARGE_MTU lets
+            // No DFS. LEASING only for profiles that use durable handles / leases (Time Machine).
+            // LARGE_MTU lets
             // READ/WRITE carry up to MAX_IO bytes per request (multi-credit), which is what
             // keeps a high-latency backend busy.
-            capabilities: CAP_LARGE_MTU,
+            capabilities: if ctx.caps.leasing {
+                CAP_LARGE_MTU | CAP_LEASING
+            } else {
+                CAP_LARGE_MTU
+            },
             max_transact_size: files::MAX_IO,
             max_read_size: files::MAX_IO,
             max_write_size: files::MAX_IO,
@@ -594,7 +609,8 @@ impl Dispatcher {
                         preauth_hash: conn.preauth_hash,
                         started: ctx.now,
                     })),
-                ),
+                )
+                .with_shared(Arc::clone(ctx.shared)),
             );
             id
         } else {
@@ -766,6 +782,7 @@ impl Dispatcher {
         }
 
         let compound_file = conn.compound_file;
+        let client_guid = conn.client_guid;
         let session = conn
             .sessions
             .get_mut(&h.session_id)
@@ -821,7 +838,7 @@ impl Dispatcher {
             }
             Command::Create => {
                 let req = CreateReq::decode(&mut Reader::new(&msg.body))?;
-                files::create(backend, &req, h.tree_id, session, ctx).await
+                files::create(backend, &req, h.tree_id, session, ctx, client_guid).await
             }
             Command::Close => {
                 let req = CloseReq::decode(&mut Reader::new(&msg.body))?;
@@ -860,7 +877,19 @@ impl Dispatcher {
             }
             // Unknown FSCTLs (macOS probes the network interface list): the usual answer.
             Command::Ioctl => Out::err(status::NOT_SUPPORTED),
-            // LOCK/CHANGE_NOTIFY/CANCEL/OPLOCK_BREAK: not implemented yet.
+            // Lease break acknowledgment (traditional oplocks are never granted).
+            Command::OplockBreak => match LeaseBreakAck::decode(&mut Reader::new(&msg.body))? {
+                Some(ack) => match ctx.shared.ack_lease(ack.key, ack.state) {
+                    Ok(state) => {
+                        let mut w = Writer::new();
+                        LeaseBreakAck::encode_response(&ack.key, state, &mut w);
+                        Out::ok(w.into_vec())
+                    }
+                    Err(st) => Out::err(st),
+                },
+                None => Out::err(status::INVALID_PARAMETER),
+            },
+            // LOCK/CHANGE_NOTIFY/CANCEL: not implemented yet.
             _ => Out::err(status::NOT_IMPLEMENTED),
         };
 
@@ -880,9 +909,16 @@ impl Dispatcher {
 
     /// Close every handle still open on a connection that is going away. The backend
     /// performs pending delete-on-close.
-    pub async fn cleanup<B: StorageBackend>(conn: &mut ConnState, backend: &B) {
+    pub async fn cleanup<B: StorageBackend>(conn: &mut ConnState, backend: &B, shared: &Shared) {
+        let client_guid = conn.client_guid;
         for session in conn.sessions.values_mut() {
-            files::close_all(backend, session.take_all_opens()).await;
+            // The connection dropped (an orderly LOGOFF has already closed its opens): durable
+            // handles are parked for a reconnect, everything else is closed.
+            let (parked, closed) = session.drain_for_drop(client_guid);
+            for (record, handle, timeout) in parked {
+                shared.park(record, handle, timeout);
+            }
+            files::close_all(backend, closed).await;
         }
     }
 }
@@ -1083,11 +1119,12 @@ mod tests {
     use smb_wire::auth::NegState;
     use smb_wire::create::disposition;
     use smb_wire::testclient::{
-        Client, Response, basic_info, close_body, close_body_ex, create_body, create_body_ex,
-        create_reply_file_id, dir_entry_names, disposition_info, eof_info, flush_body, frame,
-        negotiate_body, query_directory_body_ex, query_info_body, read_body, read_reply_data,
-        rename_info, request_header, session_setup_body, set_info_body, sign_frame, simple_body,
-        smb1_negotiate, split_compound, tree_connect_body, write_body,
+        Client, Response, basic_info, close_body, close_body_ex, create_body, create_body_ctx,
+        create_body_ex, create_reply_contexts, create_reply_file_id, dir_entry_names,
+        disposition_info, eof_info, flush_body, frame, negotiate_body, query_directory_body_ex,
+        query_info_body, read_body, read_reply_data, rename_info, request_header,
+        session_setup_body, set_info_body, sign_frame, simple_body, smb1_negotiate, split_compound,
+        tree_connect_body, write_body,
     };
     use std::time::Duration;
 
@@ -1118,6 +1155,7 @@ mod tests {
     }
 
     struct Fixture {
+        shared: Arc<Shared>,
         next_session: AtomicU64,
         conn: ConnState,
         creds: Option<Credentials>,
@@ -1132,6 +1170,7 @@ mod tests {
             let dir = TmpDir::new();
             Fixture {
                 next_session: AtomicU64::new(0x1_0000_0001),
+                shared: Arc::default(),
                 conn: ConnState::default(),
                 creds: Some(Credentials::from_password(USER, PASSWORD)),
                 now: Instant::now(),
@@ -1156,6 +1195,8 @@ mod tests {
                 volume_bytes: 1 << 40,
                 now: self.now,
                 random: det_random,
+                conn_id: ConnId(1),
+                shared: &self.shared,
             };
             match self.rt.block_on(Dispatcher::handle(
                 payload,
@@ -1209,7 +1250,7 @@ mod tests {
         assert_eq!(&b[8..24], &[9; 16], "ServerGuid");
         assert_eq!(
             u32::from_le_bytes(b[24..28].try_into().unwrap()),
-            CAP_LARGE_MTU,
+            CAP_LARGE_MTU | CAP_LEASING, // Time Machine profile: leasing advertised
             "capabilities"
         );
         for (at, what) in [
@@ -2038,6 +2079,60 @@ mod tests {
         );
         // after CLOSE nothing is open
         assert!(fx.conn.sessions[&c.session_id].opens.is_empty());
+    }
+
+    /// AAPL data as sent by macOS (`mount_smbfs`/`tmutil`): server query for caps, volume caps, model.
+    const MACOS_AAPL_QUERY: &str = "010000000000000007000000000000003f00000000000000";
+
+    #[test]
+    fn aapl_server_query_is_answered_with_full_sync() {
+        use smb_wire::create::{AAPL_CASE_SENSITIVE, AAPL_SUPPORTS_FULL_SYNC};
+        let (mut fx, mut c, tid) = connected();
+        let r = fx
+            .send(&c.signed_request(
+                Command::Create,
+                tid,
+                &create_body_ctx(
+                    "",
+                    0x0010_0080,
+                    disposition::OPEN,
+                    1,
+                    &[(b"AAPL", unhex_t(MACOS_AAPL_QUERY)), (b"MxAc", Vec::new())],
+                ),
+            ))
+            .unwrap();
+        assert!(c.verify_response(&r));
+        let p = Response::parse(&r).unwrap();
+        assert_eq!(p.status(), status::SUCCESS);
+        let ctxs = create_reply_contexts(&p.message.body);
+        let names: Vec<_> = ctxs.iter().map(|(n, _)| *n).collect();
+        assert_eq!(names, vec![*b"MxAc", *b"AAPL"]);
+        let d = &ctxs[1].1;
+        assert_eq!(
+            u32::from_le_bytes(d[0..4].try_into().unwrap()),
+            1,
+            "server query"
+        );
+        assert_eq!(
+            u64::from_le_bytes(d[8..16].try_into().unwrap()),
+            7,
+            "reply bitmap"
+        );
+        let volume = u64::from_le_bytes(d[24..32].try_into().unwrap());
+        assert_eq!(volume, AAPL_SUPPORTS_FULL_SYNC | AAPL_CASE_SENSITIVE);
+        let model_len = u32::from_le_bytes(d[36..40].try_into().unwrap()) as usize;
+        assert_eq!(d.len(), 40 + model_len);
+    }
+
+    #[test]
+    fn create_without_aapl_gets_no_aapl_reply() {
+        let (mut fx, mut c, tid) = connected();
+        let (p, _) = create_root(&mut fx, &mut c, tid);
+        let names: Vec<_> = create_reply_contexts(&p.message.body)
+            .iter()
+            .map(|(n, _)| *n)
+            .collect();
+        assert_eq!(names, vec![*b"MxAc"]);
     }
 
     #[test]
@@ -3086,7 +3181,7 @@ mod tests {
         open_ok(&mut fx, &mut c, tid, "gone", RW, disposition::CREATE, doc);
         assert!(fx.dir.0.join("gone").exists());
         fx.rt
-            .block_on(Dispatcher::cleanup(&mut fx.conn, &fx.backend));
+            .block_on(Dispatcher::cleanup(&mut fx.conn, &fx.backend, &fx.shared));
         assert!(!fx.dir.0.join("gone").exists());
         assert!(fx.conn.sessions.values().all(|s| s.opens.is_empty()));
     }

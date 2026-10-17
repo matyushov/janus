@@ -33,6 +33,7 @@ use crate::dispatch::{
     DeferredSlow, Dispatcher, IoMeta, Out, Reply, ServerCtx, status, system_random,
 };
 use crate::files::Post;
+use crate::shared::{Push, Shared};
 use crate::transport::{read_message, write_message};
 
 /// TCP connection identifier.
@@ -94,6 +95,8 @@ pub struct DevServer<B: StorageBackend> {
     async_cfg: AsyncConfig,
     /// Operations behind an interim response, for `janus-cli client status`.
     pending: Arc<janus_lib::observability::PendingOps>,
+    /// Parked durable handles and leases.
+    shared: Arc<Shared>,
 }
 
 impl<B: StorageBackend> DevServer<B> {
@@ -113,6 +116,7 @@ impl<B: StorageBackend> DevServer<B> {
             started_filetime: filetime_now(),
             async_cfg: AsyncConfig::default(),
             pending: Arc::default(),
+            shared: Arc::default(),
             trace: match std::env::var("JANUS_SMB_TRACE").as_deref() {
                 Ok("1") => 1,
                 Ok("2") => 2,
@@ -127,6 +131,13 @@ impl<B: StorageBackend> DevServer<B> {
         self
     }
 
+    /// Use this shared state (a `Shared` built on a `ParkedHandleStore` keeps durable handles
+    /// across a daemon restart).
+    pub fn with_shared(mut self, shared: Arc<Shared>) -> Self {
+        self.shared = shared;
+        self
+    }
+
     /// Share the pending-operation counter with the control plane's `status`.
     pub fn with_pending_ops(mut self, p: Arc<janus_lib::observability::PendingOps>) -> Self {
         self.pending = p;
@@ -136,6 +147,19 @@ impl<B: StorageBackend> DevServer<B> {
     /// Listen on TCP and serve connections (dev mode; in production the listener
     /// comes from launchd, see janus-smbd).
     pub async fn serve(self: Arc<Self>, listener: TcpListener) -> std::io::Result<()> {
+        // Parked durable handles whose time is up are closed here.
+        let me = Arc::clone(&self);
+        let sweeper = tokio::spawn(async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(1));
+            loop {
+                tick.tick().await;
+                me.shared.heartbeat();
+                for handle in me.shared.take_expired(Instant::now()) {
+                    let _ = me.backend.close(handle).await;
+                }
+            }
+        });
+        let _sweeper = AbortOnDrop(sweeper);
         loop {
             let (stream, peer) = listener.accept().await?;
             // Request/response protocol: Nagle + delayed ACK would add tens of ms per exchange.
@@ -156,9 +180,11 @@ impl<B: StorageBackend> DevServer<B> {
     async fn serve_conn(&self, stream: TcpStream, conn_id: ConnId) -> std::io::Result<()> {
         let mut conn = ConnState::default();
         jlog!(Info, "smb", "conn {conn_id:?} established");
-        let result = self.conn_loop(stream, &mut conn, conn_id).await;
-        // Whatever ended the connection, release the backend handles it still holds.
-        Dispatcher::cleanup(&mut conn, &*self.backend).await;
+        let push_rx = self.shared.register_conn(conn_id);
+        let result = self.conn_loop(stream, &mut conn, conn_id, push_rx).await;
+        // Whatever ended the connection: durable handles are parked, the rest is released.
+        Dispatcher::cleanup(&mut conn, &*self.backend, &self.shared).await;
+        self.shared.unregister_conn(conn_id);
         jlog!(Info, "smb", "conn {conn_id:?} closed");
         result
     }
@@ -180,6 +206,7 @@ impl<B: StorageBackend> DevServer<B> {
         stream: TcpStream,
         conn: &mut ConnState,
         conn_id: ConnId,
+        mut push_rx: tokio::sync::mpsc::UnboundedReceiver<Push>,
     ) -> std::io::Result<()> {
         let (mut rd, wr) = stream.into_split();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<std::io::Result<Option<Vec<u8>>>>(2);
@@ -216,6 +243,12 @@ impl<B: StorageBackend> DevServer<B> {
                             return Ok(());
                         }
                     }
+                    continue;
+                }
+                Some(push) = push_rx.recv() => {
+                    let Push::LeaseBreak(n) = push;
+                    jlog!(Info, "smb", "conn {conn_id:?} lease break {:#x} → {:#x} (ack required: {})", n.current_state, n.new_state, n.ack_required);
+                    write_message(&mut io.wr, &n.encode_packet()).await?;
                     continue;
                 }
                 Some((meta, out, raw)) = io.inflight.next(), if !io.inflight.is_empty() => {
@@ -258,6 +291,9 @@ impl<B: StorageBackend> DevServer<B> {
     ) -> std::io::Result<std::ops::ControlFlow<()>> {
         use std::ops::ControlFlow::{Break, Continue};
         let backend = &*self.backend;
+        if self.trace > 1 && !from_held {
+            trace_request_hex(conn_id, &raw);
+        }
         // CANCEL never waits behind anything and never gets a reply.
         if Dispatcher::try_cancel(&raw, conn) {
             return Ok(Continue(()));
@@ -338,6 +374,8 @@ impl<B: StorageBackend> DevServer<B> {
             volume_bytes,
             now: Instant::now(),
             random: system_random,
+            conn_id,
+            shared: &self.shared,
         };
 
         if !urgent && let Some(d) = Dispatcher::try_defer_slow(&raw, conn, &ctx, &async_cfg) {
@@ -377,10 +415,6 @@ impl<B: StorageBackend> DevServer<B> {
         let result = Dispatcher::handle(&raw, conn, &ctx, backend).await;
         if self.trace > 0 {
             trace_exchange(conn_id, &raw, &result);
-        }
-        if self.trace > 1 && !smb_wire::messages::is_smb1(&raw) {
-            let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
-            jlog!(Debug, "smb", "conn {conn_id:?} raw → {hex}");
         }
         match result {
             Ok(Reply::Now(bytes)) => write_message(&mut io.wr, &bytes).await?,
@@ -535,6 +569,35 @@ impl<B: StorageBackend> DevServer<B> {
             trace_exchange(conn_id, &raw, &Ok(Reply::Now(bytes.clone())));
         }
         write_message(wr, &bytes).await
+    }
+}
+
+/// `JANUS_SMB_TRACE=2` request dump: one hex line per compound element, with the payload of a
+/// WRITE cut off (file contents never reach the trace). `tools/smb-trace-summary.py` reads it.
+fn trace_request_hex(conn_id: ConnId, raw: &[u8]) {
+    const WRITE: u16 = 9;
+    if smb_wire::messages::is_smb1(raw) || raw.len() < 64 || raw[..4] != [0xfe, b'S', b'M', b'B'] {
+        return;
+    }
+    let mut rest = raw;
+    while rest.len() >= 64 {
+        let next = u32::from_le_bytes([rest[20], rest[21], rest[22], rest[23]]) as usize;
+        let end = if next == 0 || next > rest.len() {
+            rest.len()
+        } else {
+            next
+        };
+        let mut elem = &rest[..end];
+        if u16::from_le_bytes([elem[12], elem[13]]) == WRITE && elem.len() >= 68 {
+            let data_off = u16::from_le_bytes([elem[66], elem[67]]) as usize;
+            elem = &elem[..data_off.clamp(64, elem.len())];
+        }
+        let hex: String = elem.iter().map(|b| format!("{b:02x}")).collect();
+        jlog!(Debug, "smb", "conn {conn_id:?} raw → {hex}");
+        if end == rest.len() {
+            break;
+        }
+        rest = &rest[end..];
     }
 }
 

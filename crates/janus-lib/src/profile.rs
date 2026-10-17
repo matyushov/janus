@@ -36,6 +36,9 @@ pub struct CompatCaps {
     /// Windows probes alternate data streams / security descriptors:
     /// answer with a correct "emptiness" rather than an error.
     pub serve_empty_windows_metadata: bool,
+    /// Advertise SMB2_GLOBAL_CAP_LEASING and grant lease V2 / durable handles V2.
+    /// `tmutil` mounts the share but refuses it ("Operation not supported") without them.
+    pub leasing: bool,
 }
 
 impl ClientProfile {
@@ -47,6 +50,7 @@ impl ClientProfile {
                 fullfsync: true,
                 posix_extensions: false,
                 serve_empty_windows_metadata: false,
+                leasing: true,
             },
             ClientProfile::WindowsGeneric => CompatCaps {
                 case_sensitive_names: false,
@@ -54,6 +58,7 @@ impl ClientProfile {
                 fullfsync: false,
                 posix_extensions: false,
                 serve_empty_windows_metadata: true,
+                leasing: false,
             },
             ClientProfile::PosixGeneric => CompatCaps {
                 case_sensitive_names: true,
@@ -61,6 +66,7 @@ impl ClientProfile {
                 fullfsync: false,
                 posix_extensions: true,
                 serve_empty_windows_metadata: false,
+                leasing: false,
             },
         }
     }
@@ -76,6 +82,7 @@ mod tests {
         assert!(caps.case_sensitive_names);
         assert!(caps.advertise_aapl);
         assert!(caps.fullfsync);
+        assert!(caps.leasing);
     }
 
     #[test]

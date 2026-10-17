@@ -192,13 +192,23 @@ pub fn sign_frame(frame: &mut [u8], key: &[u8; 16]) {
 }
 
 pub fn negotiate_body(dialects: &[u16], with_preauth: bool, salt: &[u8]) -> Vec<u8> {
+    negotiate_body_guid(dialects, with_preauth, salt, [0x42; 16])
+}
+
+/// NEGOTIATE body with an explicit ClientGuid.
+pub fn negotiate_body_guid(
+    dialects: &[u16],
+    with_preauth: bool,
+    salt: &[u8],
+    client_guid: [u8; 16],
+) -> Vec<u8> {
     let mut w = Writer::new();
     w.u16(36);
     w.u16(dialects.len() as u16);
     w.u16(security_mode::SIGNING_ENABLED);
     w.u16(0);
     w.u32(0);
-    w.bytes(&[0x42; 16]);
+    w.bytes(&client_guid);
     let ctx_off = (64 + 36 + dialects.len() * 2).next_multiple_of(8);
     w.u32(if with_preauth { ctx_off as u32 } else { 0 });
     w.u16(with_preauth as u16);
@@ -292,6 +302,134 @@ pub fn create_body_ex(
         w.bytes(b"MxAc");
         w.zeros(4);
     }
+    w.into_vec()
+}
+
+/// CREATE body with an arbitrary chain of create contexts (`(name, data)` pairs).
+pub fn create_body_ctx(
+    path: &str,
+    access: u32,
+    disposition: u32,
+    options: u32,
+    contexts: &[(&[u8; 4], Vec<u8>)],
+) -> Vec<u8> {
+    let name = utf16le(path);
+    let name_off = 64 + 56;
+    let ctx_off = (name_off + name.len().max(1)).next_multiple_of(8);
+    let mut chain = Vec::new();
+    for (i, (tag, data)) in contexts.iter().enumerate() {
+        let len = 24 + data.len();
+        let padded = len.next_multiple_of(8);
+        let next = if i + 1 == contexts.len() {
+            0
+        } else {
+            padded as u32
+        };
+        chain.extend_from_slice(&next.to_le_bytes());
+        chain.extend_from_slice(&16u16.to_le_bytes());
+        chain.extend_from_slice(&4u16.to_le_bytes());
+        chain.extend_from_slice(&0u16.to_le_bytes());
+        chain.extend_from_slice(&24u16.to_le_bytes());
+        chain.extend_from_slice(&(data.len() as u32).to_le_bytes());
+        chain.extend_from_slice(*tag);
+        chain.extend_from_slice(&[0; 4]);
+        chain.extend_from_slice(data);
+        chain.resize(chain.len() + (padded - len), 0);
+    }
+    let mut w = Writer::new();
+    w.u16(57);
+    w.u8(0);
+    w.u8(0);
+    w.u32(2);
+    w.zeros(16);
+    w.u32(access);
+    w.u32(0x80);
+    w.u32(7);
+    w.u32(disposition);
+    w.u32(options);
+    w.u16(name_off as u16);
+    w.u16(name.len() as u16);
+    w.u32(if chain.is_empty() { 0 } else { ctx_off as u32 });
+    w.u32(chain.len() as u32);
+    w.bytes(&name);
+    if name.is_empty() {
+        w.zeros(1);
+    }
+    if !chain.is_empty() {
+        let pos = 64 + w.len();
+        w.zeros(ctx_off - pos);
+        w.bytes(&chain);
+    }
+    w.into_vec()
+}
+
+/// `DH2Q` data: a durable handle V2 request.
+pub fn dh2q_data(timeout_ms: u32, create_guid: [u8; 16]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.u32(timeout_ms);
+    w.u32(0);
+    w.u64(0);
+    w.bytes(&create_guid);
+    w.into_vec()
+}
+
+/// `DH2C` data: reconnect to a durable handle.
+pub fn dh2c_data(file_id: [u8; 16], create_guid: [u8; 16]) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.bytes(&file_id);
+    w.bytes(&create_guid);
+    w.u32(0);
+    w.into_vec()
+}
+
+/// `RqLs` v2 data (52 bytes).
+pub fn rqls_v2_data(key: [u8; 16], state: u32) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.bytes(&key);
+    w.u32(state);
+    w.u32(0);
+    w.u64(0);
+    w.bytes(&[0; 16]);
+    w.u16(1);
+    w.u16(0);
+    w.into_vec()
+}
+
+/// The create contexts of a CREATE response body: `(name, data)`.
+pub fn create_reply_contexts(body: &[u8]) -> Vec<([u8; 4], Vec<u8>)> {
+    let off = u32::from_le_bytes(body[80..84].try_into().unwrap()) as usize;
+    let len = u32::from_le_bytes(body[84..88].try_into().unwrap()) as usize;
+    let mut out = Vec::new();
+    if len == 0 {
+        return out;
+    }
+    let chain = &body[off - 64..off - 64 + len];
+    let mut at = 0;
+    loop {
+        let next = u32::from_le_bytes(chain[at..at + 4].try_into().unwrap()) as usize;
+        let no = u16::from_le_bytes(chain[at + 4..at + 6].try_into().unwrap()) as usize;
+        let doff = u16::from_le_bytes(chain[at + 10..at + 12].try_into().unwrap()) as usize;
+        let dlen = u32::from_le_bytes(chain[at + 12..at + 16].try_into().unwrap()) as usize;
+        out.push((
+            chain[at + no..at + no + 4].try_into().unwrap(),
+            chain[at + doff..at + doff + dlen].to_vec(),
+        ));
+        if next == 0 {
+            return out;
+        }
+        at += next;
+    }
+}
+
+/// LEASE_BREAK acknowledgment body.
+pub fn lease_ack_body(key: [u8; 16], state: u32) -> Vec<u8> {
+    let mut w = Writer::new();
+    w.u16(36);
+    w.u16(0);
+    w.u32(0);
+    w.bytes(&key);
+    w.u32(state);
+    w.u64(0);
     w.into_vec()
 }
 
@@ -549,6 +687,8 @@ pub struct Client {
     negotiate_ntlm: Vec<u8>,
     challenge_ntlm: Vec<u8>,
     pub exported_session_key: [u8; 16],
+    /// Sent in NEGOTIATE.
+    pub client_guid: [u8; 16],
 }
 
 impl Client {
@@ -564,6 +704,7 @@ impl Client {
             negotiate_ntlm: Vec::new(),
             challenge_ntlm: Vec::new(),
             exported_session_key: [0x55; 16],
+            client_guid: [0x42; 16],
         }
     }
 
@@ -581,7 +722,12 @@ impl Client {
         let h = request_header(Command::Negotiate, self.next_id(), 0, 0);
         let f = frame(
             &h,
-            &negotiate_body(&[0x0202, 0x0210, 0x0300, 0x0302, 0x0311], true, &[0xAB; 32]),
+            &negotiate_body_guid(
+                &[0x0202, 0x0210, 0x0300, 0x0302, 0x0311],
+                true,
+                &[0xAB; 32],
+                self.client_guid,
+            ),
         );
         self.preauth_hash = crypto::preauth_chain(&self.preauth_hash, &f);
         f

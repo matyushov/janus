@@ -11,8 +11,8 @@
 //! Implementation status (J1/J2): transport → dispatch → conn/session: NEGOTIATE 3.1.1,
 //! SESSION_SETUP (NTLMv2, signing), TREE_CONNECT/DISCONNECT, LOGOFF, ECHO, and the file model
 //! (`files`: CREATE/CLOSE/READ/WRITE/FLUSH/QUERY_INFO/QUERY_DIRECTORY/SET_INFO) on a backend.
-//! Modules of the full architecture (`shared`/`handle`/`lease`/`apple`) are a typed groundwork
-//! for UPGRADE, enabled as commands get implemented.
+//! `shared` holds what outlives a connection (parked durable handles, leases); `apple` the
+//! Apple extensions.
 
 #![allow(dead_code)] // skeleton
 
@@ -23,10 +23,5 @@ pub mod server;
 pub mod session;
 pub mod transport;
 
-// Groundwork for the full architecture (durable/lease/AAPL). Enabled as
-// CREATE gets implemented. Not in the build graph yet: the types refer
-// to the future actor/StorageBackend plumbing.
-// pub mod apple;
-// pub mod handle;
-// pub mod lease;
-// pub mod shared;
+pub mod apple;
+pub mod shared;

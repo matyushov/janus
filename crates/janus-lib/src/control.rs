@@ -224,7 +224,9 @@ impl SmbFrontControl for ControlService {
             }));
         }
 
-        // What to restore if the backend refuses the new configuration after it was persisted.
+        // What to restore if the backend refuses the new configuration after it was persisted
+        // (only a gRPC backend can refuse, so only that build needs it).
+        #[cfg(feature = "backend-grpc")]
         let previous = self
             .config
             .as_ref()

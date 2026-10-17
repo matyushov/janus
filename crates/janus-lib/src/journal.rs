@@ -179,14 +179,17 @@ fn open_private_dir(dir: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn private_file_opts() -> OpenOptions {
+    use std::os::unix::fs::OpenOptionsExt;
     let mut o = OpenOptions::new();
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        o.mode(0o600);
-    }
+    o.mode(0o600);
     o
+}
+
+#[cfg(not(unix))]
+fn private_file_opts() -> OpenOptions {
+    OpenOptions::new()
 }
 
 /// tmp file → (fsync) → rename; the file keeps mode 0600.

@@ -205,6 +205,13 @@ impl SmbFrontControl for ControlService {
             }));
         }
 
+        // What to restore if the backend refuses the new configuration after it was persisted.
+        let previous = self
+            .config
+            .as_ref()
+            .filter(|c| c.is_configured())
+            .map(|c| (*c.current()).clone());
+
         // Persist first: if the disk refuses, the running state stays as it was.
         if let Some(cfg) = &self.config
             && let Err(e) = cfg.apply(share.clone())
@@ -219,9 +226,16 @@ impl SmbFrontControl for ControlService {
         if let Some(b) = &self.backend
             && let Err(e) = b.apply(&remote, &share)
         {
+            // The running state stays as it was, so must the file: otherwise a restart would
+            // come back with a configuration that was refused.
+            if let (Some(cfg), Some(prev)) = (&self.config, previous)
+                && let Err(re) = cfg.apply(prev)
+            {
+                eprintln!("janus-smbd: could not restore the previous configuration: {re}");
+            }
             return Ok(Response::new(Ack {
                 ok: false,
-                error: format!("failed to start the journal: {e}"),
+                error: format!("configuration refused: {e}"),
             }));
         }
 

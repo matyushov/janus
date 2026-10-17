@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use crate::config::{FlushPolicy, ShareConfig};
 use crate::control::WriteGate;
-use crate::grpc_backend::{GrpcBackend, JournalRuntime, JournalSettings};
+use crate::grpc_backend::{GrpcBackend, JournalRuntime, JournalSettings, destination_of};
 use crate::remote::RemoteClient;
 use crate::uploader::UploaderStats;
 use crate::vfs::{
@@ -52,9 +52,15 @@ impl SwitchBackend {
     }
 
     /// Install a backend built from `remote` and the share configuration (quota, journal).
-    /// Fails if the journal cannot be opened; the previous backend then stays in place.
+    /// Fails if the journal cannot be opened, or if it still holds unuploaded bytes for a
+    /// different destination (another endpoint or client certificate: those bytes belong to
+    /// the old receiver and must not flow to the new one); the previous backend then stays in
+    /// place. With an empty journal a changed destination is accepted, and the handles opened
+    /// for the old destination are retired.
     pub fn apply(&self, remote: &RemoteClient, share: &ShareConfig) -> std::io::Result<()> {
-        let backend = GrpcBackend::from_remote(remote, share.quota_bytes);
+        let destination = destination_of(share);
+        let backend = GrpcBackend::from_remote(remote, share.quota_bytes)
+            .with_destination(destination.clone());
         let backend = if share.journal.enabled {
             let dir = share
                 .journal
@@ -65,7 +71,14 @@ impl SwitchBackend {
                 local_journal: share.flush_policy == FlushPolicy::LocalJournal,
             };
             match self.journal_runtime().filter(|rt| rt.dir() == dir) {
-                Some(rt) => backend.with_journal_runtime(rt, settings),
+                Some(rt) => {
+                    if rt.retarget(&destination)? {
+                        // Handles of the old destination share this journal: they must not
+                        // append to it any more (their bytes would go to the new receiver).
+                        self.retire_sharing(&rt);
+                    }
+                    backend.with_journal_runtime(rt, settings)
+                }
                 None => backend.with_journal(&dir, settings)?,
             }
         } else {
@@ -73,6 +86,21 @@ impl SwitchBackend {
         };
         self.install(backend);
         Ok(())
+    }
+
+    /// Drop the open handles of every generation that writes into `rt`.
+    fn retire_sharing(&self, rt: &Arc<JournalRuntime>) {
+        let current = self.current.read().expect("backend lock poisoned");
+        let old = self.old.lock().expect("old poisoned");
+        for b in current
+            .iter()
+            .map(|(_, b)| b)
+            .chain(old.iter().map(|(_, b)| b))
+        {
+            if b.journal_runtime().is_some_and(|x| Arc::ptr_eq(x, rt)) {
+                b.retire_handles();
+            }
+        }
     }
 
     /// The journal of the current backend.

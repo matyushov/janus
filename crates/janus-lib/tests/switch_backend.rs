@@ -332,3 +332,136 @@ async fn shutdown_with_drain_refuses_to_stop_while_data_is_pending() {
     assert!((&mut r.shutdown_rx).await.is_ok());
     assert_eq!(r.srv.store.read_file("f").unwrap().len(), 4000);
 }
+
+// ---- a changed destination must not inherit the journal's unuploaded bytes ----
+
+#[tokio::test]
+async fn a_destination_change_with_unuploaded_data_is_refused_and_nothing_is_misrouted() {
+    let r = rig("destkeep").await;
+    let other = TestServer::start("destkeep-b", 0).await.unwrap();
+    let h =
+        r.sw.open("f", req(Disposition::Create))
+            .await
+            .unwrap()
+            .handle;
+    pause(&r, true);
+    r.sw.write(h, 0, &[5; 4000]).await.unwrap();
+    let before = r.sw.journal_runtime().unwrap();
+
+    // same journal directory, another receiver: its bytes belong to the first one
+    let ack = r
+        .svc
+        .configure(configure_j(other.addr.to_string(), &r.dir))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!ack.ok);
+    assert!(ack.error.contains("unuploaded"), "{}", ack.error);
+    assert!(Arc::ptr_eq(&before, &r.sw.journal_runtime().unwrap()));
+
+    // the running share is untouched: the old handle still works and the data goes home
+    r.sw.write(h, 4000, &[6; 10]).await.unwrap();
+    pause(&r, false);
+    let d = r
+        .svc
+        .drain(Request::new(DrainRequest { timeout_sec: 10 }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(d.drained);
+    assert_eq!(r.srv.store.read_file("f").unwrap().len(), 4010);
+    assert!(
+        !other.store.exists("f"),
+        "nothing may reach the other receiver"
+    );
+    r.sw.close(h).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_refused_configuration_is_rolled_back_in_the_persisted_config() {
+    let srv = TestServer::start("destrollback", 0).await.unwrap();
+    let other = TestServer::start("destrollback-b", 0).await.unwrap();
+    let dir = journal_dir("destrollback");
+    let gate = Arc::new(WriteGate::default());
+    let sw = Arc::new(SwitchBackend::new().with_gate(Arc::clone(&gate)));
+    let store = Arc::new(janus_lib::config::ConfigStore::in_memory());
+    let svc = ControlService::new(Arc::default(), gate)
+        .with_backend(Arc::clone(&sw))
+        .with_config(Arc::clone(&store));
+    assert!(
+        svc.configure(configure_j(srv.addr.to_string(), &dir))
+            .await
+            .unwrap()
+            .into_inner()
+            .ok
+    );
+    let h = sw.open("f", req(Disposition::Create)).await.unwrap().handle;
+    sw.journal_runtime().unwrap().uploader.set_paused(true);
+    sw.write(h, 0, &[1; 100]).await.unwrap();
+
+    let ack = svc
+        .configure(configure_j(other.addr.to_string(), &dir))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(!ack.ok);
+    assert_eq!(
+        store.current().appliance_endpoint,
+        srv.addr.to_string(),
+        "a restart must come back with the configuration that is actually running"
+    );
+    sw.journal_runtime().unwrap().uploader.set_paused(false);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[tokio::test]
+async fn a_destination_change_after_a_drain_is_accepted_and_retires_the_old_handles() {
+    let r = rig("destmove").await;
+    let other = TestServer::start("destmove-b", 0).await.unwrap();
+    let h_old =
+        r.sw.open("f", req(Disposition::Create))
+            .await
+            .unwrap()
+            .handle;
+    r.sw.write(h_old, 0, &[1; 1000]).await.unwrap();
+    let d = r
+        .svc
+        .drain(Request::new(DrainRequest { timeout_sec: 10 }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(d.drained);
+    assert_eq!(r.srv.store.read_file("f").unwrap().len(), 1000);
+
+    let ack = r
+        .svc
+        .configure(configure_j(other.addr.to_string(), &r.dir))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(ack.ok, "{}", ack.error);
+
+    // a handle of the old destination can no longer append to the shared journal
+    assert!(matches!(
+        r.sw.write(h_old, 1000, &[2; 10]).await,
+        Err(BackendError::BadHandle)
+    ));
+    // new opens go to the new receiver, and only there
+    let h_new =
+        r.sw.open("g", req(Disposition::Create))
+            .await
+            .unwrap()
+            .handle;
+    r.sw.write(h_new, 0, &[3; 50]).await.unwrap();
+    let d = r
+        .svc
+        .drain(Request::new(DrainRequest { timeout_sec: 10 }))
+        .await
+        .unwrap()
+        .into_inner();
+    assert!(d.drained);
+    assert_eq!(other.store.read_file("g").unwrap().len(), 50);
+    assert!(!r.srv.store.exists("g"));
+    assert_eq!(r.srv.store.read_file("f").unwrap().len(), 1000);
+    r.sw.close(h_new).await.unwrap();
+}

@@ -373,13 +373,20 @@ pub struct JournalRuntime {
     dir: PathBuf,
     /// Set when the journal was reopened with fsync (`LOCAL_JOURNAL`).
     durable: bool,
+    /// Who the unuploaded bytes belong to (see `destination_of`); empty = not tracked.
+    /// Mirrors the `destination` file in the journal directory.
+    destination: Mutex<String>,
 }
+
+/// Name of the file in the journal directory that remembers the journal's destination.
+const DESTINATION_FILE: &str = "destination";
 
 impl JournalRuntime {
     fn open(
         dir: &Path,
         settings: JournalSettings,
         target: Arc<dyn UploadTarget>,
+        destination: &str,
     ) -> std::io::Result<Arc<JournalRuntime>> {
         if tokio::runtime::Handle::try_current().is_err() {
             return Err(std::io::Error::other("the journal needs a tokio runtime"));
@@ -392,6 +399,10 @@ impl JournalRuntime {
                 ..Default::default()
             },
         )?;
+        // Unuploaded bytes recovered from disk belong to the destination they were written
+        // for; they must not silently flow to a different receiver (another machine's store).
+        // Checked before the uploader starts.
+        check_destination(dir, destination, report.replayed_bytes)?;
         if report.replayed_bytes > 0
             || report.dropped_tail_bytes > 0
             || !report.corrupt_segments.is_empty()
@@ -415,11 +426,31 @@ impl JournalRuntime {
             settings: RwLock::new(settings),
             dir: dir.to_owned(),
             durable: settings.local_journal,
+            destination: Mutex::new(destination.to_owned()),
         }))
     }
 
     pub fn dir(&self) -> &Path {
         &self.dir
+    }
+
+    /// Switch the journal to a new destination. Refused while it holds unuploaded bytes
+    /// (they belong to the old receiver); with an empty journal the destination is simply
+    /// recorded. `Ok(true)` = the destination really changed.
+    pub fn retarget(&self, destination: &str) -> std::io::Result<bool> {
+        let mut cur = self.destination.lock().expect("destination poisoned");
+        if *cur == destination {
+            return Ok(false);
+        }
+        let pending = self.journal.live_bytes();
+        if pending > 0 && !cur.is_empty() {
+            return Err(destination_changed_error(&self.dir, pending, &cur));
+        }
+        if !destination.is_empty() {
+            write_destination(&self.dir, destination)?;
+        }
+        *cur = destination.to_owned();
+        Ok(true)
     }
 
     pub fn settings(&self) -> JournalSettings {
@@ -467,6 +498,70 @@ async fn statfs_via(link: &Link, fallback_quota: u64) -> Result<FsStats> {
 }
 
 /// `(when, the answer or None if the receiver could not be asked, bytes uploaded by then)`.
+/// Identity of the receiver a share sends to: the endpoint (without scheme) plus the client
+/// identity, i.e. a hash of the client certificate file (or the Keychain reference). A change
+/// of either may mean another machine's store on the receiver, so the journal treats it as a
+/// different destination.
+pub fn destination_of(share: &crate::config::ShareConfig) -> String {
+    use sha2::{Digest, Sha256};
+    let endpoint = share
+        .appliance_endpoint
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    let identity = if !share.client_cert_path.is_empty() {
+        match std::fs::read(&share.client_cert_path) {
+            Ok(bytes) => Sha256::digest(&bytes)
+                .iter()
+                .map(|b| format!("{b:02x}"))
+                .collect::<String>(),
+            // unreadable now: the connection will fail anyway; keep the path as the identity
+            Err(_) => format!("path:{}", share.client_cert_path),
+        }
+    } else if !share.tls_identity_ref.is_empty() {
+        format!("ref:{}", share.tls_identity_ref)
+    } else {
+        "plain".to_owned()
+    };
+    format!("{endpoint}|{identity}")
+}
+
+fn destination_changed_error(dir: &Path, pending: u64, old: &str) -> std::io::Error {
+    std::io::Error::other(format!(
+        "the journal {} holds {pending} unuploaded bytes for another destination ({old}); \
+         let them upload first (janus-cli client drain), or use another journal directory",
+        dir.display()
+    ))
+}
+
+fn write_destination(dir: &Path, destination: &str) -> std::io::Result<()> {
+    crate::journal::write_atomic(&dir.join(DESTINATION_FILE), destination.as_bytes(), true)
+}
+
+/// Compare the journal directory's recorded destination with `destination`. Unuploaded bytes
+/// (`pending`) for a different destination are an error; an empty journal, or one without a
+/// record (created before records existed, or brand new), just takes the new destination.
+fn check_destination(dir: &Path, destination: &str, pending: u64) -> std::io::Result<()> {
+    if destination.is_empty() {
+        return Ok(());
+    }
+    match std::fs::read_to_string(dir.join(DESTINATION_FILE)) {
+        Ok(old) => {
+            let old = old.trim();
+            if old == destination {
+                return Ok(());
+            }
+            if pending > 0 {
+                return Err(destination_changed_error(dir, pending, old));
+            }
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => return Err(e),
+    }
+    write_destination(dir, destination)
+}
+
 type QuotaCache = Option<(Instant, Option<FsStats>, u64)>;
 
 /// How long a cached `statfs` may be used for the quota check of a write.
@@ -484,6 +579,8 @@ pub struct GrpcBackend {
     /// `(when, answer)` of the last `statfs` taken for a quota check; `None` = it failed.
     quota_cache: Arc<Mutex<QuotaCache>>,
     quota_refreshing: Arc<AtomicBool>,
+    /// Who this backend talks to (see `destination_of`); empty = not tracked.
+    destination: String,
 }
 
 impl GrpcBackend {
@@ -502,7 +599,22 @@ impl GrpcBackend {
             journal: None,
             quota_cache: Arc::default(),
             quota_refreshing: Arc::default(),
+            destination: String::new(),
         }
+    }
+
+    /// Name the receiver this backend sends to (`destination_of`). Set before `with_journal`:
+    /// the journal remembers whom its unuploaded bytes belong to and refuses to hand them to
+    /// another destination.
+    pub fn with_destination(mut self, destination: impl Into<String>) -> Self {
+        self.destination = destination.into();
+        self
+    }
+
+    /// Forget every open handle: they were opened for a destination this backend must no
+    /// longer write to. Operations on them fail with `BadHandle`.
+    pub fn retire_handles(&self) {
+        self.handles.lock().expect("handle table poisoned").clear();
     }
 
     fn link_mut(&mut self) -> &mut Link {
@@ -539,7 +651,12 @@ impl GrpcBackend {
     /// Enable the write-ahead journal in `dir` (recovering whatever it holds). Call after the
     /// link is configured, inside a tokio runtime.
     pub fn with_journal(mut self, dir: &Path, settings: JournalSettings) -> std::io::Result<Self> {
-        self.journal = Some(JournalRuntime::open(dir, settings, self.target())?);
+        self.journal = Some(JournalRuntime::open(
+            dir,
+            settings,
+            self.target(),
+            &self.destination,
+        )?);
         Ok(self)
     }
 
@@ -1250,10 +1367,14 @@ impl StorageBackend for GrpcBackend {
             // Data first: the source's bytes reach the receiver under the old name, and a
             // restart must not replay them under it afterwards.
             self.settle_uploaded(&src).await?;
-            rt.journal.forget_under(&src).map_err(BackendError::Io)?;
             if replace {
-                self.settle_discard(&dst).await?;
+                // The target's unuploaded bytes are NOT discarded up front: if the receiver
+                // then refuses the rename (missing source, network error), the target still
+                // exists and those writes would be lost. They are uploaded first and simply
+                // replaced by the rename; the cost is some wasted upload, never data loss.
+                self.settle_uploaded(&dst).await?;
             }
+            rt.journal.forget_under(&src).map_err(BackendError::Io)?;
         }
         self.bundle_ok(
             false,

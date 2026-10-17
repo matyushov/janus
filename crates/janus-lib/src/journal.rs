@@ -193,7 +193,7 @@ fn private_file_opts() -> OpenOptions {
 }
 
 /// tmp file → (fsync) → rename; the file keeps mode 0600.
-fn write_atomic(path: &Path, body: &[u8], durable: bool) -> io::Result<()> {
+pub(crate) fn write_atomic(path: &Path, body: &[u8], durable: bool) -> io::Result<()> {
     let tmp = path.with_extension("tmp");
     let r = (|| {
         let mut f = private_file_opts()

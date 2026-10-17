@@ -402,7 +402,7 @@ async fn delete_and_replacing_rename_discard_unuploaded_data() {
     r.backend.close(a).await.unwrap();
     assert!(!r.srv.store.exists("a"));
     assert_eq!(r.backlog(), 5000);
-    // renaming `c` over `b` discards b's bytes, c's data goes first
+    // renaming `c` over `b`: c's data goes first, b's bytes are uploaded and then replaced
     let c = r.create("c").await;
     r.backend.write(c, 0, &[3; 100]).await.unwrap();
     r.pause(false);
@@ -411,6 +411,31 @@ async fn delete_and_replacing_rename_discard_unuploaded_data() {
     assert_eq!(r.on_receiver("b").unwrap(), vec![3; 100]);
     assert!(!r.srv.store.exists("a"));
     assert!(!r.srv.store.exists("c"));
+    r.backend.close(b).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_refused_replacing_rename_does_not_lose_the_targets_unuploaded_data() {
+    let r = rig("renamefail").await;
+    let b = r.create("b").await;
+    r.pause(true);
+    r.backend.write(b, 0, &[2; 5000]).await.unwrap();
+    // the source does not exist, so the receiver will refuse; until then the target's
+    // bytes must not be discarded, so the rename waits for their upload
+    let rename = r.backend.rename("missing", "b", true);
+    tokio::pin!(rename);
+    assert!(
+        tokio::time::timeout(MS(300), &mut rename).await.is_err(),
+        "the replacing rename must upload the target's bytes first, not drop them"
+    );
+    r.pause(false);
+    assert!(
+        rename.await.is_err(),
+        "the receiver refuses a missing source"
+    );
+    r.drain().await;
+    assert_eq!(r.on_receiver("b").unwrap(), vec![2; 5000]);
+    assert_eq!(r.backend.read(b, 0, 5000).await.unwrap(), vec![2; 5000]);
     r.backend.close(b).await.unwrap();
 }
 
@@ -612,4 +637,61 @@ async fn small_files_round_trip() {
         );
     }
     assert_eq!(r.backlog(), 0);
+}
+
+fn backend_to(
+    addr: SocketAddr,
+    dir: &std::path::Path,
+    destination: &str,
+) -> std::io::Result<GrpcBackend> {
+    let remote = RemoteClient::connect_lazy(&RemoteConfig {
+        endpoint: addr.to_string(),
+        timeouts: timeouts(),
+        ..Default::default()
+    })
+    .unwrap();
+    GrpcBackend::from_remote(&remote, 0)
+        .with_destination(destination)
+        .with_journal(
+            dir,
+            JournalSettings {
+                max_backlog: 64 << 20,
+                local_journal: false,
+            },
+        )
+}
+
+#[tokio::test]
+async fn a_journal_with_unuploaded_data_is_not_handed_to_another_destination_after_a_restart() {
+    let home = TestServer::start("destrestart-a", 0).await.unwrap();
+    let other = TestServer::start("destrestart-b", 0).await.unwrap();
+    let dir = tmp_journal_dir("destrestart");
+    {
+        let b = backend_to(home.addr, &dir, "a:1|id-a").ok().unwrap();
+        let h = b.open("f", req(Disposition::Create)).await.unwrap().handle;
+        b.journal_runtime().unwrap().uploader.set_paused(true);
+        b.write(h, 0, &[1; 3000]).await.unwrap();
+        // "kill -9": the bytes stay in the journal
+    }
+    // the config now points elsewhere: refused, nothing reaches either receiver
+    let err = backend_to(other.addr, &dir, "b:2|id-b")
+        .err()
+        .expect("must be refused");
+    assert!(err.to_string().contains("unuploaded"), "{err}");
+    assert!(!other.store.exists("f"));
+
+    // the original destination replays everything
+    let b = backend_to(home.addr, &dir, "a:1|id-a").ok().unwrap();
+    let (ok, left) = b
+        .journal_runtime()
+        .unwrap()
+        .drain(Duration::from_secs(10))
+        .await;
+    assert!(ok, "left {left}");
+    assert_eq!(home.store.read_file("f").unwrap(), vec![1; 3000]);
+    drop(b);
+
+    // an empty journal can move to another destination
+    assert!(backend_to(other.addr, &dir, "b:2|id-b").is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
 }

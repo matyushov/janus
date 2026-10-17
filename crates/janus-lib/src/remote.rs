@@ -13,7 +13,6 @@
 //! UPGRADE(keychain): `tls_identity_ref` (client identity from the macOS Keychain) is not
 //! implemented; only the file mode is.
 
-use crate::jlog;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -184,6 +183,7 @@ pub fn is_transport_failure(s: &tonic::Status) -> bool {
 fn warn_if_wide(path: &str) {
     #[cfg(unix)]
     {
+        use crate::jlog;
         use std::os::unix::fs::PermissionsExt;
         if let Ok(md) = std::fs::metadata(path)
             && md.permissions().mode() & 0o077 != 0

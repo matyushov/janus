@@ -1,9 +1,11 @@
 //! Per-connection state: dialect, preauth chain, credits, sessions, async operations.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use smb_wire::frame::Dialect;
+use tokio::sync::Notify;
 
 use crate::session::{Session, SessionState};
 
@@ -128,20 +130,147 @@ impl CreditWindow {
     }
 }
 
-/// Long operations (FLUSH with sync-through, CHANGE_NOTIFY, Lock):
-/// interim STATUS_PENDING with an async_id → the final reply on completion.
+/// Timing of the asynchronous (interim `STATUS_PENDING`) path.
+#[derive(Debug, Clone, Copy)]
+pub struct AsyncConfig {
+    /// An operation still running after this long gets an interim `STATUS_PENDING`.
+    pub interim_after: Duration,
+    /// An operation still running after this long is answered with an error. Only the wait is
+    /// abandoned: the backend call (and the journal behind it) carries on.
+    pub max_wait: Duration,
+}
+
+/// Default for `AsyncConfig::interim_after`: well below the 30 s the macOS client waits.
+pub const DEFAULT_INTERIM_AFTER: Duration = Duration::from_millis(1500);
+/// Default for `AsyncConfig::max_wait`.
+pub const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(600);
+
+impl Default for AsyncConfig {
+    fn default() -> Self {
+        AsyncConfig {
+            interim_after: DEFAULT_INTERIM_AFTER,
+            max_wait: DEFAULT_MAX_WAIT,
+        }
+    }
+}
+
+/// A request that has left the synchronous path: its reply comes when the backend is done.
+#[derive(Debug)]
+pub struct PendingOp {
+    pub async_id: u64,
+    pub message_id: u64,
+    pub session_id: u64,
+    pub command: smb_wire::Command,
+    pub started: Instant,
+    /// When the interim response is due; `None` once it has been sent.
+    pub interim_due: Option<Instant>,
+    /// Wakes the task waiting for the backend when the client cancels.
+    pub cancel: Arc<Notify>,
+}
+
+/// Long operations (FLUSH, CLOSE, SET_INFO that wait for the journal): after a short time the
+/// client gets an interim STATUS_PENDING with an AsyncId, the final reply follows on completion
+/// (MS-SMB2 §3.3.4.2). Entries live from the moment the request is taken until its final reply.
 #[derive(Debug, Default)]
 pub struct AsyncOpRegistry {
-    next_async_id: u64,
+    last_async_id: u64,
+    ops: HashMap<u64, PendingOp>,
 }
 
 impl AsyncOpRegistry {
-    pub fn register(&mut self, _message_id: u64) -> u64 {
-        todo!("allocate async_id, remember context for the final response")
+    /// Track a request; the AsyncId is allocated now (non-zero, unique on the connection) but
+    /// only becomes visible to the client with the interim response.
+    pub fn register(
+        &mut self,
+        message_id: u64,
+        session_id: u64,
+        command: smb_wire::Command,
+        now: Instant,
+        interim_after: Duration,
+    ) -> (u64, Arc<Notify>) {
+        self.last_async_id += 1;
+        let async_id = self.last_async_id;
+        let cancel = Arc::new(Notify::new());
+        self.ops.insert(
+            async_id,
+            PendingOp {
+                async_id,
+                message_id,
+                session_id,
+                command,
+                started: now,
+                interim_due: Some(now + interim_after),
+                cancel: Arc::clone(&cancel),
+            },
+        );
+        (async_id, cancel)
     }
 
-    pub fn complete(&mut self, _async_id: u64) {
-        todo!("match and send the final response via write_loop")
+    /// The earliest moment an interim response is due.
+    pub fn next_interim_due(&self) -> Option<Instant> {
+        self.ops.values().filter_map(|o| o.interim_due).min()
+    }
+
+    /// Operations whose interim response is due at `now`; marks them as announced.
+    pub fn take_due(&mut self, now: Instant) -> Vec<(u64, u64, u64, smb_wire::Command, Instant)> {
+        let mut due: Vec<_> = self
+            .ops
+            .values_mut()
+            .filter(|o| o.interim_due.is_some_and(|t| t <= now))
+            .map(|o| {
+                o.interim_due = None;
+                (o.async_id, o.message_id, o.session_id, o.command, o.started)
+            })
+            .collect();
+        due.sort_unstable_by_key(|d| d.0);
+        due
+    }
+
+    /// Whether the client has been told about this operation (interim sent).
+    pub fn announced(&self, async_id: u64) -> bool {
+        self.ops
+            .get(&async_id)
+            .is_some_and(|o| o.interim_due.is_none())
+    }
+
+    /// SMB2 CANCEL (MS-SMB2 §3.3.5.16): by AsyncId when the request carries the async flag,
+    /// otherwise by MessageId within the session. Returns whether an operation was found.
+    pub fn cancel(&mut self, by_async: bool, id: u64, session_id: u64) -> bool {
+        let found = self.ops.values().find(|o| {
+            if by_async {
+                o.async_id == id && o.interim_due.is_none()
+            } else {
+                o.message_id == id && o.session_id == session_id
+            }
+        });
+        match found {
+            Some(o) => {
+                o.cancel.notify_one();
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The final reply is being sent: forget the operation.
+    pub fn complete(&mut self, async_id: u64) -> Option<PendingOp> {
+        self.ops.remove(&async_id)
+    }
+
+    pub fn len(&self) -> usize {
+        self.ops.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ops.is_empty()
+    }
+
+    /// Age of the oldest pending operation.
+    pub fn oldest_age(&self, now: Instant) -> Option<Duration> {
+        self.ops
+            .values()
+            .map(|o| now.saturating_duration_since(o.started))
+            .max()
     }
 }
 
@@ -202,5 +331,48 @@ mod tests {
             assert_eq!(w.grant(1), 1);
         }
         assert_eq!(w.outstanding(), 1);
+    }
+
+    #[test]
+    fn registry_allocates_unique_nonzero_ids_and_announces_due_ops() {
+        use smb_wire::Command;
+        let t0 = Instant::now();
+        let mut r = AsyncOpRegistry::default();
+        let (a, _) = r.register(10, 7, Command::Flush, t0, Duration::from_secs(1));
+        let (b, _) = r.register(11, 7, Command::Close, t0, Duration::from_secs(2));
+        assert!(a != 0 && b != 0 && a != b);
+        assert_eq!(r.next_interim_due(), Some(t0 + Duration::from_secs(1)));
+        assert!(r.take_due(t0).is_empty());
+        let due = r.take_due(t0 + Duration::from_secs(1));
+        assert_eq!(due, vec![(a, 10, 7, Command::Flush, t0)]);
+        assert!(r.announced(a) && !r.announced(b));
+        assert_eq!(r.next_interim_due(), Some(t0 + Duration::from_secs(2)));
+        assert_eq!(r.len(), 2);
+        assert_eq!(
+            r.oldest_age(t0 + Duration::from_secs(5)),
+            Some(Duration::from_secs(5))
+        );
+        assert!(r.complete(a).is_some());
+        assert!(r.complete(a).is_none());
+        assert_eq!(r.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_matches_by_message_id_or_async_id_and_wakes_the_waiter() {
+        use smb_wire::Command;
+        let t0 = Instant::now();
+        let mut r = AsyncOpRegistry::default();
+        let (a, wake) = r.register(10, 7, Command::Flush, t0, Duration::from_secs(1));
+        // wrong session / unknown id
+        assert!(!r.cancel(false, 10, 8));
+        assert!(!r.cancel(false, 99, 7));
+        // by AsyncId only once announced
+        assert!(!r.cancel(true, a, 7));
+        assert!(r.cancel(false, 10, 7));
+        tokio::time::timeout(Duration::from_millis(100), wake.notified())
+            .await
+            .expect("woken");
+        r.take_due(t0 + Duration::from_secs(1));
+        assert!(r.cancel(true, a, 7));
     }
 }

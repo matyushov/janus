@@ -28,6 +28,7 @@ fn timeouts(request: u64, budget: u64) -> Timeouts {
         fail_fast: MS(100),
         budget: MS(budget),
         barrier: MS(budget),
+        barrier_down_after: MS(budget),
         // Keepalive is effectively off unless a test overrides it.
         keepalive_interval: Duration::from_secs(3600),
         keepalive_timeout: Duration::from_secs(3600),

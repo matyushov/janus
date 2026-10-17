@@ -19,6 +19,7 @@ pub mod grpc_backend;
 pub mod journal;
 #[cfg(feature = "backend-local")]
 pub mod local_backend;
+pub mod log;
 pub mod model;
 pub mod observability;
 pub mod profile;

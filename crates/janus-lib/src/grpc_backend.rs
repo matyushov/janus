@@ -21,6 +21,7 @@
 //! rename and delete are NOT retried: a lost reply would turn success into a spurious
 //! `AlreadyExists`/`NotFound`.
 
+use crate::jlog;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -407,8 +408,10 @@ impl JournalRuntime {
             || report.dropped_tail_bytes > 0
             || !report.corrupt_segments.is_empty()
         {
-            eprintln!(
-                "janus: journal {} recovered: {} unuploaded bytes in {} records, \
+            jlog!(
+                Info,
+                "backend",
+                "journal {} recovered: {} unuploaded bytes in {} records, \
                  {} torn bytes dropped, corrupt segments {:?}",
                 dir.display(),
                 report.replayed_bytes,
@@ -940,7 +943,11 @@ impl GrpcBackend {
         }
         // The same long wait as a flush: the file's data has to be there first.
         rt.uploader
-            .wait_uploaded(&ids, Instant::now() + self.link.timeouts.barrier)
+            .wait_uploaded_unless_down(
+                &ids,
+                Instant::now() + self.link.timeouts.barrier,
+                Some(self.link.timeouts.barrier_down_after),
+            )
             .await
             .map_err(map_upload_err)
     }
@@ -1287,7 +1294,11 @@ impl GrpcBackend {
         }
         let id = rt.journal.intern(path);
         rt.uploader
-            .flush_barrier(id, Instant::now() + self.link.timeouts.barrier)
+            .flush_barrier_unless_down(
+                id,
+                Instant::now() + self.link.timeouts.barrier,
+                Some(self.link.timeouts.barrier_down_after),
+            )
             .await
             .map_err(map_upload_err)
     }

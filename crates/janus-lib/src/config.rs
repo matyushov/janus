@@ -85,6 +85,33 @@ impl JournalConfig {
     }
 }
 
+/// How long the SMB layer keeps a client waiting for FLUSH / CLOSE / SET_INFO that depend on
+/// the receiver. `0` means the built-in default for each field.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SmbWaitConfig {
+    /// After this long a still-running operation gets an interim STATUS_PENDING (default 1500).
+    pub interim_after_ms: u32,
+    /// The ceiling: the client is then answered with an error (default 600).
+    pub max_wait_sec: u32,
+    /// A receiver failing continuously this long ends the wait early with an error (default 120).
+    pub down_after_sec: u32,
+}
+
+impl SmbWaitConfig {
+    pub fn interim_after(&self) -> Option<std::time::Duration> {
+        (self.interim_after_ms > 0)
+            .then(|| std::time::Duration::from_millis(self.interim_after_ms.into()))
+    }
+    pub fn max_wait(&self) -> Option<std::time::Duration> {
+        (self.max_wait_sec > 0).then(|| std::time::Duration::from_secs(self.max_wait_sec.into()))
+    }
+    pub fn down_after(&self) -> Option<std::time::Duration> {
+        (self.down_after_sec > 0)
+            .then(|| std::time::Duration::from_secs(self.down_after_sec.into()))
+    }
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(default)]
 pub struct ShareConfig {
@@ -110,6 +137,7 @@ pub struct ShareConfig {
     /// AAPL, POSIX-ext and so on. See profile::ClientProfile.
     pub profile: crate::profile::ClientProfile,
     pub journal: JournalConfig,
+    pub smb_wait: SmbWaitConfig,
 }
 
 mod pem_text {

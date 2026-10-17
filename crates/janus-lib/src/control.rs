@@ -6,13 +6,14 @@
 //!
 //! Wire types are generated from the contract (`janus_proto::v1`).
 
+use crate::jlog;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use janus_proto::v1::smb_front_control_server::SmbFrontControl;
 use janus_proto::v1::{
-    Ack, ConfigureRequest, DiagnosticsBundle, DrainReply, DrainRequest, Empty, Event, Readiness,
-    RotateRequest, ShutdownRequest, StatusReply,
+    Ack, ConfigureRequest, DiagnosticsBundle, DrainReply, DrainRequest, Empty, Event, LogLine,
+    LogRequest, Readiness, RotateRequest, ShutdownRequest, StatusReply,
 };
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
@@ -74,7 +75,11 @@ impl DaemonState {
                 remote: Some(remote),
             },
             Err(e) => {
-                eprintln!("janus: stored configuration is unusable ({e}); waiting for configure");
+                jlog!(
+                    Warn,
+                    "control",
+                    "stored configuration is unusable ({e}); waiting for configure"
+                );
                 DaemonState::default()
             }
         }
@@ -94,6 +99,8 @@ pub struct ControlService {
     credentials: Option<Arc<crate::credentials::CredentialStore>>,
     /// Persistent configuration; `None` = memory only (tests).
     config: Option<Arc<ConfigStore>>,
+    /// SMB operations currently waiting behind an interim response (shown by `status`).
+    pending_ops: Option<Arc<crate::observability::PendingOps>>,
     /// The share's backend; `Configure` swaps a new `GrpcBackend` into it.
     #[cfg(feature = "backend-grpc")]
     backend: Option<Arc<crate::switch_backend::SwitchBackend>>,
@@ -109,6 +116,7 @@ impl ControlService {
             shutdown_drain_timeout: SHUTDOWN_DRAIN_TIMEOUT,
             credentials: None,
             config: None,
+            pending_ops: None,
             #[cfg(feature = "backend-grpc")]
             backend: None,
         }
@@ -129,6 +137,12 @@ impl ControlService {
     /// Persist every accepted `Configure` through this store.
     pub fn with_config(mut self, store: Arc<ConfigStore>) -> Self {
         self.config = Some(store);
+        self
+    }
+
+    /// Report the SMB layer's pending operations in `status`.
+    pub fn with_pending_ops(mut self, p: Arc<crate::observability::PendingOps>) -> Self {
+        self.pending_ops = Some(p);
         self
     }
 
@@ -173,6 +187,11 @@ fn share_from_request(req: &ConfigureRequest) -> ShareConfig {
             enabled: req.journal_enabled.unwrap_or(true),
             dir: req.journal_dir.clone(),
             max_backlog_bytes: req.max_backlog_bytes,
+        },
+        smb_wait: crate::config::SmbWaitConfig {
+            interim_after_ms: req.smb_interim_after_ms,
+            max_wait_sec: req.smb_max_wait_sec,
+            down_after_sec: req.smb_down_after_sec,
         },
     }
 }
@@ -231,7 +250,11 @@ impl SmbFrontControl for ControlService {
             if let (Some(cfg), Some(prev)) = (&self.config, previous)
                 && let Err(re) = cfg.apply(prev)
             {
-                eprintln!("janus-smbd: could not restore the previous configuration: {re}");
+                jlog!(
+                    Error,
+                    "control",
+                    "could not restore the previous configuration: {re}"
+                );
             }
             return Ok(Response::new(Ack {
                 ok: false,
@@ -302,6 +325,11 @@ impl SmbFrontControl for ControlService {
             ),
             ..Default::default()
         };
+        if let Some(p) = &self.pending_ops {
+            let (n, oldest) = p.snapshot();
+            reply.pending_smb_ops = n as u32;
+            reply.oldest_pending_smb_op_ms = oldest.map_or(0, |d| d.as_millis() as u64);
+        }
         #[cfg(feature = "backend-grpc")]
         if let Some(b) = &self.backend {
             reply.open_handles = b.open_handles() as u32;
@@ -360,6 +388,67 @@ impl SmbFrontControl for ControlService {
         _req: Request<Empty>,
     ) -> Result<Response<Self::WatchEventsStream>, Status> {
         Err(Status::unimplemented("WatchEvents: TODO (EventBus)"))
+    }
+
+    type StreamLogsStream =
+        std::pin::Pin<Box<dyn tokio_stream::Stream<Item = Result<LogLine, Status>> + Send>>;
+
+    async fn stream_logs(
+        &self,
+        req: Request<LogRequest>,
+    ) -> Result<Response<Self::StreamLogsStream>, Status> {
+        use crate::log;
+        let req = req.into_inner();
+        let filter = log::Filter {
+            min_level: Some(log::Level::from_u32(req.min_level)),
+            components: req.components,
+            contains: req.contains,
+        };
+        let (old, mut rx) = log::subscribe(req.tail as usize, &filter);
+        let to_msg = |l: log::Line| LogLine {
+            seq: l.seq,
+            unix_ms: l.unix_ms,
+            level: l.level as u32,
+            component: l.component.to_owned(),
+            text: l.text,
+        };
+        let (tx, out) = tokio::sync::mpsc::channel(256);
+        tokio::spawn(async move {
+            for l in old {
+                if tx.send(Ok(to_msg(l))).await.is_err() {
+                    return;
+                }
+            }
+            if !req.follow {
+                return;
+            }
+            loop {
+                match rx.recv().await {
+                    Ok(l) if filter.matches(&l) => {
+                        if tx.send(Ok(to_msg(l))).await.is_err() {
+                            return;
+                        }
+                    }
+                    Ok(_) => {}
+                    // The reader was too slow; say so instead of silently skipping lines.
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(n)) => {
+                        let note = LogLine {
+                            level: log::Level::Warn as u32,
+                            component: "control".into(),
+                            text: format!("log stream lagged: {n} lines skipped"),
+                            ..Default::default()
+                        };
+                        if tx.send(Ok(note)).await.is_err() {
+                            return;
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+        });
+        Ok(Response::new(Box::pin(
+            tokio_stream::wrappers::ReceiverStream::new(out),
+        )))
     }
 
     async fn rotate_credentials(

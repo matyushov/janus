@@ -57,8 +57,11 @@ pub struct Cli {
 #[derive(Debug, PartialEq, Eq)]
 pub enum Command {
     // --- common to both sides ---
-    /// `status` → Status of the corresponding service.
-    Status,
+    /// `status [--watch [<sec>]]` → Status of the corresponding service; with `--watch` it is
+    /// redrawn every `<sec>` seconds (default 1) until Ctrl-C.
+    Status {
+        watch: Option<std::time::Duration>,
+    },
     /// `events` → WatchEvents (a stream to stdout, Ctrl-C to exit).
     Events,
     /// `diag --out <path>` → GetDiagnostics: a tar.gz into a file.
@@ -79,6 +82,8 @@ pub enum Command {
     Drain {
         timeout_sec: u32,
     },
+    /// `logs [-f] [-n N] [--level L] [--component a,b] [--grep TEXT]` → StreamLogs.
+    Logs(LogsArgs),
     /// `quiesce` / `resume` → the write gate.
     Quiesce,
     Resume,
@@ -108,6 +113,25 @@ pub struct ConfigureArgs {
     pub max_backlog_mib: u64,
     /// `--flush-policy local-journal`: fsync = fsync of the journal (unsafe for backups).
     pub local_journal: bool,
+    /// `--interim-after <ms>`, `--max-wait <sec>`, `--down-after <sec>`; 0 = the daemon default.
+    pub interim_after_ms: u32,
+    pub max_wait_sec: u32,
+    pub down_after_sec: u32,
+}
+
+/// Parameters of `client logs` (the daemon's log, like `tail`).
+#[derive(Debug, PartialEq, Eq)]
+pub struct LogsArgs {
+    /// `-f` / `--follow`: keep streaming new lines.
+    pub follow: bool,
+    /// `-n N`: how many of the latest lines to show first (default 100).
+    pub tail: u32,
+    /// `--level debug|info|warn|error`: the lowest level shown (default info).
+    pub level: u32,
+    /// `--component smb,daemon,backend,control`: only these (default all).
+    pub components: Vec<String>,
+    /// `--grep TEXT`: only lines containing it (case-insensitive).
+    pub grep: String,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -123,7 +147,7 @@ Sides:
   server     janus-receiverd — receiver (127.0.0.1:50052)
 
 Commands (both sides):
-  status                    daemon status
+  status [--watch [<sec>]]  daemon status (--watch redraws it every <sec>, default 1)
   events                    event stream
   diag --out <path>         dump a diagnostic bundle
   shutdown [--drain]        stop the daemon (--drain is client-only)
@@ -141,6 +165,14 @@ Commands (client only):
                             --journal off = every write goes to the server at once;
                             --max-backlog = unuploaded data the journal may hold (default 1024);
                             local-journal = fsync only syncs the journal: UNSAFE for backups
+            [--interim-after <ms>] [--max-wait <sec>] [--down-after <sec>]
+                            how long a FLUSH/CLOSE/RENAME may keep the SMB client waiting for the
+                            server: interim (still working) reply after <ms> (default 1500); an
+                            error after <sec> (600); an error early if the server has been
+                            failing for <sec> (120)
+  logs [-f] [-n <N>] [--level debug|info|warn|error] [--component <a,b>] [--grep <text>]
+                            the daemon log, like tail: the last N lines (default 100) and with
+                            -f new ones as they appear; components: smb, daemon, backend, control
   drain [--timeout <sec>]   flush pending data (default 300)
   quiesce | resume          pause/resume accepting writes
 
@@ -171,7 +203,23 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, ParseError>
 
     let command = match (target, cmd.as_str()) {
         // common
-        (_, "status") => Command::Status,
+        (_, "status") => {
+            let mut watch = None;
+            if optional_flag(&mut args, "--watch") {
+                let secs = match args.peek() {
+                    Some(v) if !v.starts_with('-') => {
+                        let v = args.next().expect("peeked");
+                        v.parse::<f64>()
+                            .ok()
+                            .filter(|s| *s >= 0.1)
+                            .ok_or_else(|| ParseError(format!("--watch: bad interval: {v}")))?
+                    }
+                    _ => 1.0,
+                };
+                watch = Some(std::time::Duration::from_secs_f64(secs));
+            }
+            Command::Status { watch }
+        }
         (_, "events") => Command::Events,
         (_, "diag") => Command::Diag {
             out: required_value(&mut args, "--out", "diag")?.into(),
@@ -231,6 +279,23 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, ParseError>
                         )));
                     }
                 },
+                interim_after_ms: 0,
+                max_wait_sec: 0,
+                down_after_sec: 0,
+            };
+            let mut number = |name: &str| -> Result<u32, ParseError> {
+                match f.remove(name) {
+                    Some(v) => v
+                        .parse()
+                        .map_err(|_| ParseError(format!("{name}: not a number: {v}"))),
+                    None => Ok(0),
+                }
+            };
+            let cfg = ConfigureArgs {
+                interim_after_ms: number("--interim-after")?,
+                max_wait_sec: number("--max-wait")?,
+                down_after_sec: number("--down-after")?,
+                ..cfg
             };
             if let Some((unknown, _)) = f.into_iter().next() {
                 return Err(ParseError(format!("configure: unknown flag {unknown}")));
@@ -240,6 +305,59 @@ pub fn parse<I: IntoIterator<Item = String>>(args: I) -> Result<Cli, ParseError>
                 target,
                 command: Command::Configure(cfg),
             });
+        }
+        (Target::Client, "logs") => {
+            let mut a = LogsArgs {
+                follow: false,
+                tail: 100,
+                level: 1,
+                components: Vec::new(),
+                grep: String::new(),
+            };
+            while let Some(flag) = args.peek().cloned() {
+                let value = |args: &mut std::iter::Peekable<_>| -> Result<String, ParseError> {
+                    args.next();
+                    args.next()
+                        .ok_or_else(|| ParseError(format!("{flag} requires a value")))
+                };
+                match flag.as_str() {
+                    "-f" | "--follow" => {
+                        args.next();
+                        a.follow = true;
+                    }
+                    "-n" => {
+                        let v = value(&mut args)?;
+                        a.tail = v
+                            .parse()
+                            .map_err(|_| ParseError(format!("-n: not a number: {v}")))?;
+                    }
+                    "--level" => {
+                        let v = value(&mut args)?;
+                        a.level = match v.to_ascii_lowercase().as_str() {
+                            "debug" => 0,
+                            "info" => 1,
+                            "warn" | "warning" => 2,
+                            "error" => 3,
+                            _ => {
+                                return Err(ParseError(format!(
+                                    "--level: expected debug|info|warn|error, got {v}"
+                                )));
+                            }
+                        };
+                    }
+                    "--component" => {
+                        let v = value(&mut args)?;
+                        a.components = v
+                            .split(',')
+                            .filter(|c| !c.is_empty())
+                            .map(str::to_owned)
+                            .collect();
+                    }
+                    "--grep" => a.grep = value(&mut args)?,
+                    _ => break,
+                }
+            }
+            Command::Logs(a)
         }
         (Target::Client, "drain") => {
             let timeout_sec = match optional_value(&mut args, "--timeout")? {
@@ -344,7 +462,7 @@ mod tests {
     fn client_status_uses_fixed_addr() {
         let cli = parse_ok(&["client", "status"]);
         assert_eq!(cli.target, Target::Client);
-        assert_eq!(cli.command, Command::Status);
+        assert_eq!(cli.command, Command::Status { watch: None });
         assert_eq!(Target::Client.addr(), CLIENT_ADDR);
     }
 
@@ -408,7 +526,88 @@ mod tests {
                 journal_dir: String::new(),
                 max_backlog_mib: 0,
                 local_journal: false,
+                interim_after_ms: 0,
+                max_wait_sec: 0,
+                down_after_sec: 0,
             })
+        );
+    }
+
+    #[test]
+    fn status_watch_and_logs_flags() {
+        use std::time::Duration;
+        let c = parse_ok(&["client", "status", "--watch"]);
+        assert_eq!(
+            c.command,
+            Command::Status {
+                watch: Some(Duration::from_secs(1))
+            }
+        );
+        let c = parse_ok(&["server", "status", "--watch", "0.5"]);
+        assert_eq!(
+            c.command,
+            Command::Status {
+                watch: Some(Duration::from_millis(500))
+            }
+        );
+        assert!(parse(["client", "status", "--watch", "x"].map(String::from)).is_err());
+
+        let c = parse_ok(&["client", "logs"]);
+        let Command::Logs(a) = c.command else {
+            panic!("logs expected")
+        };
+        assert_eq!((a.follow, a.tail, a.level), (false, 100, 1));
+        let c = parse_ok(&[
+            "client",
+            "logs",
+            "-f",
+            "-n",
+            "20",
+            "--level",
+            "warn",
+            "--component",
+            "smb,daemon",
+            "--grep",
+            "async",
+        ]);
+        let Command::Logs(a) = c.command else {
+            panic!("logs expected")
+        };
+        assert_eq!(
+            (a.follow, a.tail, a.level, a.grep.as_str()),
+            (true, 20, 2, "async")
+        );
+        assert_eq!(a.components, ["smb", "daemon"]);
+        assert!(parse(["client", "logs", "--level", "loud"].map(String::from)).is_err());
+        assert!(parse(["server", "logs"].map(String::from)).is_err());
+    }
+
+    #[test]
+    fn configure_wait_flags() {
+        let cli = parse_ok(&[
+            "client",
+            "configure",
+            "--endpoint",
+            "v:1",
+            "--client-cert",
+            "c",
+            "--client-key",
+            "k",
+            "--ca",
+            "a",
+            "--interim-after",
+            "500",
+            "--max-wait",
+            "90",
+            "--down-after",
+            "30",
+        ]);
+        let Command::Configure(a) = cli.command else {
+            panic!("configure expected")
+        };
+        assert_eq!(
+            (a.interim_after_ms, a.max_wait_sec, a.down_after_sec),
+            (500, 90, 30)
         );
     }
 

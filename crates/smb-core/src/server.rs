@@ -10,6 +10,9 @@
 //! durable handle tables in ServerShared (surviving a TCP drop). This
 //! linear loop is then replaced by split read/write tasks.
 
+use janus_lib::jlog;
+use janus_lib::log::Level;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Instant;
@@ -25,8 +28,11 @@ use smb_wire::ntlm::Credentials;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Mutex;
 
-use crate::conn::{AUTH_TIMEOUT, ConnState};
-use crate::dispatch::{Dispatcher, IoMeta, Reply, ServerCtx, system_random};
+use crate::conn::{AUTH_TIMEOUT, AsyncConfig, ConnState};
+use crate::dispatch::{
+    DeferredSlow, Dispatcher, IoMeta, Out, Reply, ServerCtx, status, system_random,
+};
+use crate::files::Post;
 use crate::transport::{read_message, write_message};
 
 /// TCP connection identifier.
@@ -36,6 +42,8 @@ pub struct ConnId(pub u64);
 /// READ/WRITE backend calls of one connection that may be in flight at once. Each holds up to
 /// `MAX_IO` of payload; a high-latency backend needs several in flight to fill the link.
 const MAX_INFLIGHT_IO: usize = 8;
+/// Packets queued behind pending operations before the loop stops reading.
+const MAX_HELD: usize = 256;
 
 /// Aborts the reader task when the connection loop ends (otherwise it would hold the socket).
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
@@ -83,6 +91,9 @@ pub struct DevServer<B: StorageBackend> {
     /// (once the session is established; contains paths and signatures, but not passwords).
     trace: u8,
     started_filetime: u64,
+    async_cfg: AsyncConfig,
+    /// Operations behind an interim response, for `janus-cli client status`.
+    pending: Arc<janus_lib::observability::PendingOps>,
 }
 
 impl<B: StorageBackend> DevServer<B> {
@@ -100,12 +111,26 @@ impl<B: StorageBackend> DevServer<B> {
             next_conn: AtomicU64::new(1),
             next_session: AtomicU64::new(FIRST_SESSION_ID),
             started_filetime: filetime_now(),
+            async_cfg: AsyncConfig::default(),
+            pending: Arc::default(),
             trace: match std::env::var("JANUS_SMB_TRACE").as_deref() {
                 Ok("1") => 1,
                 Ok("2") => 2,
                 _ => 0,
             },
         }
+    }
+
+    /// Timing of the interim STATUS_PENDING path (see `AsyncConfig`).
+    pub fn with_async_config(mut self, cfg: AsyncConfig) -> Self {
+        self.async_cfg = cfg;
+        self
+    }
+
+    /// Share the pending-operation counter with the control plane's `status`.
+    pub fn with_pending_ops(mut self, p: Arc<janus_lib::observability::PendingOps>) -> Self {
+        self.pending = p;
+        self
     }
 
     /// Listen on TCP and serve connections (dev mode; in production the listener
@@ -122,7 +147,7 @@ impl<B: StorageBackend> DevServer<B> {
             let me = Arc::clone(&self);
             tokio::spawn(async move {
                 if let Err(e) = me.serve_conn(stream, conn_id).await {
-                    eprintln!("janus: conn {conn_id:?} ({peer}) error: {e}");
+                    jlog!(Warn, "smb", "conn {conn_id:?} ({peer}) error: {e}");
                 }
             });
         }
@@ -130,11 +155,11 @@ impl<B: StorageBackend> DevServer<B> {
 
     async fn serve_conn(&self, stream: TcpStream, conn_id: ConnId) -> std::io::Result<()> {
         let mut conn = ConnState::default();
-        eprintln!("janus: conn {conn_id:?} established");
+        jlog!(Info, "smb", "conn {conn_id:?} established");
         let result = self.conn_loop(stream, &mut conn, conn_id).await;
         // Whatever ended the connection, release the backend handles it still holds.
         Dispatcher::cleanup(&mut conn, &*self.backend).await;
-        eprintln!("janus: conn {conn_id:?} closed");
+        jlog!(Info, "smb", "conn {conn_id:?} closed");
         result
     }
 
@@ -143,13 +168,20 @@ impl<B: StorageBackend> DevServer<B> {
     /// in-flight I/O is replied to, so CLOSE/FLUSH/SET_INFO and friends see all earlier writes
     /// and the order of every other command is exactly the order of arrival. Replies to
     /// READ/WRITE may overtake each other, which SMB2 allows (clients match by MessageId).
+    ///
+    /// FLUSH, CLOSE and SET_INFO may wait for the journal for a long time. They run as
+    /// *pending operations*: after `interim_after` the client gets an interim STATUS_PENDING,
+    /// the final reply follows when the backend is done, the client cancels or `max_wait`
+    /// passes. While any operation is pending the loop keeps reading: CANCEL and ECHO are
+    /// handled at once, everything else queues in `held` and runs, in arrival order, once the
+    /// pending operations are finished (so a held CREATE still sees the rename before it).
     async fn conn_loop(
         &self,
         stream: TcpStream,
         conn: &mut ConnState,
         conn_id: ConnId,
     ) -> std::io::Result<()> {
-        let (mut rd, mut wr) = stream.into_split();
+        let (mut rd, wr) = stream.into_split();
         let (tx, mut rx) = tokio::sync::mpsc::channel::<std::io::Result<Option<Vec<u8>>>>(2);
         let _reader = AbortOnDrop(tokio::spawn(async move {
             loop {
@@ -160,108 +192,332 @@ impl<B: StorageBackend> DevServer<B> {
                 }
             }
         }));
-        let backend = &*self.backend;
-        let mut inflight = FuturesUnordered::new();
+        let mut io = ConnIo {
+            wr,
+            inflight: FuturesUnordered::new(),
+            slow: FuturesUnordered::new(),
+            slow_ctx: HashMap::new(),
+            held: VecDeque::new(),
+            pending_tokens: HashMap::new(),
+            pending_stats: Arc::clone(&self.pending),
+        };
         loop {
             // While authentication is in progress, wait for the next packet only for a bounded time.
-            let auth_wait = conn.has_pending_auth() && inflight.is_empty();
+            let auth_wait = conn.has_pending_auth() && io.inflight.is_empty() && io.slow.is_empty();
+            let interim_due = conn.pending_async.next_interim_due();
             let next = tokio::select! {
                 biased;
-                Some((meta, out, raw)) = inflight.next(), if !inflight.is_empty() => {
-                    self.send_io_reply(&mut wr, conn, conn_id, meta, out, raw).await?;
+                Some((async_id, end)) = io.slow.next(), if !io.slow.is_empty() => {
+                    self.send_slow_reply(&mut io, conn, conn_id, async_id, end).await?;
+                    // Pending operations are over: run what queued up behind them.
+                    while io.slow.is_empty() {
+                        let Some(raw) = io.held.pop_front() else { break };
+                        if self.process(&mut io, conn, conn_id, raw, true).await?.is_break() {
+                            return Ok(());
+                        }
+                    }
                     continue;
                 }
-                m = rx.recv(), if inflight.len() < MAX_INFLIGHT_IO => match m {
+                Some((meta, out, raw)) = io.inflight.next(), if !io.inflight.is_empty() => {
+                    self.send_io_reply(&mut io.wr, conn, conn_id, meta, out, raw).await?;
+                    continue;
+                }
+                _ = tokio::time::sleep_until(interim_due.unwrap_or_else(Instant::now).into()), if interim_due.is_some() => {
+                    self.send_interims(&mut io, conn, conn_id).await?;
+                    continue;
+                }
+                m = rx.recv(), if io.inflight.len() < MAX_INFLIGHT_IO && io.held.len() < MAX_HELD => match m {
                     Some(r) => r?,
                     None => break,
                 },
                 _ = tokio::time::sleep(AUTH_TIMEOUT), if auth_wait => {
-                    eprintln!("janus: conn {conn_id:?} auth timeout; closing");
+                    jlog!(Warn, "smb", "conn {conn_id:?} auth timeout; closing");
                     break;
                 }
             };
             let Some(raw) = next else { break };
-
-            if let Some((meta, job)) = Dispatcher::try_defer_io(&raw, conn, &self.backend) {
-                let keep = (self.trace > 0).then_some(raw);
-                inflight.push(async move { (meta, job.run(backend).await, keep) });
-                continue;
-            }
-            conn.io_epoch += 1; // anything but plain READ/WRITE may change what readahead holds
-            // Barrier: finish the I/O in flight before anything else is looked at.
-            while let Some((meta, out, raw)) = inflight.next().await {
-                self.send_io_reply(&mut wr, conn, conn_id, meta, out, raw)
-                    .await?;
-            }
-
-            // Snapshot of the share configuration and credentials for the duration of packet handling.
-            let (share_name, profile, volume_bytes) = {
-                let st = self.daemon.lock().await;
-                match &st.share {
-                    Some(s) => (
-                        if s.share_name.is_empty() {
-                            DEFAULT_SHARE.to_owned()
-                        } else {
-                            s.share_name.clone()
-                        },
-                        s.profile,
-                        if s.quota_bytes == 0 {
-                            DEFAULT_VOLUME_BYTES
-                        } else {
-                            s.quota_bytes
-                        },
-                    ),
-                    None => (
-                        DEFAULT_SHARE.to_owned(),
-                        ClientProfile::default(),
-                        DEFAULT_VOLUME_BYTES,
-                    ),
-                }
-            };
-            let credentials = self
-                .credentials
-                .get()
-                .map(|c| Credentials::from_password(&c.user, &c.password));
-            let ctx = ServerCtx {
-                server_guid: self.config.server_guid,
-                server_name: SERVER_NAME,
-                share_name: &share_name,
-                caps: profile.caps(),
-                credentials,
-                next_session_id: &self.next_session,
-                filetime: filetime_now(),
-                started_filetime: self.started_filetime,
-                volume_bytes,
-                now: Instant::now(),
-                random: system_random,
-            };
-
-            let result = Dispatcher::handle(&raw, conn, &ctx, &*self.backend).await;
-            if self.trace > 0 {
-                trace_exchange(conn_id, &raw, &result);
-            }
-            if self.trace > 1 && !smb_wire::messages::is_smb1(&raw) {
-                let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
-                eprintln!("janus: conn {conn_id:?} raw → {hex}");
-            }
-            match result {
-                Ok(Reply::Now(bytes)) => write_message(&mut wr, &bytes).await?,
-                Ok(Reply::None) => {}
-                Ok(Reply::Async { .. }) => {
-                    // UPGRADE: the interim STATUS_PENDING has already been sent, the final reply comes later.
-                }
-                Err(e) => {
-                    eprintln!("janus: conn {conn_id:?} protocol error: {e}; closing");
-                    break;
-                }
-            }
-            if conn.close_after_reply {
-                eprintln!("janus: conn {conn_id:?} closing after failed logons");
+            if self
+                .process(&mut io, conn, conn_id, raw, false)
+                .await?
+                .is_break()
+            {
                 break;
             }
         }
         Ok(())
     }
+
+    /// One packet. `from_held`: it already waited its turn in the queue.
+    async fn process<'a>(
+        &'a self,
+        io: &mut ConnIo<'a>,
+        conn: &mut ConnState,
+        conn_id: ConnId,
+        raw: Vec<u8>,
+        from_held: bool,
+    ) -> std::io::Result<std::ops::ControlFlow<()>> {
+        use std::ops::ControlFlow::{Break, Continue};
+        let backend = &*self.backend;
+        // CANCEL never waits behind anything and never gets a reply.
+        if Dispatcher::try_cancel(&raw, conn) {
+            return Ok(Continue(()));
+        }
+        let urgent = Dispatcher::is_echo(&raw);
+        if !urgent {
+            // Plain READ/WRITE of an unrelated file may pass pending operations, but only when
+            // nothing is queued (queued packets keep their order).
+            let queued = !from_held && !io.held.is_empty();
+            if !queued
+                && let Some((meta, job)) = Dispatcher::try_defer_io(&raw, conn, &self.backend)
+            {
+                let keep = (self.trace > 0).then_some(raw);
+                io.inflight.push(Box::pin(
+                    async move { (meta, job.run(backend).await, keep) },
+                ));
+                return Ok(Continue(()));
+            }
+            if !from_held && (queued || !io.slow.is_empty()) {
+                io.held.push_back(raw);
+                return Ok(Continue(()));
+            }
+        }
+        if !urgent {
+            conn.io_epoch += 1; // anything but plain READ/WRITE may change what readahead holds
+            // Barrier: finish the I/O in flight before anything else is looked at.
+            while let Some((meta, out, raw)) = io.inflight.next().await {
+                self.send_io_reply(&mut io.wr, conn, conn_id, meta, out, raw)
+                    .await?;
+            }
+        }
+
+        // Snapshot of the share configuration and credentials for the duration of packet handling.
+        let (share_name, profile, volume_bytes, async_cfg) = {
+            let st = self.daemon.lock().await;
+            match &st.share {
+                Some(s) => (
+                    if s.share_name.is_empty() {
+                        DEFAULT_SHARE.to_owned()
+                    } else {
+                        s.share_name.clone()
+                    },
+                    s.profile,
+                    if s.quota_bytes == 0 {
+                        DEFAULT_VOLUME_BYTES
+                    } else {
+                        s.quota_bytes
+                    },
+                    AsyncConfig {
+                        interim_after: s
+                            .smb_wait
+                            .interim_after()
+                            .unwrap_or(self.async_cfg.interim_after),
+                        max_wait: s.smb_wait.max_wait().unwrap_or(self.async_cfg.max_wait),
+                    },
+                ),
+                None => (
+                    DEFAULT_SHARE.to_owned(),
+                    ClientProfile::default(),
+                    DEFAULT_VOLUME_BYTES,
+                    self.async_cfg,
+                ),
+            }
+        };
+        let credentials = self
+            .credentials
+            .get()
+            .map(|c| Credentials::from_password(&c.user, &c.password));
+        let ctx = ServerCtx {
+            server_guid: self.config.server_guid,
+            server_name: SERVER_NAME,
+            share_name: &share_name,
+            caps: profile.caps(),
+            credentials,
+            next_session_id: &self.next_session,
+            filetime: filetime_now(),
+            started_filetime: self.started_filetime,
+            volume_bytes,
+            now: Instant::now(),
+            random: system_random,
+        };
+
+        if !urgent && let Some(d) = Dispatcher::try_defer_slow(&raw, conn, &ctx, &async_cfg) {
+            let DeferredSlow {
+                async_id,
+                cancel,
+                meta,
+                job,
+            } = d;
+            let max_wait = async_cfg.max_wait;
+            let backend = Arc::clone(&self.backend);
+            let (op, post) = (job.op, job.post);
+            if self.trace > 0 {
+                jlog!(
+                    Debug,
+                    "smb",
+                    "conn {conn_id:?} → {:?} mid={} deferred (async_id={async_id})",
+                    meta.header().command,
+                    meta.header().message_id
+                );
+            }
+            io.slow_ctx.insert(async_id, (meta, post));
+            io.slow.push(Box::pin(async move {
+                // The backend call runs as its own task: when the client cancels or `max_wait`
+                // passes, only the wait ends. The call (and the journal behind it) carries on.
+                let mut task = tokio::spawn(async move { op.run(&*backend).await });
+                let end = tokio::select! {
+                    r = &mut task => SlowEnd::Done(r.unwrap_or_else(|_| Out::err(status::UNEXPECTED_IO_ERROR))),
+                    _ = cancel.notified() => SlowEnd::Cancelled,
+                    _ = tokio::time::sleep(max_wait) => SlowEnd::TimedOut,
+                };
+                (async_id, end)
+            }));
+            return Ok(Continue(()));
+        }
+
+        let result = Dispatcher::handle(&raw, conn, &ctx, backend).await;
+        if self.trace > 0 {
+            trace_exchange(conn_id, &raw, &result);
+        }
+        if self.trace > 1 && !smb_wire::messages::is_smb1(&raw) {
+            let hex: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+            jlog!(Debug, "smb", "conn {conn_id:?} raw → {hex}");
+        }
+        match result {
+            Ok(Reply::Now(bytes)) => write_message(&mut io.wr, &bytes).await?,
+            Ok(Reply::None) => {}
+            Err(e) => {
+                jlog!(Warn, "smb", "conn {conn_id:?} protocol error: {e}; closing");
+                return Ok(Break(()));
+            }
+        }
+        if conn.close_after_reply {
+            jlog!(Warn, "smb", "conn {conn_id:?} closing after failed logons");
+            return Ok(Break(()));
+        }
+        Ok(Continue(()))
+    }
+
+    /// Interim STATUS_PENDING for every operation that has been waiting long enough.
+    async fn send_interims(
+        &self,
+        io: &mut ConnIo<'_>,
+        conn: &mut ConnState,
+        conn_id: ConnId,
+    ) -> std::io::Result<()> {
+        for (async_id, message_id, _, command, started) in
+            conn.pending_async.take_due(Instant::now())
+        {
+            let Some((meta, _)) = io.slow_ctx.get(&async_id) else {
+                continue;
+            };
+            let bytes = Dispatcher::interim_reply(meta, async_id, conn);
+            jlog!(
+                Info,
+                "smb",
+                "conn {conn_id:?} {command:?} mid={message_id} now asynchronous (async_id={async_id}); interim STATUS_PENDING sent"
+            );
+            io.pending_tokens
+                .insert(async_id, self.pending.begin(started));
+            write_message(&mut io.wr, &bytes).await?;
+        }
+        Ok(())
+    }
+
+    /// Final reply of a pending operation.
+    async fn send_slow_reply(
+        &self,
+        io: &mut ConnIo<'_>,
+        conn: &mut ConnState,
+        conn_id: ConnId,
+        async_id: u64,
+        end: SlowEnd,
+    ) -> std::io::Result<()> {
+        let Some((meta, post)) = io.slow_ctx.remove(&async_id) else {
+            return Ok(());
+        };
+        if let Some(t) = io.pending_tokens.remove(&async_id) {
+            self.pending.end(t);
+        }
+        let announced = conn.pending_async.announced(async_id);
+        let waited = conn
+            .pending_async
+            .complete(async_id)
+            .map(|o| o.started.elapsed());
+        let (out, what) = match end {
+            SlowEnd::Done(out) => {
+                if let Some(session) = conn.sessions.get_mut(&meta.header().session_id) {
+                    post.apply(&out, session);
+                }
+                (out, "completed")
+            }
+            // MS-SMB2 §3.3.5.16: the cancelled request completes with STATUS_CANCELLED.
+            SlowEnd::Cancelled => (Out::err(status::CANCELLED), "cancelled by the client"),
+            // The wait is over but the data is not lost: the journal keeps uploading. The
+            // network-error status makes SMB clients fail the call without dropping the share.
+            SlowEnd::TimedOut => (
+                Out::err(status::UNEXPECTED_NETWORK_ERROR),
+                "gave up waiting",
+            ),
+        };
+        // Quick operations that never went asynchronous are routine: Debug. Everything the
+        // client was kept waiting for, and every failure, is Info/Warn.
+        let level = if !announced && out.status == status::SUCCESS {
+            Level::Debug
+        } else if out.status == status::SUCCESS {
+            Level::Info
+        } else {
+            Level::Warn
+        };
+        janus_lib::log::emit(
+            level,
+            "smb",
+            format!(
+                "conn {conn_id:?} {:?} mid={} (op {async_id}) {what} after {:?}: status={:#010x}",
+                meta.header().command,
+                meta.header().message_id,
+                waited.unwrap_or_default(),
+                out.status
+            ),
+        );
+        let bytes = Dispatcher::finish_slow(&meta, async_id, announced, out, conn);
+        write_message(&mut io.wr, &bytes).await
+    }
+}
+
+/// Everything a connection loop owns besides the `ConnState`.
+struct ConnIo<'a> {
+    wr: tokio::net::tcp::OwnedWriteHalf,
+    inflight: FuturesUnordered<BoxFuture<'a, IoDone>>,
+    /// Pending FLUSH/CLOSE/SET_INFO tasks.
+    slow: FuturesUnordered<BoxFuture<'a, (u64, SlowEnd)>>,
+    /// What the final reply of each pending operation needs, by AsyncId.
+    slow_ctx: HashMap<u64, (IoMeta, Post)>,
+    /// Packets that arrived while operations were pending, in arrival order.
+    held: VecDeque<Vec<u8>>,
+    /// `PendingOps` tokens of the operations the client has been told about.
+    pending_tokens: HashMap<u64, u64>,
+    pending_stats: Arc<janus_lib::observability::PendingOps>,
+}
+
+impl Drop for ConnIo<'_> {
+    /// The connection is gone: its pending operations no longer count.
+    fn drop(&mut self) {
+        for t in self.pending_tokens.values() {
+            self.pending_stats.end(*t);
+        }
+    }
+}
+
+/// A finished READ/WRITE: its reply metadata, outcome and (when tracing) the request.
+type IoDone = (IoMeta, Out, Option<Vec<u8>>);
+
+type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
+
+/// How a pending operation ended.
+enum SlowEnd {
+    Done(Out),
+    Cancelled,
+    TimedOut,
 }
 
 impl<B: StorageBackend> DevServer<B> {
@@ -326,6 +582,6 @@ fn trace_exchange(conn_id: ConnId, raw: &[u8], result: &Result<Reply, smb_wire::
         Ok(_) => vec!["(no response)".to_owned()],
         Err(e) => vec![format!("ERROR {e}")],
     };
-    eprintln!("janus: conn {conn_id:?} → {}", req.join(" | "));
-    eprintln!("janus: conn {conn_id:?} ← {}", resp.join(" | "));
+    jlog!(Debug, "smb", "conn {conn_id:?} → {}", req.join(" | "));
+    jlog!(Debug, "smb", "conn {conn_id:?} ← {}", resp.join(" | "));
 }

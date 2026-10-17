@@ -258,6 +258,9 @@ struct State {
     sticky: HashMap<PathId, Sticky>,
     backoff_until: Option<Instant>,
     failures: u32,
+    /// Since when the receiver has been failing without a single success in between
+    /// (transport errors and timeouts of uploads and fsyncs). `None` while it works.
+    down_since: Option<Instant>,
     last_error: Option<String>,
     /// File → seq of its newest write that a successful `Fsync(file)` covered. A flush of a
     /// file with nothing newer needs no round trip (a close right after a flush is common).
@@ -356,6 +359,7 @@ impl UploaderHandle {
         let mut st = self.shared.state.lock().expect("state poisoned");
         st.backoff_until = None;
         st.failures = 0;
+        st.down_since = None;
         drop(st);
         self.shared.work.notify_one();
     }
@@ -447,6 +451,18 @@ impl UploaderHandle {
     async fn wait<T>(
         &self,
         deadline: Instant,
+        check: impl FnMut() -> Option<T>,
+    ) -> Result<T, UploadError> {
+        self.wait_unless_down(deadline, None, check).await
+    }
+
+    /// Like `wait`, but also gives up with `RemoteUnavailable` once the receiver has been
+    /// failing continuously for `down_after` (see `State::down_since`): a slow or freshly thawed
+    /// receiver is waited for, one that stays down is reported.
+    async fn wait_unless_down<T>(
+        &self,
+        deadline: Instant,
+        down_after: Option<Duration>,
         mut check: impl FnMut() -> Option<T>,
     ) -> Result<T, UploadError> {
         loop {
@@ -456,9 +472,22 @@ impl UploaderHandle {
             if let Some(v) = check() {
                 return Ok(v);
             }
-            if tokio::time::timeout_at(deadline.into(), notified)
+            let give_up_at = down_after.and_then(|d| {
+                self.shared
+                    .state
+                    .lock()
+                    .expect("state poisoned")
+                    .down_since
+                    .map(|t| t + d)
+            });
+            if give_up_at.is_some_and(|t| t <= Instant::now()) {
+                return Err(UploadError::RemoteUnavailable);
+            }
+            let wake = give_up_at.map_or(deadline, |t| t.min(deadline));
+            if tokio::time::timeout_at(wake.into(), notified)
                 .await
                 .is_err()
+                && wake >= deadline
             {
                 return Err(self.timeout_error());
             }
@@ -481,8 +510,18 @@ impl UploaderHandle {
         files: &[PathId],
         deadline: Instant,
     ) -> Result<(), UploadError> {
+        self.wait_uploaded_unless_down(files, deadline, None).await
+    }
+
+    /// `wait_uploaded` that stops early when the receiver stays down for `down_after`.
+    pub async fn wait_uploaded_unless_down(
+        &self,
+        files: &[PathId],
+        deadline: Instant,
+        down_after: Option<Duration>,
+    ) -> Result<(), UploadError> {
         let s0 = self.shared.journal.last_seq();
-        self.wait(deadline, || {
+        self.wait_unless_down(deadline, down_after, || {
             let st = self.shared.state.lock().expect("state poisoned");
             for f in files {
                 if let Some(e) = st.sticky.get(f) {
@@ -504,14 +543,45 @@ impl UploaderHandle {
     async fn fsync(&self, path: Option<&str>, deadline: Instant) -> Result<(), UploadError> {
         let target = self.shared.target.read().expect("target poisoned").clone();
         match tokio::time::timeout_at(deadline.into(), target.fsync(path)).await {
-            Err(_) => Err(UploadError::RemoteUnavailable),
-            Ok(Ok(())) => Ok(()),
+            Err(_) => {
+                self.mark_down();
+                Err(UploadError::RemoteUnavailable)
+            }
+            Ok(Ok(())) => {
+                self.mark_up();
+                Ok(())
+            }
             Ok(Err(UploadFail::Transient(m))) => {
                 self.record_error(&m);
+                self.mark_down();
                 Err(UploadError::RemoteUnavailable)
             }
             Ok(Err(UploadFail::Permanent(s))) => Err(UploadError::Sticky(s)),
         }
+    }
+
+    fn mark_down(&self) {
+        self.shared
+            .state
+            .lock()
+            .expect("state poisoned")
+            .down_since
+            .get_or_insert_with(Instant::now);
+        self.shared.progress.notify_waiters();
+    }
+
+    fn mark_up(&self) {
+        self.shared.state.lock().expect("state poisoned").down_since = None;
+    }
+
+    /// How long the receiver has been failing without a success, if it is.
+    pub fn down_for(&self) -> Option<Duration> {
+        self.shared
+            .state
+            .lock()
+            .expect("state poisoned")
+            .down_since
+            .map(|t| t.elapsed())
     }
 
     fn record_error(&self, msg: &str) {
@@ -521,7 +591,20 @@ impl UploaderHandle {
 
     /// Wait for the acks of all dirty ranges of the file + Fsync(file) on the receiver.
     pub async fn flush_barrier(&self, file: PathId, deadline: Instant) -> Result<(), UploadError> {
-        self.wait_uploaded(&[file], deadline).await?;
+        self.flush_barrier_unless_down(file, deadline, None).await
+    }
+
+    /// `flush_barrier` for the SMB layer's long wait: instead of one fsync attempt bounded by
+    /// the link's operation budget, the fsync is retried until `deadline`, and the whole wait
+    /// ends early once the receiver has been down for `down_after`.
+    pub async fn flush_barrier_unless_down(
+        &self,
+        file: PathId,
+        deadline: Instant,
+        down_after: Option<Duration>,
+    ) -> Result<(), UploadError> {
+        self.wait_uploaded_unless_down(&[file], deadline, down_after)
+            .await?;
         let newest = self.shared.journal.last_write_seq(file).map_or(0, |s| s.0);
         let covered = self
             .shared
@@ -537,7 +620,19 @@ impl UploaderHandle {
         let Some(p) = self.shared.journal.path_of(file) else {
             return Ok(());
         };
-        self.fsync(Some(&p), deadline).await?;
+        loop {
+            match self.fsync(Some(&p), deadline).await {
+                Ok(()) => break,
+                Err(UploadError::RemoteUnavailable) if down_after.is_some() => {
+                    let down = self.down_for().unwrap_or_default();
+                    if Instant::now() >= deadline || down_after.is_some_and(|d| down >= d) {
+                        return Err(UploadError::RemoteUnavailable);
+                    }
+                    tokio::time::sleep(Duration::from_millis(500)).await;
+                }
+                Err(e) => return Err(e),
+            }
+        }
         self.shared
             .state
             .lock()
@@ -731,6 +826,7 @@ async fn upload(sh: &Shared, batch: crate::journal::Batch) {
             let mut st = sh.state.lock().expect("state poisoned");
             st.window.finish(batch.file, range);
             st.failures = 0;
+            st.down_since = None;
             st.backoff_until = None;
         }
         Err(UploadFail::Transient(m)) => {
@@ -738,6 +834,7 @@ async fn upload(sh: &Shared, batch: crate::journal::Batch) {
             let mut st = sh.state.lock().expect("state poisoned");
             st.window.finish(batch.file, range);
             st.failures += 1;
+            st.down_since.get_or_insert_with(Instant::now);
             st.last_error = Some(m);
             let until = Instant::now() + sh.cfg.retry.delay(st.failures);
             st.backoff_until = Some(st.backoff_until.map_or(until, |b| b.max(until)));

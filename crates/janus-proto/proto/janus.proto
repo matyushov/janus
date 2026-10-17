@@ -130,9 +130,26 @@ service SmbFrontControl {
   rpc Quiesce(Empty) returns (Ack);
   rpc Resume(Empty) returns (Ack);
   rpc WatchEvents(Empty) returns (stream Event);
+  // The daemon log: the last `tail` lines, and with `follow` new ones as they are written.
+  rpc StreamLogs(LogRequest) returns (stream LogLine);
   rpc RotateCredentials(RotateRequest) returns (Ack);
   rpc GetDiagnostics(Empty) returns (DiagnosticsBundle);
   rpc Shutdown(ShutdownRequest) returns (Ack);
+}
+
+message LogRequest {
+  uint32 tail      = 1; // last N matching lines first (0 = none)
+  bool   follow    = 2; // keep streaming new lines
+  uint32 min_level = 3; // 0 debug, 1 info (default), 2 warn, 3 error
+  repeated string components = 4; // smb, daemon, backend, control; empty = all
+  string contains  = 5; // case-insensitive substring
+}
+message LogLine {
+  uint64 seq     = 1;
+  int64  unix_ms = 2;
+  uint32 level   = 3;
+  string component = 4;
+  string text    = 5;
 }
 
 message Empty {}
@@ -177,6 +194,10 @@ message ConfigureRequest {
   optional bool journal_enabled = 14;
   string journal_dir            = 15;
   uint64 max_backlog_bytes      = 16;
+  // How long a FLUSH/CLOSE/SET_INFO may keep the SMB client waiting (0 = the default of each).
+  uint32 smb_interim_after_ms   = 17; // interim STATUS_PENDING after this long (1500)
+  uint32 smb_max_wait_sec       = 18; // ceiling: then an error (600)
+  uint32 smb_down_after_sec     = 19; // receiver failing this long: error early (120)
 }
 
 message Readiness {
@@ -196,6 +217,8 @@ message StatusReply {
   uint64 oldest_unuploaded_age_ms   = 9;  // age of the oldest record not yet on the appliance
   string last_upload_error          = 10; // empty = none
   uint32 sticky_error_files         = 11; // files with a permanent upload error
+  uint32 pending_smb_ops            = 12; // FLUSH/CLOSE/SET_INFO answered with an interim STATUS_PENDING
+  uint64 oldest_pending_smb_op_ms   = 13; // age of the oldest of them
 }
 
 message DrainRequest { uint32 timeout_sec = 1; }

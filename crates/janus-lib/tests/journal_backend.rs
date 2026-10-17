@@ -121,6 +121,7 @@ fn timeouts() -> Timeouts {
         fail_fast: MS(100),
         budget: MS(1500),
         barrier: MS(1500),
+        barrier_down_after: MS(1500),
         keepalive_interval: MS(200),
         keepalive_timeout: MS(300),
     }
@@ -150,9 +151,18 @@ fn tmp_journal_dir(tag: &str) -> PathBuf {
 }
 
 fn backend_for(addr: SocketAddr, dir: &std::path::Path, max_backlog: u64) -> GrpcBackend {
+    backend_with(addr, dir, max_backlog, timeouts())
+}
+
+fn backend_with(
+    addr: SocketAddr,
+    dir: &std::path::Path,
+    max_backlog: u64,
+    timeouts: Timeouts,
+) -> GrpcBackend {
     let remote = RemoteClient::connect_lazy(&RemoteConfig {
         endpoint: addr.to_string(),
-        timeouts: timeouts(),
+        timeouts,
         ..Default::default()
     })
     .unwrap();
@@ -694,4 +704,74 @@ async fn a_journal_with_unuploaded_data_is_not_handed_to_another_destination_aft
     // an empty journal can move to another destination
     assert!(backend_to(other.addr, &dir, "b:2|id-b").is_ok());
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The barrier is a long wait, not a copy of the per-operation budget: a receiver that is
+/// frozen for longer than `budget` but shorter than `barrier_down_after` is ridden out.
+#[tokio::test]
+async fn a_barrier_rides_out_a_freeze_longer_than_the_operation_budget() {
+    let srv = TestServer::start("barrierfreeze", 0).await.unwrap();
+    let proxy = Proxy::start(srv.addr).await;
+    let dir = tmp_journal_dir("barrierfreeze");
+    let t = Timeouts {
+        barrier: MS(20_000),
+        barrier_down_after: MS(6000),
+        ..timeouts()
+    };
+    let backend = backend_with(proxy.addr, &dir, 64 << 20, t);
+    let h = backend
+        .open("f", req(Disposition::Create))
+        .await
+        .unwrap()
+        .handle;
+    backend.write(h, 0, b"warm").await.unwrap();
+    backend.flush(h, true).await.unwrap();
+
+    proxy.freeze();
+    backend.write(h, 4, &[7; 5000]).await.unwrap();
+    let started = Instant::now();
+    let flush = backend.flush(h, true);
+    tokio::pin!(flush);
+    // well past `budget` (1.5 s): still waiting, no error
+    assert!(tokio::time::timeout(MS(3000), &mut flush).await.is_err());
+    proxy.thaw();
+    flush.await.unwrap();
+    assert!(started.elapsed() > MS(3000));
+    assert_eq!(srv.store.read_file("f").unwrap().len(), 5004);
+}
+
+/// ...but a receiver that stays down is reported once it has been failing for
+/// `barrier_down_after`, long before the ceiling, and the data stays in the journal.
+#[tokio::test]
+async fn a_barrier_fails_early_when_the_receiver_stays_down() {
+    let srv = TestServer::start("barrierdown", 0).await.unwrap();
+    let proxy = Proxy::start(srv.addr).await;
+    let dir = tmp_journal_dir("barrierdown");
+    let t = Timeouts {
+        barrier: MS(30_000),
+        barrier_down_after: MS(2500),
+        ..timeouts()
+    };
+    let backend = backend_with(proxy.addr, &dir, 64 << 20, t);
+    let h = backend
+        .open("f", req(Disposition::Create))
+        .await
+        .unwrap()
+        .handle;
+    backend.write(h, 0, b"warm").await.unwrap();
+    backend.flush(h, true).await.unwrap();
+
+    proxy.freeze();
+    backend.write(h, 4, &[7; 5000]).await.unwrap();
+    let started = Instant::now();
+    let e = backend.flush(h, true).await.unwrap_err();
+    assert!(matches!(e, BackendError::RemoteUnavailable), "{e:?}");
+    let took = started.elapsed();
+    assert!(took > MS(2000) && took < MS(8000), "{took:?}");
+    let rt = backend.journal_runtime().unwrap();
+    assert_eq!(rt.journal.live_bytes(), 5000, "nothing was lost");
+    proxy.thaw();
+    let (ok, left) = rt.drain(Duration::from_secs(10)).await;
+    assert!(ok, "left {left}");
+    assert_eq!(srv.store.read_file("f").unwrap().len(), 5004);
 }

@@ -8,9 +8,12 @@
 //! remaining commands get `STATUS_NOT_IMPLEMENTED` (signed). Signing is mandatory: after SESSION_SETUP, frames without a valid
 //! signature are rejected and replies are signed.
 
+use janus_lib::jlog;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
+
+use tokio::sync::Notify;
 
 use janus_lib::profile::CompatCaps;
 use janus_lib::vfs::StorageBackend;
@@ -29,7 +32,7 @@ use smb_wire::messages::{
 use smb_wire::ntlm::{ChallengeParams, Credentials, NtlmServer};
 use smb_wire::{Command, Message, WireError};
 
-use crate::conn::{ConnState, MAX_AUTH_FAILURES, MAX_PENDING_SESSIONS};
+use crate::conn::{AsyncConfig, ConnState, MAX_AUTH_FAILURES, MAX_PENDING_SESSIONS};
 use crate::files;
 use crate::session::{PendingAuth, Session, SessionState};
 
@@ -38,9 +41,6 @@ pub enum Reply {
     /// Ready reply bytes (a whole NBSS packet, possibly compound); the write loop
     /// sends them as is.
     Now(Vec<u8>),
-    /// Long operation: the interim STATUS_PENDING has already been sent, the final reply comes later.
-    /// UPGRADE: enable together with AsyncOpRegistry (FLUSH sync-through, CHANGE_NOTIFY).
-    Async { async_id: u64 },
     /// No reply (for example, an ack without a response).
     None,
 }
@@ -48,6 +48,8 @@ pub enum Reply {
 /// NTSTATUS constants.
 pub mod status {
     pub const SUCCESS: u32 = 0x0000_0000;
+    pub const PENDING: u32 = 0x0000_0103;
+    pub const CANCELLED: u32 = 0xC000_0120;
     pub const NOT_IMPLEMENTED: u32 = 0xC000_0002;
     pub const INVALID_INFO_CLASS: u32 = 0xC000_0003;
     pub const INFO_LENGTH_MISMATCH: u32 = 0xC000_0004;
@@ -127,9 +129,22 @@ const MAX_COMPOUND: usize = 32;
 const CAP_LARGE_MTU: u32 = 0x0000_0004;
 
 /// What `finish_io` needs to build the reply of a deferred READ/WRITE.
+pub(crate) struct DeferredSlow {
+    pub(crate) async_id: u64,
+    pub(crate) cancel: Arc<Notify>,
+    pub(crate) meta: IoMeta,
+    pub(crate) job: files::SlowJob,
+}
+
 pub(crate) struct IoMeta {
     header: Header,
     key: [u8; 16],
+}
+
+impl IoMeta {
+    pub(crate) fn header(&self) -> &Header {
+        &self.header
+    }
 }
 
 pub struct Dispatcher;
@@ -282,6 +297,156 @@ impl Dispatcher {
     /// Build the signed reply of a deferred READ/WRITE once its backend call has finished.
     pub(crate) fn finish_io(meta: &IoMeta, out: Out, conn: &mut ConnState) -> Vec<u8> {
         let elem = reply(&meta.header, conn, out.status, out.body, Some(meta.key));
+        assemble(vec![elem])
+    }
+
+    /// SMB2 CANCEL (MS-SMB2 §3.3.5.16). Returns `true` when `payload` is a single CANCEL packet,
+    /// which is consumed here: there is never a response to it (the cancelled request is
+    /// answered with STATUS_CANCELLED by its own task). It spends no credits and grants none.
+    /// An unsigned or wrongly signed CANCEL is ignored.
+    pub(crate) fn try_cancel(payload: &[u8], conn: &mut ConnState) -> bool {
+        let Some((h, raw)) = single_request(payload) else {
+            return false;
+        };
+        if h.command != Command::Cancel {
+            return false;
+        }
+        let Some(key) = conn
+            .sessions
+            .get(&h.session_id)
+            .and_then(Session::signing_key)
+        else {
+            return true;
+        };
+        if h.flags & flags::SIGNED == 0 || !crypto::verify(&key, raw, &h.signature) {
+            return true;
+        }
+        let by_async = h.flags & flags::ASYNC_COMMAND != 0;
+        let id = if by_async { h.async_id } else { h.message_id };
+        let found = conn.pending_async.cancel(by_async, id, h.session_id);
+        jlog!(
+            Info,
+            "smb",
+            "CANCEL {}={id} session={:#x}: {}",
+            if by_async { "async_id" } else { "message_id" },
+            h.session_id,
+            if found {
+                "pending operation cancelled"
+            } else {
+                "nothing to cancel"
+            }
+        );
+        true
+    }
+
+    /// A lone ECHO is answered at once, even while operations are pending (keepalive).
+    pub(crate) fn is_echo(payload: &[u8]) -> bool {
+        single_request(payload).is_some_and(|(h, _)| h.command == Command::Echo)
+    }
+
+    /// Like `try_defer_io`, for FLUSH, CLOSE and SET_INFO: the commands that may wait for the
+    /// journal. Everything that needs the connection state is done now (and the request is
+    /// registered as a pending operation); the backend call is handed back as a job.
+    /// `None` leaves the connection untouched, and the ordinary `handle` path produces the reply
+    /// (an error, or a compound chain).
+    pub(crate) fn try_defer_slow(
+        payload: &[u8],
+        conn: &mut ConnState,
+        ctx: &ServerCtx<'_>,
+        cfg: &AsyncConfig,
+    ) -> Option<DeferredSlow> {
+        conn.dialect?;
+        let (h, raw) = single_request(payload)?;
+        if !matches!(
+            h.command,
+            Command::Flush | Command::Close | Command::SetInfo
+        ) || h.flags & (flags::SERVER_TO_REDIR | flags::RELATED_OPERATIONS) != 0
+            || u32::from(h.credit_charge.max(1)) > conn.credits.outstanding()
+        {
+            return None;
+        }
+        let msg = Message::decode_single(raw).ok()?;
+        let session = conn.sessions.get_mut(&h.session_id)?;
+        let key = session.signing_key()?;
+        if h.flags & flags::SIGNED == 0 || !crypto::verify(&key, raw, &h.signature) {
+            return None;
+        }
+        if !session.trees.contains_key(&h.tree_id) {
+            return None;
+        }
+        let mut r = Reader::new(&msg.body);
+        let job = match h.command {
+            Command::Flush => {
+                let req = FlushReq::decode(&mut r).ok()?;
+                files::prepare_flush(&req, req.file_id, h.tree_id, session, ctx)
+            }
+            Command::Close => {
+                let req = CloseReq::decode(&mut r).ok()?;
+                files::prepare_close(&req, req.file_id, h.tree_id, session)
+            }
+            _ => {
+                let req = SetInfoReq::decode(&mut r).ok()?;
+                files::prepare_set_info(&req, req.file_id, h.tree_id, session)
+            }
+        }
+        .ok()?;
+        conn.credits
+            .charge(h.credit_charge)
+            .expect("credits checked above");
+        let (async_id, cancel) = conn.pending_async.register(
+            h.message_id,
+            h.session_id,
+            h.command,
+            ctx.now,
+            cfg.interim_after,
+        );
+        Some(DeferredSlow {
+            async_id,
+            cancel,
+            meta: IoMeta {
+                header: h.clone(),
+                key,
+            },
+            job,
+        })
+    }
+
+    /// The interim STATUS_PENDING response (MS-SMB2 §3.3.4.2): the request header with the async
+    /// flag and AsyncId, a credit grant, an empty error body. Not signed: the spec says the
+    /// server SHOULD NOT sign interim responses.
+    pub(crate) fn interim_reply(meta: &IoMeta, async_id: u64, conn: &mut ConnState) -> Vec<u8> {
+        let mut elem = reply(&meta.header, conn, status::PENDING, error_body(), None);
+        elem.header.flags |= flags::ASYNC_COMMAND;
+        elem.header.async_id = async_id;
+        elem.header.tree_id = 0;
+        assemble(vec![elem])
+    }
+
+    /// Build the signed final reply of a deferred FLUSH/CLOSE/SET_INFO. If the client was told
+    /// the operation is asynchronous, the reply carries the async header and no credits
+    /// (MS-SMB2 §3.3.4.1.1 / §3.3.4.3: the interim response already granted them).
+    pub(crate) fn finish_slow(
+        meta: &IoMeta,
+        async_id: u64,
+        announced: bool,
+        out: Out,
+        conn: &mut ConnState,
+    ) -> Vec<u8> {
+        let mut elem = if announced {
+            let mut header = Header::response_to(&meta.header, out.status);
+            header.credit_req_grant = 0;
+            header.flags |= flags::ASYNC_COMMAND;
+            header.async_id = async_id;
+            header.tree_id = 0;
+            Element {
+                header,
+                body: out.body,
+                sign_key: Some(meta.key),
+            }
+        } else {
+            reply(&meta.header, conn, out.status, out.body, Some(meta.key))
+        };
+        elem.sign_key = Some(meta.key);
         assemble(vec![elem])
     }
 
@@ -804,6 +969,18 @@ fn tree_connect_resp(_caps: &CompatCaps) -> TreeConnectResp {
         capabilities: 0,
         maximal_access: ACCESS_ALL,
     }
+}
+
+/// The header of a packet that is a single SMB2 message (not SMB1, not encrypted, not compound).
+fn single_request(payload: &[u8]) -> Option<(Header, &[u8])> {
+    if smb_wire::messages::is_smb1(payload)
+        || (payload.len() >= 4 && payload[..4] == SMB2_TRANSFORM_MAGIC)
+    {
+        return None;
+    }
+    let [raw] = split_compound(payload).ok()?.try_into().ok()?;
+    let h = Header::decode(&mut Reader::new(raw)).ok()?;
+    Some((h, raw))
 }
 
 /// Splits an NBSS packet by NextCommand into the elements of a compound chain.

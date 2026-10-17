@@ -16,6 +16,39 @@ pub struct Metrics {
     pub last_appliance_ack_unix_ms: AtomicI64,
 }
 
+/// SMB operations that were answered with an interim STATUS_PENDING and are still waiting for
+/// the backend, across all connections. The SMB layer writes, `status` reads.
+#[derive(Debug, Default)]
+pub struct PendingOps {
+    next: std::sync::atomic::AtomicU64,
+    since: std::sync::Mutex<std::collections::HashMap<u64, std::time::Instant>>,
+}
+
+impl PendingOps {
+    /// An operation went asynchronous (`started` is when the request was taken). The token ends it.
+    pub fn begin(&self, started: std::time::Instant) -> u64 {
+        let id = self.next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.since
+            .lock()
+            .expect("pending ops poisoned")
+            .insert(id, started);
+        id
+    }
+
+    pub fn end(&self, token: u64) {
+        self.since
+            .lock()
+            .expect("pending ops poisoned")
+            .remove(&token);
+    }
+
+    /// (number of operations, age of the oldest).
+    pub fn snapshot(&self) -> (usize, Option<std::time::Duration>) {
+        let m = self.since.lock().expect("pending ops poisoned");
+        (m.len(), m.values().map(|t| t.elapsed()).max())
+    }
+}
+
 /// Events for the agent's WatchEvents stream and the diagnostics ring.
 #[derive(Debug, Clone)]
 pub enum Event {

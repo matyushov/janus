@@ -220,6 +220,178 @@ pub(crate) async fn create<B: StorageBackend>(
     }
 }
 
+/// A command that may wait for the journal (FLUSH, CLOSE, SET_INFO). `prepare_*` does the
+/// session work synchronously, in request order; `SlowOp::run` only talks to the backend, so
+/// the connection can answer other packets (and the client's CANCEL) while it waits.
+pub(crate) enum SlowOp {
+    Flush {
+        handle: BackendHandle,
+        fullfsync: bool,
+    },
+    Close {
+        handle: BackendHandle,
+        /// CLOSE_POSTQUERY_ATTRIB: (access, delete_pending) to report the final attributes with.
+        attrs_of: Option<(u32, bool)>,
+    },
+    SetTimes {
+        handle: BackendHandle,
+        times: SetTimes,
+    },
+    Rename {
+        from: String,
+        to: String,
+        replace: bool,
+    },
+    SetDelete {
+        handle: BackendHandle,
+        on: bool,
+    },
+    Truncate {
+        handle: BackendHandle,
+        len: u64,
+    },
+    /// Nothing to ask the backend (ignored information classes): a plain SET_INFO success.
+    Nothing,
+}
+
+/// What a successful job changes in the session table once the backend has agreed.
+#[derive(Clone)]
+pub(crate) enum Post {
+    None,
+    Renamed {
+        fid: [u8; 16],
+        tree_id: u32,
+        to: String,
+    },
+    DeletePending {
+        fid: [u8; 16],
+        tree_id: u32,
+        on: bool,
+    },
+}
+
+impl Post {
+    pub(crate) fn apply(self, out: &Out, session: &mut Session) {
+        if out.status != status::SUCCESS {
+            return;
+        }
+        match self {
+            Post::None => {}
+            Post::Renamed { fid, tree_id, to } => {
+                if let Some(open) = session.open_mut(&fid, tree_id) {
+                    // Other opens under a renamed directory keep their old path: a known J2 gap.
+                    open.rel_path = to;
+                }
+            }
+            Post::DeletePending { fid, tree_id, on } => {
+                if let Some(open) = session.open_mut(&fid, tree_id) {
+                    open.delete_pending = on;
+                }
+            }
+        }
+    }
+}
+
+pub(crate) struct SlowJob {
+    pub(crate) op: SlowOp,
+    pub(crate) post: Post,
+}
+
+impl SlowOp {
+    pub(crate) async fn run<B: StorageBackend>(self, backend: &B) -> Out {
+        let done = |encode: fn(&mut Writer)| {
+            let mut w = Writer::new();
+            encode(&mut w);
+            Out::ok(w.into_vec())
+        };
+        match self {
+            SlowOp::Flush { handle, fullfsync } => match backend.flush(handle, fullfsync).await {
+                Ok(()) => done(encode_flush_resp),
+                Err(e) => Out::err(status_of(&e)),
+            },
+            SlowOp::Close { handle, attrs_of } => {
+                let attrs = match attrs_of {
+                    Some((access, delete_pending)) => backend
+                        .stat_handle(handle)
+                        .await
+                        .ok()
+                        .map(|st| obj_info(&st, access, delete_pending)),
+                    None => None,
+                };
+                if let Err(e) = backend.close(handle).await {
+                    return Out::err(status_of(&e));
+                }
+                let mut w = Writer::new();
+                match attrs {
+                    Some(o) => encode_close_resp_attrs(&mut w, &o),
+                    None => encode_close_resp(&mut w),
+                }
+                Out::ok(w.into_vec())
+            }
+            SlowOp::SetTimes { handle, times } => {
+                finish_set_info(backend.set_times(handle, times).await)
+            }
+            SlowOp::Rename { from, to, replace } => {
+                finish_set_info(backend.rename(&from, &to, replace).await)
+            }
+            SlowOp::SetDelete { handle, on } => {
+                finish_set_info(backend.set_delete_on_close(handle, on).await)
+            }
+            SlowOp::Truncate { handle, len } => {
+                finish_set_info(backend.truncate(handle, len).await)
+            }
+            SlowOp::Nothing => finish_set_info(Ok(())),
+        }
+    }
+}
+
+fn finish_set_info(result: janus_lib::vfs::Result<()>) -> Out {
+    match result {
+        Ok(()) => {
+            let mut w = Writer::new();
+            encode_set_info_resp(&mut w);
+            Out::ok(w.into_vec())
+        }
+        Err(e) => Out::err(status_of(&e)),
+    }
+}
+
+/// Run a prepared job to completion and apply its session effects (the inline path).
+async fn run_inline<B: StorageBackend>(
+    backend: &B,
+    job: Result<SlowJob, Out>,
+    session: &mut Session,
+) -> Out {
+    match job {
+        Ok(SlowJob { op, post }) => {
+            let out = op.run(backend).await;
+            post.apply(&out, session);
+            out
+        }
+        Err(out) => out,
+    }
+}
+
+/// `Err` carries a finished reply; the session is untouched in that case.
+pub(crate) fn prepare_close(
+    req: &CloseReq,
+    fid: [u8; 16],
+    tree_id: u32,
+    session: &mut Session,
+) -> Result<SlowJob, Out> {
+    let Some(open) = session.take_open(&fid, tree_id) else {
+        return Err(Out::err(status::FILE_CLOSED));
+    };
+    Ok(SlowJob {
+        op: SlowOp::Close {
+            handle: open.handle,
+            attrs_of: (req.flags & CLOSE_POSTQUERY_ATTRIB != 0)
+                .then_some((open.access, open.delete_pending)),
+        },
+        post: Post::None,
+    })
+}
+
 pub(crate) async fn close<B: StorageBackend>(
     backend: &B,
     req: &CloseReq,
@@ -227,27 +399,8 @@ pub(crate) async fn close<B: StorageBackend>(
     tree_id: u32,
     session: &mut Session,
 ) -> Out {
-    let Some(open) = session.take_open(&fid, tree_id) else {
-        return Out::err(status::FILE_CLOSED);
-    };
-    let attrs = if req.flags & CLOSE_POSTQUERY_ATTRIB != 0 {
-        backend
-            .stat_handle(open.handle)
-            .await
-            .ok()
-            .map(|st| obj_info(&st, open.access, open.delete_pending))
-    } else {
-        None
-    };
-    if let Err(e) = backend.close(open.handle).await {
-        return Out::err(status_of(&e));
-    }
-    let mut w = Writer::new();
-    match attrs {
-        Some(o) => encode_close_resp_attrs(&mut w, &o),
-        None => encode_close_resp(&mut w),
-    }
-    Out::ok(w.into_vec())
+    let job = prepare_close(req, fid, tree_id, session);
+    run_inline(backend, job, session).await
 }
 
 /// A validated READ or WRITE, ready for the backend. Everything that needs the session is
@@ -464,6 +617,25 @@ pub(crate) async fn write<B: StorageBackend>(
     }
 }
 
+pub(crate) fn prepare_flush(
+    req: &FlushReq,
+    fid: [u8; 16],
+    tree_id: u32,
+    session: &mut Session,
+    ctx: &ServerCtx<'_>,
+) -> Result<SlowJob, Out> {
+    let Some(open) = session.open_mut(&fid, tree_id) else {
+        return Err(Out::err(status::FILE_CLOSED));
+    };
+    Ok(SlowJob {
+        op: SlowOp::Flush {
+            handle: open.handle,
+            fullfsync: ctx.caps.fullfsync && req.reserved1 == FLUSH_FULLFSYNC,
+        },
+        post: Post::None,
+    })
+}
+
 pub(crate) async fn flush<B: StorageBackend>(
     backend: &B,
     req: &FlushReq,
@@ -472,18 +644,8 @@ pub(crate) async fn flush<B: StorageBackend>(
     session: &mut Session,
     ctx: &ServerCtx<'_>,
 ) -> Out {
-    let Some(open) = session.open_mut(&fid, tree_id) else {
-        return Out::err(status::FILE_CLOSED);
-    };
-    let fullfsync = ctx.caps.fullfsync && req.reserved1 == FLUSH_FULLFSYNC;
-    match backend.flush(open.handle, fullfsync).await {
-        Ok(()) => {
-            let mut w = Writer::new();
-            encode_flush_resp(&mut w);
-            Out::ok(w.into_vec())
-        }
-        Err(e) => Out::err(status_of(&e)),
-    }
+    let job = prepare_flush(req, fid, tree_id, session, ctx);
+    run_inline(backend, job, session).await
 }
 
 /// Volume numbers for FileFs* replies: the backend's quota and usage when it has them,
@@ -605,25 +767,24 @@ pub(crate) async fn query_directory<B: StorageBackend>(
     Out::ok(w.into_vec())
 }
 
-pub(crate) async fn set_info<B: StorageBackend>(
-    backend: &B,
+pub(crate) fn prepare_set_info(
     req: &SetInfoReq,
     fid: [u8; 16],
     tree_id: u32,
     session: &mut Session,
-) -> Out {
+) -> Result<SlowJob, Out> {
     let Some(open) = session.open_mut(&fid, tree_id) else {
-        return Out::err(status::FILE_CLOSED);
+        return Err(Out::err(status::FILE_CLOSED));
     };
     if req.info_type != info_type::FILE {
-        return Out::err(status::NOT_SUPPORTED);
+        return Err(Out::err(status::NOT_SUPPORTED));
     }
     let set = match FileSet::decode(req.class, &req.buffer) {
         Ok(Some(s)) => s,
-        Ok(None) => return Out::err(status::INVALID_INFO_CLASS),
-        Err(_) => return Out::err(status::INFO_LENGTH_MISMATCH),
+        Ok(None) => return Err(Out::err(status::INVALID_INFO_CLASS)),
+        Err(_) => return Err(Out::err(status::INFO_LENGTH_MISMATCH)),
     };
-    let result = match set {
+    let (op, post) = match set {
         FileSet::Basic {
             accessed, written, ..
         } => {
@@ -632,52 +793,76 @@ pub(crate) async fn set_info<B: StorageBackend>(
                 mtime_unix_ns: unix_ns_from_filetime(written),
             };
             if times.atime_unix_ns.is_some() || times.mtime_unix_ns.is_some() {
-                backend.set_times(open.handle, times).await
+                (
+                    SlowOp::SetTimes {
+                        handle: open.handle,
+                        times,
+                    },
+                    Post::None,
+                )
             } else {
-                Ok(())
+                (SlowOp::Nothing, Post::None)
             }
         }
         FileSet::Rename { replace, target } => {
             let to = backend_path(&target);
             if open.rel_path.is_empty() || to.is_empty() {
-                return Out::err(status::ACCESS_DENIED);
+                return Err(Out::err(status::ACCESS_DENIED));
             }
-            let r = backend.rename(&open.rel_path, &to, replace).await;
-            if r.is_ok() {
-                // Other opens under a renamed directory keep their old path: a known J2 gap.
-                open.rel_path = to;
-            }
-            r
+            (
+                SlowOp::Rename {
+                    from: open.rel_path.clone(),
+                    to: to.clone(),
+                    replace,
+                },
+                Post::Renamed { fid, tree_id, to },
+            )
         }
         FileSet::Disposition { delete } => {
             if delete && (open.access & ACCESS_DELETE == 0 || open.rel_path.is_empty()) {
-                return Out::err(status::ACCESS_DENIED);
+                return Err(Out::err(status::ACCESS_DENIED));
             }
-            let r = backend.set_delete_on_close(open.handle, delete).await;
-            if r.is_ok() {
-                open.delete_pending = delete;
-            }
-            r
+            (
+                SlowOp::SetDelete {
+                    handle: open.handle,
+                    on: delete,
+                },
+                Post::DeletePending {
+                    fid,
+                    tree_id,
+                    on: delete,
+                },
+            )
         }
         FileSet::EndOfFile(len) => {
             if open.directory {
-                return Out::err(status::FILE_IS_A_DIRECTORY);
+                return Err(Out::err(status::FILE_IS_A_DIRECTORY));
             }
             if !access_wants_write(open.access) {
-                return Out::err(status::ACCESS_DENIED);
+                return Err(Out::err(status::ACCESS_DENIED));
             }
-            backend.truncate(open.handle, len).await
+            (
+                SlowOp::Truncate {
+                    handle: open.handle,
+                    len,
+                },
+                Post::None,
+            )
         }
-        FileSet::Allocation(_) | FileSet::Ignored => Ok(()),
+        FileSet::Allocation(_) | FileSet::Ignored => (SlowOp::Nothing, Post::None),
     };
-    match result {
-        Ok(()) => {
-            let mut w = Writer::new();
-            encode_set_info_resp(&mut w);
-            Out::ok(w.into_vec())
-        }
-        Err(e) => Out::err(status_of(&e)),
-    }
+    Ok(SlowJob { op, post })
+}
+
+pub(crate) async fn set_info<B: StorageBackend>(
+    backend: &B,
+    req: &SetInfoReq,
+    fid: [u8; 16],
+    tree_id: u32,
+    session: &mut Session,
+) -> Out {
+    let job = prepare_set_info(req, fid, tree_id, session);
+    run_inline(backend, job, session).await
 }
 
 /// Close backend handles of opens that are being dropped (TREE_DISCONNECT, LOGOFF,

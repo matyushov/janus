@@ -47,9 +47,11 @@ Machine must not think a backup is done while the data exists only on the laptop
   `receiver used + backlog + write > quota` (from a cached `statfs`), so Time Machine gets its
   thinning signal while it writes.
 - **Honest fsync (`SYNC_THROUGH`).** `flush` / `F_FULLFSYNC` and the close of a file with
-  unuploaded data wait until the data reached the receiver and was fsynced there. If the receiver
-  is unreachable for longer than the barrier budget (26 s) they fail (the backup aborts and is retried
-  in the next cycle); they never report a false success.
+  unuploaded data wait until the data reached the receiver and was fsynced there. The SMB layer
+  answers the client with an interim `STATUS_PENDING` after ~1.5 s and keeps waiting, so a slow
+  or briefly frozen receiver does not fail the call. If the receiver has been failing for
+  `barrier_down_after` (120 s), or the wait reaches the ceiling (`barrier`, 600 s), they fail (the
+  backup aborts and is retried in the next cycle); they never report a false success.
 - **`LOCAL_JOURNAL` (off by default, UNSAFE for backups).** `flush` returns after an fsync of the
   journal; the network catches up later. A lost laptop or disk means lost "durable" data, and Time
   Machine will believe a backup exists that the server does not have.
@@ -85,14 +87,17 @@ upload error and the time of the last acknowledgement; `drain` waits for an empt
 
 #### Time limits (`remote::Timeouts`)
 
-A frozen receiver (TCP alive, no replies) must not hold an SMB request longer than the macOS
-client is willing to wait (`max_resp_timeout`, 30 s by default). The limits are therefore one
-shared deadline per backend operation, not "timeout x attempts":
+A frozen receiver (TCP alive, no replies) must not hold an ordinary SMB request longer than the
+macOS client is willing to wait (`max_resp_timeout`, 30 s by default). The limits are therefore one
+shared deadline per backend operation, not "timeout x attempts". Barriers (flush / close / rename of
+a file with unuploaded data) are the exception: the SMB layer sends an interim `STATUS_PENDING`
+for them, which stops the client's 30 s clock, so they wait much longer:
 
 | Limit | Default | Why |
 |---|---|---|
 | operation budget | 18 s | all attempts and backoff of one operation; leaves ~12 s of margin to 30 s |
-| barrier (journal mode) | 26 s | how long a flush / close of a file with unuploaded data waits for the receiver; it is what absorbs a receiver frozen for ~20 s, and still ends 4 s before the client gives up |
+| barrier (journal mode) | 600 s | ceiling for a flush / close / rename of a file with unuploaded data; the client is kept waiting by the interim response |
+| barrier down-after | 120 s | the barrier fails early once the receiver has had no successful upload or fsync for this long ("stably unavailable"); must exceed the freezes that should be ridden out |
 | request attempt | 6 s | far above a healthy RTT + disk fsync, short enough for 2-3 attempts |
 | bulk attempt (`ReadRange`/`WriteRange`) | 10 s | up to 1 MiB per call on a slow link; still < budget |
 | connect | 4 s | an unreachable host must not eat the budget |

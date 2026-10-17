@@ -13,6 +13,7 @@
 //! UPGRADE(keychain): `tls_identity_ref` (client identity from the macOS Keychain) is not
 //! implemented; only the file mode is.
 
+use crate::jlog;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
@@ -69,10 +70,16 @@ pub struct Timeouts {
     pub fail_fast: Duration,
     /// Total time for one backend operation, all attempts and backoff included.
     pub budget: Duration,
-    /// Longest a flush / close of a file with unuploaded data may wait for the receiver
-    /// (journal mode). Longer than `budget` on purpose: this wait is what absorbs a receiver
-    /// that freezes for tens of seconds; it still ends before the client's own 30 s timeout.
+    /// Longest a flush / close / rename of a file with unuploaded data may wait for the receiver
+    /// (journal mode). Much longer than `budget` on purpose: the SMB layer answers the client
+    /// with an interim STATUS_PENDING and keeps it waiting, so a receiver that freezes for a
+    /// minute or uploads slowly is waited for. This is a ceiling; see `barrier_down_after`.
     pub barrier: Duration,
+    /// A barrier ends with an error as soon as the receiver has been failing continuously
+    /// (no successful upload or fsync in between) for this long: a receiver that is gone is
+    /// reported instead of being waited for until `barrier`. Must exceed the longest freeze
+    /// that should be ridden out silently.
+    pub barrier_down_after: Duration,
     /// HTTP/2 PING interval (also while idle, so a silent peer is noticed).
     pub keepalive_interval: Duration,
     /// How long to wait for the PING ack before the connection is declared dead.
@@ -89,6 +96,7 @@ impl Default for Timeouts {
             fail_fast: DEFAULT_FAIL_FAST,
             budget: DEFAULT_OPERATION_BUDGET,
             barrier: DEFAULT_BARRIER_BUDGET,
+            barrier_down_after: DEFAULT_BARRIER_DOWN_AFTER,
             keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
             keepalive_timeout: DEFAULT_KEEPALIVE_TIMEOUT,
         }
@@ -106,7 +114,9 @@ pub const DEFAULT_CONNECTIONS: usize = 4;
 const MAX_CALLS_PER_CONNECTION: usize = 128;
 pub const DEFAULT_OPERATION_BUDGET: Duration = Duration::from_secs(18);
 /// See `Timeouts::barrier`.
-pub const DEFAULT_BARRIER_BUDGET: Duration = Duration::from_secs(26);
+pub const DEFAULT_BARRIER_BUDGET: Duration = Duration::from_secs(600);
+/// See `Timeouts::barrier_down_after`.
+pub const DEFAULT_BARRIER_DOWN_AFTER: Duration = Duration::from_secs(120);
 pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
 pub const DEFAULT_KEEPALIVE_TIMEOUT: Duration = Duration::from_secs(3);
 
@@ -135,7 +145,16 @@ impl RemoteConfig {
             ca_pem: cfg.ca_pem.clone(),
             client_cert_path: cfg.client_cert_path.clone(),
             client_key_path: cfg.client_key_path.clone(),
-            timeouts: Timeouts::default(),
+            timeouts: {
+                let mut t = Timeouts::default();
+                if let Some(d) = cfg.smb_wait.max_wait() {
+                    t.barrier = d;
+                }
+                if let Some(d) = cfg.smb_wait.down_after() {
+                    t.barrier_down_after = d;
+                }
+                t
+            },
         }
     }
 
@@ -169,8 +188,10 @@ fn warn_if_wide(path: &str) {
         if let Ok(md) = std::fs::metadata(path)
             && md.permissions().mode() & 0o077 != 0
         {
-            eprintln!(
-                "janus: warning: {path} is accessible by group/others (mode {:o}); expected 0600",
+            jlog!(
+                Warn,
+                "backend",
+                "{path} is accessible by group/others (mode {:o}); expected 0600",
                 md.permissions().mode() & 0o777
             );
         }

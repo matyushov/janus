@@ -124,39 +124,60 @@ async fn run_client(cmd: Command) {
             }
             Err(e) => fail_rpc(e),
         },
-        Command::Status => match c.status(Empty {}).await {
-            Ok(reply) => {
-                let s = reply.into_inner();
-                println!("version:           {}", s.version);
-                println!("SMB sessions:      {}", s.smb_sessions);
-                println!("open handles:      {}", s.open_handles);
-                println!("parked durables:   {}", s.durable_handles_parked);
-                println!("journal backlog:   {} bytes", s.journal_backlog_bytes);
-                println!(
-                    "oldest unuploaded: {}",
-                    if s.journal_backlog_bytes == 0 {
-                        "-".to_string()
-                    } else {
-                        format!("{:.1} s ago", s.oldest_unuploaded_age_ms as f64 / 1000.0)
-                    }
-                );
-                println!("uploaded:          {} bytes", s.uploaded_bytes_total);
-                println!("upload errors:     {}", s.upload_errors);
-                println!("stuck files:       {}", s.sticky_error_files);
-                if !s.last_upload_error.is_empty() {
-                    println!("last upload error: {}", s.last_upload_error);
-                }
-                if s.last_appliance_ack_unix_ms > 0 {
-                    let ago = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_millis() as i64)
-                        .unwrap_or(0)
-                        - s.last_appliance_ack_unix_ms;
-                    println!("last server ack:   {:.1} s ago", ago.max(0) as f64 / 1000.0);
-                }
+        Command::Status { watch } => loop {
+            if watch.is_some() {
+                print!("\x1b[H\x1b[2J");
             }
-            Err(e) => fail_rpc(e),
+            match c.status(Empty {}).await {
+                Ok(reply) => {
+                    let s = reply.into_inner();
+                    println!("version:           {}", s.version);
+                    println!("SMB sessions:      {}", s.smb_sessions);
+                    println!("open handles:      {}", s.open_handles);
+                    println!(
+                        "waiting SMB ops:   {}{}",
+                        s.pending_smb_ops,
+                        if s.pending_smb_ops == 0 {
+                            String::new()
+                        } else {
+                            format!(
+                                " (oldest {:.1} s)",
+                                s.oldest_pending_smb_op_ms as f64 / 1000.0
+                            )
+                        }
+                    );
+                    println!("parked durables:   {}", s.durable_handles_parked);
+                    println!("journal backlog:   {} bytes", s.journal_backlog_bytes);
+                    println!(
+                        "oldest unuploaded: {}",
+                        if s.journal_backlog_bytes == 0 {
+                            "-".to_string()
+                        } else {
+                            format!("{:.1} s ago", s.oldest_unuploaded_age_ms as f64 / 1000.0)
+                        }
+                    );
+                    println!("uploaded:          {} bytes", s.uploaded_bytes_total);
+                    println!("upload errors:     {}", s.upload_errors);
+                    println!("stuck files:       {}", s.sticky_error_files);
+                    if !s.last_upload_error.is_empty() {
+                        println!("last upload error: {}", s.last_upload_error);
+                    }
+                    if s.last_appliance_ack_unix_ms > 0 {
+                        let ago = std::time::SystemTime::now()
+                            .duration_since(std::time::UNIX_EPOCH)
+                            .map(|d| d.as_millis() as i64)
+                            .unwrap_or(0)
+                            - s.last_appliance_ack_unix_ms;
+                        println!("last server ack:   {:.1} s ago", ago.max(0) as f64 / 1000.0);
+                    }
+                }
+                Err(e) => fail_rpc(e),
+            }
+            let Some(every) = watch else { break };
+            println!("\n(every {} s, Ctrl-C to stop)", every.as_secs_f64());
+            tokio::time::sleep(every).await;
         },
+        Command::Logs(a) => stream_logs(&mut c, a).await,
         Command::Quiesce => match c.quiesce(Empty {}).await {
             Ok(_) => println!("janus-smbd: writes paused"),
             Err(e) => fail_rpc(e),
@@ -248,6 +269,9 @@ fn build_configure(args: &ConfigureArgs) -> ConfigureRequest {
         journal_enabled: args.journal,
         journal_dir: args.journal_dir.clone(),
         max_backlog_bytes: args.max_backlog_mib << 20,
+        smb_interim_after_ms: args.interim_after_ms,
+        smb_max_wait_sec: args.max_wait_sec,
+        smb_down_after_sec: args.down_after_sec,
         ..Default::default()
     }
 }
@@ -261,17 +285,25 @@ async fn run_server(cmd: Command) {
     let mut c = ReceiverControlClient::new(channel);
 
     match cmd {
-        Command::Status => match c.status(Empty {}).await {
-            Ok(reply) => {
-                let s = reply.into_inner();
-                println!("version:           {}", s.version);
-                println!("active workers:    {}", s.active_workers);
-                println!("known machines:    {}", s.machines_known);
-                println!("gRPC sessions:     {}", s.grpc_sessions);
-                println!("received:          {} bytes", s.received_bytes_total);
-                println!("write errors:      {}", s.write_errors);
+        Command::Status { watch } => loop {
+            if watch.is_some() {
+                print!("\x1b[H\x1b[2J");
             }
-            Err(e) => fail_rpc(e),
+            match c.status(Empty {}).await {
+                Ok(reply) => {
+                    let s = reply.into_inner();
+                    println!("version:           {}", s.version);
+                    println!("active workers:    {}", s.active_workers);
+                    println!("known machines:    {}", s.machines_known);
+                    println!("gRPC sessions:     {}", s.grpc_sessions);
+                    println!("received:          {} bytes", s.received_bytes_total);
+                    println!("write errors:      {}", s.write_errors);
+                }
+                Err(e) => fail_rpc(e),
+            }
+            let Some(every) = watch else { break };
+            println!("\n(every {} s, Ctrl-C to stop)", every.as_secs_f64());
+            tokio::time::sleep(every).await;
         },
         Command::Machines => match c.list_machines(Empty {}).await {
             Ok(reply) => {
@@ -319,6 +351,53 @@ async fn run_server(cmd: Command) {
         }
         _ => unreachable!("client commands are rejected by the parser for server"),
     }
+}
+
+/// `logs`: print the daemon's log lines as they come, until the stream ends or Ctrl-C.
+async fn stream_logs(c: &mut SmbFrontControlClient<Channel>, a: cli::LogsArgs) {
+    let req = janus_proto::v1::LogRequest {
+        tail: a.tail,
+        follow: a.follow,
+        min_level: a.level,
+        components: a.components,
+        contains: a.grep,
+    };
+    let mut stream = match c.stream_logs(req).await {
+        Ok(r) => r.into_inner(),
+        Err(e) => fail_rpc(e),
+    };
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => return,
+            next = stream.message() => match next {
+                Ok(Some(l)) => println!("{}", format_log_line(&l)),
+                Ok(None) => return,
+                Err(e) => fail_rpc(e),
+            },
+        }
+    }
+}
+
+/// `HH:MM:SS.mmm LEVEL  component  text` (UTC).
+fn format_log_line(l: &janus_proto::v1::LogLine) -> String {
+    let ms = l.unix_ms.max(0);
+    let day_ms = ms % 86_400_000;
+    let level = match l.level {
+        0 => "DEBUG",
+        2 => "WARN",
+        3 => "ERROR",
+        _ => "INFO",
+    };
+    format!(
+        "{:02}:{:02}:{:02}.{:03} {:<5} {:<8} {}",
+        day_ms / 3_600_000,
+        day_ms / 60_000 % 60,
+        day_ms / 1000 % 60,
+        day_ms % 1000,
+        level,
+        l.component,
+        l.text
+    )
 }
 
 fn fail_rpc(e: tonic::Status) -> ! {

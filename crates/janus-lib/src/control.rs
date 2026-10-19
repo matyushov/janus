@@ -268,7 +268,8 @@ impl SmbFrontControl for ControlService {
         st.share = Some(share);
         st.remote = Some(remote);
 
-        // TODO(bonjour/SMB): rebuild the advertisement and the listener for the new port/share.
+        // The Bonjour advertisement follows the new share by itself (janus-smbd re-reads the
+        // configuration every few seconds). TODO: rebuild the SMB listener for a new port.
 
         Ok(Response::new(Ack {
             ok: true,

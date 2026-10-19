@@ -94,9 +94,12 @@ integrity, SESSION_SETUP over SPNEGO/NTLMv2, TREE_CONNECT/TREE_DISCONNECT/LOGOFF
 credits. J2 is done: the file model (CREATE, CLOSE, READ, WRITE, FLUSH, QUERY_INFO,
 QUERY_DIRECTORY, SET_INFO) over `StorageBackend`, with `LocalFsBackend` as the first backend; a
 real macOS client (`mount_smbfs`) mounts the share, copies files both ways and the hashes
-match (details and the run are in `crates/smb-core/README.md`). Next (J3) is `GrpcBackend` with
-the journal and the uploader.
-Business logic marked `todo!()` is tied to the architecture sections below.
+match (details and the run are in `crates/smb-core/README.md`). J3 is done: `GrpcBackend` over mTLS,
+the write-ahead journal with background upload, interim STATUS_PENDING for slow operations.
+J4 is implemented: Time Machine (`backupd`) completes a backup through the share (AAPL, durable and
+lease V2, `F_FULLFSYNC`, Bonjour); see `crates/smb-core/README.md` and the lab scripts in `tools/lab/`.
+Business logic marked `todo!()` (S3 backend, launchd socket activation, event broadcast) is tied to the
+architecture sections below.
 
 ## License
 

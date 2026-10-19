@@ -96,7 +96,37 @@ has the same SHA-256 on the client, in the mount and in the share directory.
 - READ/WRITE are limited to 64 KiB (no LARGE_MTU yet); the channel fields (RDMA) must be 0.
 
 Known gaps: no LOCK (macOS sends an exclusive whole-file `LOCK` with FAIL_IMMEDIATELY after
-every open; it copes with the error), no durable handles/leases/AAPL (J4), no
+every open and diskimages sends it for the bundle's `lock` file; both cope with
+NOT_IMPLEMENTED, checked with a real Time Machine backup), no CHANGE_NOTIFY, no
 `FileRenameInformationEx`, other opens under a renamed directory keep their old path, no
 STATUS_DELETE_PENDING for new opens of a file marked for deletion, SET_INFO of security and
 file attributes (read-only, hidden) is not applied.
+
+## Time Machine support (J4)
+
+Checked with a real `backupd` (macOS 26): a full backup completes, files restore byte for byte,
+and killing the daemon in the middle of a backup does not break it. The lab scripts are in
+`tools/lab/`.
+
+- **AAPL** (`apple.rs`): the server query on CREATE is answered with `FULL_SYNC | CASE_SENSITIVE` in
+  the *volume* capabilities (`tmutil` refuses the share without FULL_SYNC), server capabilities 0,
+  model string. Profile driven (`CompatCaps`), no OS branching.
+- **Durable handles V2 and lease V2** (`shared.rs`, `session.rs`, `files.rs`): `DH2Q`/`DH2C`/`RqLs`
+  (v1 and v2). The NEGOTIATE reply advertises `LEASING` for the Time Machine profile only (without
+  it the kernel answers ENOTSUP; persistent handles or directory leasing make the client drop the
+  connection, so they are not advertised). A durable handle is granted only together with a lease
+  that has H. When the connection drops it is parked and reclaimed with DH2C by the same user and
+  ClientGuid within the timeout (0 asks for the 60 s default, capped at 300 s). Durable opens are
+  persisted when granted, with a once-a-second heartbeat, in `parked-handles.json` next to the
+  journal, so a reconnect also works after a daemon restart or `kill -9` (the file is reopened by
+  path; the deadline is the last heartbeat plus the timeout).
+- **Lease breaks**: a conflicting open (data access under another lease key) breaks the holder's lease;
+  the holder gets an unsolicited LEASE_BREAK and the opener waits for the acknowledgment, forced after
+  35 s. If the holder is the opener's own connection the opener does not wait (the ack could only
+  arrive on the blocked connection); a lease of a parked handle gives way at once.
+- **`F_FULLFSYNC`** is FLUSH with `Reserved1 = 0xffff`; plain and full flushes both wait for a real fsync.
+- Request trace: `JANUS_SMB_TRACE=2` dumps every request (WRITE payload cut off);
+  `tools/smb-trace-summary.py` summarises it.
+
+Not done: a CREATE does not wait for a receiver that is down (it fails at once, and a backup image
+does not survive that); no byte-range locks; share modes are not enforced.

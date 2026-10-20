@@ -8,7 +8,11 @@
 use std::path::PathBuf;
 
 fn main() {
-    let out = PathBuf::from(std::env::args().nth(1).expect("usage: gen_header <output.h>"));
+    let out = PathBuf::from(
+        std::env::args()
+            .nth(1)
+            .expect("usage: gen_header <output.h>"),
+    );
     let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let bindings = cbindgen::Builder::new()
         .with_crate(&dir)

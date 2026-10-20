@@ -78,10 +78,16 @@ impl JournalConfig {
     }
 
     pub fn resolve_dir(&self) -> Option<PathBuf> {
+        self.resolve_dir_in(state_dir().as_deref())
+    }
+
+    /// Like `resolve_dir`, with an explicit state directory instead of the environment's
+    /// (the embedding SDK never reads `HOME`).
+    pub fn resolve_dir_in(&self, state_dir: Option<&Path>) -> Option<PathBuf> {
         if !self.dir.is_empty() {
             return Some(PathBuf::from(&self.dir));
         }
-        state_dir().map(|d| d.join("journal"))
+        state_dir.map(|d| d.join("journal"))
     }
 }
 

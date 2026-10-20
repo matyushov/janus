@@ -20,20 +20,14 @@
 //! SMB user: `JANUS_SMB_USER`/`JANUS_SMB_PASSWORD` (dev) or the file
 //! `JANUS_SMB_CREDS_FILE` / `~/.config/janus/smb-credentials` (mode 0600;
 //! created by `janus-cli client configure`). There is no guest access.
+//!
+//! All the logic lives in the `janus-client` library; this binary reads the environment and
+//! waits for a shutdown request.
 
 mod launchd;
 
-use std::sync::Arc;
-
-use janus_lib::config::ConfigStore;
-use janus_lib::control::{ControlService, DaemonState, WriteGate};
-use janus_lib::credentials::CredentialStore;
+use janus_client::{Client, ClientConfig, ExitReason, StopMode};
 use janus_lib::jlog;
-use janus_lib::switch_backend::SwitchBackend;
-use janus_lib::vfs::{LocalFsBackend, StorageBackend};
-use janus_proto::v1::smb_front_control_server::SmbFrontControlServer;
-use smb_core::server::{DevServer, ServerConfig};
-use tokio::sync::Mutex;
 
 /// The share host is a model invariant (SMB does not leave the machine). Not a parameter.
 const HOST: &str = "127.0.0.1";
@@ -42,6 +36,8 @@ const CONTROL_ADDR: &str = "127.0.0.1:50051";
 /// Default SMB listener. 445 is taken by the system SMB server on Windows and
 /// needs privileges, so for debugging we take a high port.
 const SMB_PORT: u16 = 4445;
+const BONJOUR_ENV: &str = "JANUS_BONJOUR";
+const TRACE_ENV: &str = "JANUS_SMB_TRACE";
 
 /// Overrides for dev setups and tests.
 const CONTROL_ADDR_ENV: &str = "JANUS_CLIENT_ADDR";
@@ -68,7 +64,7 @@ fn main() {
         }
     }
 
-    run(dev);
+    std::process::exit(run(dev));
 }
 
 fn print_usage() {
@@ -85,224 +81,70 @@ fn print_usage() {
     );
 }
 
-/// Durable handles parked by a dropped connection are kept next to the journal, so a client
-/// can reclaim them after a daemon restart too.
-async fn open_shared(state: &Arc<Mutex<DaemonState>>) -> Arc<smb_core::shared::Shared> {
-    let dir = {
-        let st = state.lock().await;
-        match &st.share {
-            Some(s) => s.journal.resolve_dir(),
-            None => janus_lib::config::JournalConfig::default().resolve_dir(),
+/// Everything the old daemon took from the environment, as explicit configuration.
+fn config_from_env() -> ClientConfig {
+    let config_file = janus_lib::config::default_path();
+    if config_file.is_none() {
+        jlog!(
+            Warn,
+            "daemon",
+            "no config path (set JANUS_CONFIG); configuration is not persisted"
+        );
+    }
+    ClientConfig {
+        state_dir: janus_lib::config::state_dir(),
+        config_file,
+        smb_listen: std::env::var(SMB_ADDR_ENV).unwrap_or_else(|_| format!("{HOST}:{SMB_PORT}")),
+        allow_non_loopback: true,
+        control_listen: Some(
+            std::env::var(CONTROL_ADDR_ENV).unwrap_or_else(|_| CONTROL_ADDR.to_string()),
+        ),
+        smb_user: std::env::var(janus_lib::credentials::USER_ENV).ok(),
+        smb_password: std::env::var(janus_lib::credentials::PASSWORD_ENV).ok(),
+        smb_credentials_file: janus_lib::credentials::default_path(),
+        // `janus-cli client configure` creates the account.
+        generate_credentials: false,
+        local_root: std::env::var_os(LOCAL_ROOT_ENV).map(std::path::PathBuf::from),
+        bonjour: true,
+        bonjour_without_share: std::env::var(BONJOUR_ENV).as_deref() == Ok("1"),
+        trace: match std::env::var(TRACE_ENV).as_deref() {
+            Ok("1") => 1,
+            Ok("2") => 2,
+            _ => 0,
+        },
+        ..ClientConfig::default()
+    }
+}
+
+/// The exit code of the process.
+fn run(dev: bool) -> i32 {
+    let client = match Client::start(config_from_env()) {
+        Ok(c) => c,
+        Err(e) => {
+            jlog!(Error, "daemon", "{e}");
+            return 1;
         }
     };
-    let store = match dir.map(|d| janus_lib::journal::ParkedHandleStore::in_dir(&d)) {
-        Some(Ok(store)) => store,
-        Some(Err(e)) => {
-            jlog!(
-                Warn,
-                "daemon",
-                "durable handles will not survive a restart: {e}"
-            );
-            janus_lib::journal::ParkedHandleStore::in_memory()
+    if dev {
+        jlog!(
+            Info,
+            "daemon",
+            "dev mode; configure with: janus-cli client configure …"
+        );
+    }
+    // The failure of either plane is fatal for the daemon.
+    match client.wait() {
+        ExitReason::ShutdownRequested => {
+            jlog!(Info, "daemon", "stopping on shutdown command");
+            // Let the gRPC reply to Shutdown reach the client.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            client.stop(StopMode::Immediate);
+            0
         }
-        None => janus_lib::journal::ParkedHandleStore::in_memory(),
-    };
-    Arc::new(smb_core::shared::Shared::new(store))
-}
-
-/// Keeps the mDNS advertisement in line with the configured share (set by `Configure`, so it
-/// is re-read periodically) and restarts it if `dns-sd` dies. macOS only; elsewhere a no-op.
-/// Without a configured share (dev runs with `JANUS_SMB_LOCAL_ROOT`) it is off, unless
-/// `JANUS_BONJOUR=1`.
-fn spawn_bonjour(
-    state: &Arc<Mutex<DaemonState>>,
-    port: u16,
-) -> Arc<std::sync::Mutex<janus_lib::bonjour::BonjourAdvertiser>> {
-    let state = Arc::clone(state);
-    let adv = Arc::new(std::sync::Mutex::new(
-        janus_lib::bonjour::BonjourAdvertiser::default(),
-    ));
-    let handle = Arc::clone(&adv);
-    tokio::spawn(async move {
-        loop {
-            let wanted = {
-                let st = state.lock().await;
-                match &st.share {
-                    Some(s) if s.advertise_bonjour => Some(s.share_name.clone()),
-                    Some(_) => None,
-                    None if std::env::var("JANUS_BONJOUR").as_deref() == Ok("1") => {
-                        Some(smb_core::server::DEFAULT_SHARE.to_owned())
-                    }
-                    None => None,
-                }
-            };
-            let wanted = wanted.map(|share| janus_lib::bonjour::Registration {
-                share: if share.is_empty() {
-                    smb_core::server::DEFAULT_SHARE.to_owned()
-                } else {
-                    share
-                },
-                port,
-            });
-            adv.lock().unwrap_or_else(|e| e.into_inner()).sync(wanted);
-            tokio::time::sleep(std::time::Duration::from_secs(5)).await;
+        // Both planes log their own failure.
+        ExitReason::ControlStopped(_) | ExitReason::SmbStopped(_) => {
+            client.stop(StopMode::Immediate);
+            1
         }
-    });
-    handle
-}
-
-fn spawn_smb<B: StorageBackend>(
-    state: &Arc<Mutex<DaemonState>>,
-    credentials: &Arc<CredentialStore>,
-    pending: &Arc<janus_lib::observability::PendingOps>,
-    backend: Arc<B>,
-    listener: tokio::net::TcpListener,
-    shared: Arc<smb_core::shared::Shared>,
-) -> tokio::task::JoinHandle<std::io::Result<()>> {
-    let server = Arc::new(
-        DevServer::new(
-            ServerConfig::default(),
-            Arc::clone(state),
-            Arc::clone(credentials),
-            backend,
-        )
-        .with_pending_ops(Arc::clone(pending))
-        .with_shared(shared),
-    );
-    tokio::spawn(async move { server.serve(listener).await })
-}
-
-fn run(dev: bool) {
-    let control_addr = std::env::var(CONTROL_ADDR_ENV).unwrap_or_else(|_| CONTROL_ADDR.to_string());
-    let smb_addr = std::env::var(SMB_ADDR_ENV).unwrap_or_else(|_| format!("{HOST}:{SMB_PORT}"));
-
-    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-    rt.block_on(async move {
-        // Persisted configuration: a restart comes back with the previous share.
-        let config_path = janus_lib::config::default_path();
-        let config = Arc::new(match &config_path {
-            Some(p) => match ConfigStore::load(p) {
-                Ok(c) => {
-                    if c.is_configured() {
-                        jlog!(Info, "daemon", "configuration restored from {}", p.display());
-                    }
-                    c
-                }
-                Err(e) => {
-                    jlog!(Error, "daemon", "cannot use config file {}: {e}", p.display());
-                    std::process::exit(1);
-                }
-            },
-            None => {
-                jlog!(Warn, "daemon", "no config path (set JANUS_CONFIG); configuration is not persisted");
-                ConfigStore::in_memory()
-            }
-        });
-        let state = Arc::new(Mutex::new(DaemonState::from_config(&config)));
-        let gate = Arc::new(WriteGate::default());
-        let pending_ops = Arc::new(janus_lib::observability::PendingOps::default());
-        let switch = Arc::new(SwitchBackend::new().with_gate(Arc::clone(&gate)));
-        if let Err(e) = state.lock().await.install_backend(&switch) {
-            jlog!(Error, "daemon", "cannot start the journal: {e}");
-            std::process::exit(1);
-        }
-        // SMB account: dev uses JANUS_SMB_USER/JANUS_SMB_PASSWORD, otherwise a 0600 file
-        // (created by `janus-cli client configure`). There is no guest access.
-        let credentials = Arc::new(CredentialStore::from_process_env());
-        match credentials.get() {
-            Some(c) => jlog!(Info, "daemon", "SMB user \"{}\" (password is not logged)", c.user),
-            None => jlog!(Warn, "daemon", 
-                "no SMB credentials — logins are rejected until `janus-cli client configure` \
-                 (or set {}/{})",
-                janus_lib::credentials::USER_ENV,
-                janus_lib::credentials::PASSWORD_ENV
-            ),
-        }
-
-        // --- control plane (janus-cli client / the orchestrator agent) ---
-        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
-        let control_svc =
-            ControlService::new(Arc::clone(&state), Arc::clone(&gate))
-                .with_shutdown(shutdown_tx)
-                .with_config(Arc::clone(&config))
-                .with_pending_ops(Arc::clone(&pending_ops))
-                .with_backend(Arc::clone(&switch))
-                .with_credentials(Arc::clone(&credentials));
-        let control_listener = match tokio::net::TcpListener::bind(&control_addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                jlog!(Error, "daemon", "failed to listen on control {control_addr}: {e}");
-                std::process::exit(1);
-            }
-        };
-        jlog!(Info, "daemon", "control plane on {control_addr} (janus-cli client …)");
-        let control = tokio::spawn(async move {
-            let incoming = tokio_stream::wrappers::TcpListenerStream::new(control_listener);
-            tonic::transport::Server::builder()
-                .add_service(SmbFrontControlServer::new(control_svc))
-                .serve_with_incoming(incoming)
-                .await
-        });
-
-        // --- SMB listener ---
-        // TODO(prod): in normal mode the socket comes from launchd/systemd
-        // (socket activation) and is not bound here; see launchd.rs.
-        let smb_listener = match tokio::net::TcpListener::bind(&smb_addr).await {
-            Ok(l) => l,
-            Err(e) => {
-                jlog!(Error, "daemon", "failed to listen on SMB {smb_addr}: {e}");
-                std::process::exit(1);
-            }
-        };
-        jlog!(Info, "daemon", "SMB on {smb_addr} (mount point smb://{smb_addr}/<share>)");
-        let bonjour =
-            spawn_bonjour(&state, smb_listener.local_addr().map(|a| a.port()).unwrap_or(SMB_PORT));
-        if dev {
-            jlog!(Info, "daemon", "dev mode; configure with: janus-cli client configure …");
-        }
-        // Backend: production serves the share from the receiver (gRPC/mTLS), built from the
-        // persisted/pushed configuration and rebuilt on every `Configure`. Setting
-        // JANUS_SMB_LOCAL_ROOT selects a plain local directory instead (dev, no receiver).
-        let shared = open_shared(&state).await;
-        let smb = if let Some(root) = std::env::var_os(LOCAL_ROOT_ENV) {
-            let root = std::path::PathBuf::from(root);
-            let backend = match LocalFsBackend::new(&root) {
-                Ok(b) => Arc::new(b),
-                Err(e) => {
-                    jlog!(Error, "daemon", 
-                        "cannot use {} as the share directory: {e}",
-                        root.display()
-                    );
-                    std::process::exit(1);
-                }
-            };
-            jlog!(Info, "daemon", 
-                "DEV share directory {} ({LOCAL_ROOT_ENV}); no receiver is used",
-                root.display()
-            );
-            spawn_smb(&state, &credentials, &pending_ops, backend, smb_listener, shared)
-        } else {
-            let backend = Arc::clone(&switch);
-            jlog!(Info, "daemon", 
-                "share backend: receiver over gRPC/mTLS (waits for `janus-cli client configure` if not configured)"
-            );
-            spawn_smb(&state, &credentials, &pending_ops, backend, smb_listener, shared)
-        };
-
-        // The failure of either plane is fatal for the daemon.
-        tokio::select! {
-            r = control => jlog!(Warn, "daemon", "control plane stopped: {r:?}"),
-            r = smb => jlog!(Warn, "daemon", "SMB plane stopped: {r:?}"),
-            _ = shutdown_rx => {
-                jlog!(Info, "daemon", "stopping on shutdown command");
-                // Let the gRPC reply to Shutdown reach the client.
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                // The dns-sd children would outlive the process otherwise.
-                bonjour.lock().unwrap_or_else(|e| e.into_inner()).stop();
-                std::process::exit(0);
-            }
-        }
-        bonjour.lock().unwrap_or_else(|e| e.into_inner()).stop();
-        std::process::exit(1);
-    });
+    }
 }

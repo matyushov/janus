@@ -5,6 +5,7 @@
 //! short static tag (`smb`, `daemon`, `backend`, `control`) that clients can filter on.
 
 use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use tokio::sync::broadcast;
@@ -80,9 +81,16 @@ impl Filter {
     }
 }
 
+/// Receives every line after it is recorded (the embedding SDK forwards it to the host app).
+/// Called on the logging thread: it must be quick and must not log itself.
+pub type Sink = std::sync::Arc<dyn Fn(&Line) + Send + Sync>;
+
 struct Hub {
     ring: Mutex<(VecDeque<Line>, u64)>,
     tx: broadcast::Sender<Line>,
+    sink: Mutex<Option<Sink>>,
+    /// Lines go to stderr unless an embedding application switched that off.
+    stderr: AtomicBool,
 }
 
 fn hub() -> &'static Hub {
@@ -90,13 +98,27 @@ fn hub() -> &'static Hub {
     HUB.get_or_init(|| Hub {
         ring: Mutex::new((VecDeque::new(), 0)),
         tx: broadcast::channel(4096).0,
+        sink: Mutex::new(None),
+        stderr: AtomicBool::new(true),
     })
+}
+
+/// Install (or remove, with `None`) the sink that sees every line from now on.
+pub fn set_sink(sink: Option<Sink>) {
+    *hub().sink.lock().unwrap_or_else(|e| e.into_inner()) = sink;
+}
+
+/// Whether lines are also printed to stderr (default: yes).
+pub fn set_stderr(on: bool) {
+    hub().stderr.store(on, Ordering::Relaxed);
 }
 
 /// Record a line (and print it to stderr). Use `jlog!` instead of calling this directly.
 pub fn emit(level: Level, component: &'static str, text: String) {
     let h = hub();
-    eprintln!("{} {component}: {text}", level.name());
+    if h.stderr.load(Ordering::Relaxed) {
+        eprintln!("{} {component}: {text}", level.name());
+    }
     let unix_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as i64);
@@ -114,7 +136,13 @@ pub fn emit(level: Level, component: &'static str, text: String) {
     }
     ring.0.push_back(line.clone());
     // Sent under the lock so that `subscribe` never misses or repeats a line.
-    let _ = h.tx.send(line);
+    let _ = h.tx.send(line.clone());
+    drop(ring);
+    // Outside the ring lock: a slow sink must not stall `subscribe`.
+    let sink = h.sink.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    if let Some(sink) = sink {
+        sink(&line);
+    }
 }
 
 /// The last `tail` matching lines, and a receiver of everything logged from now on.

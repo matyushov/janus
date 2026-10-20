@@ -1,0 +1,9 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: janus
+Description: janus client SDK (shared library). macOS mounting helper needs: @JANUS_PC_MOUNT_LIBS@
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -ljanus -Wl,-rpath,${libdir}
+Cflags: -I${includedir} -DJANUS_SHARED

@@ -1,0 +1,16 @@
+{
+  global:
+    janus_client_abi_version;
+    janus_client_version;
+    janus_client_start;
+    janus_client_mount_info;
+    janus_client_ready;
+    janus_client_configure;
+    janus_client_status_json;
+    janus_client_drain;
+    janus_client_stop;
+    janus_free_string;
+    janus_last_error;
+  local:
+    *;
+};

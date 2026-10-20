@@ -87,6 +87,18 @@ janus-smbd --dev                       # a foreground SMB server on 127.0.0.1
 janus-cli smbd configure --endpoint … --client-cert … --client-key … --ca … [--port N] [--share NAME]
 ```
 
+**Client SDK (libjanus) and C++ examples.** Needs CMake ≥ 3.20 and a C++23 compiler; cargo builds the
+library, cbindgen generates `janus.h`, the examples link `libjanus.a` statically. See
+[`examples/README.md`](examples/README.md) and [`crates/janus-ffi/README.md`](crates/janus-ffi/README.md).
+```
+cmake -S examples -B build/examples          # build the examples (libjanus is built from source)
+cmake --build build/examples
+./build/examples/01_hello_embed
+
+cmake -S . -B build/janus && cmake --build build/janus     # only the SDK
+cmake --install build/janus --prefix ~/janus-sdk           # headers, libs, CMake and pkg-config files
+```
+
 ## Implementation status
 
 J1 is done: SMB 3.1.1 (the only dialect, signing mandatory), NEGOTIATE with preauth

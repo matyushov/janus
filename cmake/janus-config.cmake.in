@@ -1,0 +1,55 @@
+@PACKAGE_INIT@
+
+# Imported targets of the installed libjanus. Paths are relative to this file, so the package
+# can be moved. Usage:
+#   find_package(janus CONFIG REQUIRED)
+#   target_link_libraries(app PRIVATE janus::client_static)
+
+if(NOT TARGET janus::client_static)
+  set_and_check(_janus_include "@PACKAGE_CMAKE_INSTALL_INCLUDEDIR@")
+  set_and_check(_janus_lib "@PACKAGE_CMAKE_INSTALL_LIBDIR@")
+
+  add_library(janus::client_static STATIC IMPORTED)
+  add_library(janus::client_shared SHARED IMPORTED)
+
+  if(WIN32)
+    set_target_properties(janus::client_static PROPERTIES IMPORTED_LOCATION "${_janus_lib}/janus.lib")
+    set_and_check(_janus_bin "@PACKAGE_CMAKE_INSTALL_BINDIR@")
+    set_target_properties(janus::client_shared PROPERTIES
+      IMPORTED_LOCATION "${_janus_bin}/janus.dll" IMPORTED_IMPLIB "${_janus_lib}/janus.dll.lib")
+  elseif(APPLE)
+    set_target_properties(janus::client_static PROPERTIES IMPORTED_LOCATION "${_janus_lib}/libjanus.a")
+    set_target_properties(janus::client_shared PROPERTIES
+      IMPORTED_LOCATION "${_janus_lib}/libjanus.dylib" IMPORTED_SONAME "@rpath/libjanus.dylib")
+  else()
+    set_target_properties(janus::client_static PROPERTIES IMPORTED_LOCATION "${_janus_lib}/libjanus.a")
+    set_target_properties(janus::client_shared PROPERTIES
+      IMPORTED_LOCATION "${_janus_lib}/libjanus.so" IMPORTED_SONAME "libjanus.so")
+  endif()
+
+  # System libraries the static library needs.
+  if(APPLE)
+    set(_janus_native iconv m)
+  elseif(WIN32)
+    set(_janus_native ws2_32 userenv bcrypt ntdll advapi32 kernel32 synchronization)
+  else()
+    set(_janus_native gcc_s util rt pthread m dl c)
+  endif()
+
+  set_target_properties(janus::client_static PROPERTIES
+    INTERFACE_INCLUDE_DIRECTORIES "${_janus_include}"
+    INTERFACE_LINK_LIBRARIES "${_janus_native}"
+    INTERFACE_COMPILE_FEATURES cxx_std_17)
+  set_target_properties(janus::client_shared PROPERTIES
+    INTERFACE_INCLUDE_DIRECTORIES "${_janus_include}"
+    INTERFACE_COMPILE_DEFINITIONS JANUS_SHARED
+    INTERFACE_COMPILE_FEATURES cxx_std_17)
+
+  if(APPLE)
+    add_library(janus::mount_macos INTERFACE IMPORTED)
+    set_target_properties(janus::mount_macos PROPERTIES
+      INTERFACE_LINK_LIBRARIES "-framework NetFS;-framework CoreFoundation")
+  endif()
+endif()
+
+check_required_components(janus)

@@ -196,32 +196,40 @@ fn share_from_request(req: &ConfigureRequest) -> ShareConfig {
     }
 }
 
-#[tonic::async_trait]
-impl SmbFrontControl for ControlService {
-    /// Apply the configuration: save it and build the receiver client.
-    /// The network is not touched here: the connection is lazy, the check is in `EnsureReady`.
-    async fn configure(&self, req: Request<ConfigureRequest>) -> Result<Response<Ack>, Status> {
-        let req = req.into_inner();
-        if req.appliance_endpoint.is_empty() {
-            return Err(Status::invalid_argument("appliance_endpoint is required"));
-        }
+/// Why `ControlService::apply_share` did not apply a configuration.
+#[derive(Debug)]
+pub enum ApplyError {
+    /// The configuration itself is wrong (a bad argument).
+    Invalid(String),
+    /// The configuration is fine but could not be put in place (disk, journal, backend).
+    Refused(String),
+}
 
-        let share = share_from_request(&req);
+impl std::fmt::Display for ApplyError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ApplyError::Invalid(e) | ApplyError::Refused(e) => f.write_str(e),
+        }
+    }
+}
+
+impl ControlService {
+    /// `Configure` without the wire types: validate, persist, install the backend, publish.
+    pub async fn apply_share(&self, share: ShareConfig) -> Result<(), ApplyError> {
         if let Err(e) = share.validate() {
-            return Err(Status::invalid_argument(e.to_string()));
+            return Err(ApplyError::Invalid(e.to_string()));
         }
         let remote_cfg = RemoteConfig::from_share(&share);
         let remote = RemoteClient::connect_lazy(&remote_cfg)
-            .map_err(|e| Status::invalid_argument(e.to_string()))?;
+            .map_err(|e| ApplyError::Invalid(e.to_string()))?;
 
         // There is no guest access: SMB does not work without a login/password pair.
         if let Some(store) = &self.credentials
             && let Err(e) = store.ensure_generated()
         {
-            return Ok(Response::new(Ack {
-                ok: false,
-                error: format!("failed to create SMB credentials: {e}"),
-            }));
+            return Err(ApplyError::Refused(format!(
+                "failed to create SMB credentials: {e}"
+            )));
         }
 
         // What to restore if the backend refuses the new configuration after it was persisted
@@ -237,10 +245,9 @@ impl SmbFrontControl for ControlService {
         if let Some(cfg) = &self.config
             && let Err(e) = cfg.apply(share.clone())
         {
-            return Ok(Response::new(Ack {
-                ok: false,
-                error: format!("failed to persist configuration: {e}"),
-            }));
+            return Err(ApplyError::Refused(format!(
+                "failed to persist configuration: {e}"
+            )));
         }
 
         #[cfg(feature = "backend-grpc")]
@@ -258,10 +265,7 @@ impl SmbFrontControl for ControlService {
                     "could not restore the previous configuration: {re}"
                 );
             }
-            return Ok(Response::new(Ack {
-                ok: false,
-                error: format!("configuration refused: {e}"),
-            }));
+            return Err(ApplyError::Refused(format!("configuration refused: {e}")));
         }
 
         let mut st = self.state.lock().await;
@@ -271,44 +275,43 @@ impl SmbFrontControl for ControlService {
         // The Bonjour advertisement follows the new share by itself (janus-smbd re-reads the
         // configuration every few seconds). TODO: rebuild the SMB listener for a new port.
 
-        Ok(Response::new(Ack {
-            ok: true,
-            error: String::new(),
-        }))
+        Ok(())
     }
+}
 
-    /// An ordered chain of checks; the first one to fail goes into `blocker`,
-    /// so that the operator sees "what to fix", not just "not ready".
-    async fn ensure_ready(&self, _req: Request<Empty>) -> Result<Response<Readiness>, Status> {
+impl ControlService {
+    /// The ordered readiness chain behind `EnsureReady`.
+    pub async fn readiness(&self) -> Readiness {
         let mut st = self.state.lock().await;
 
         if st.share.is_none() {
-            return Ok(Response::new(Readiness {
+            return Readiness {
                 ready: false,
                 blocker: "no-config".into(),
-            }));
+            };
         }
 
         let Some(remote) = st.remote.as_mut() else {
-            return Ok(Response::new(Readiness {
+            return Readiness {
                 ready: false,
                 blocker: "no-remote-client".into(),
-            }));
+            };
         };
 
         match remote.ping().await {
-            Ok(_server_version) => Ok(Response::new(Readiness {
+            Ok(_server_version) => Readiness {
                 ready: true,
                 blocker: String::new(),
-            })),
-            Err(e) => Ok(Response::new(Readiness {
+            },
+            Err(e) => Readiness {
                 ready: false,
                 blocker: format!("appliance-unreachable: {e}"),
-            })),
+            },
         }
     }
 
-    async fn status(&self, _req: Request<Empty>) -> Result<Response<StatusReply>, Status> {
+    /// What `Status` reports.
+    pub async fn status_reply(&self) -> StatusReply {
         let st = self.state.lock().await;
         #[cfg_attr(not(feature = "backend-grpc"), allow(unused_mut))]
         let mut reply = StatusReply {
@@ -346,25 +349,60 @@ impl SmbFrontControl for ControlService {
                 reply.sticky_error_files = s.sticky_files as u32;
             }
         }
-        Ok(Response::new(reply))
+        reply
+    }
+
+    /// Wait until everything accepted so far reached the receiver and was fsynced there.
+    pub async fn drain_for(&self, timeout: std::time::Duration) -> DrainReply {
+        #[cfg(feature = "backend-grpc")]
+        if let Some(b) = &self.backend {
+            let (drained, remaining_bytes) = b.drain(timeout).await;
+            return DrainReply {
+                drained,
+                remaining_bytes,
+            };
+        }
+        let _ = timeout;
+        DrainReply {
+            drained: true,
+            remaining_bytes: 0,
+        }
+    }
+}
+
+#[tonic::async_trait]
+impl SmbFrontControl for ControlService {
+    /// Apply the configuration: save it and build the receiver client.
+    /// The network is not touched here: the connection is lazy, the check is in `EnsureReady`.
+    async fn configure(&self, req: Request<ConfigureRequest>) -> Result<Response<Ack>, Status> {
+        let req = req.into_inner();
+        if req.appliance_endpoint.is_empty() {
+            return Err(Status::invalid_argument("appliance_endpoint is required"));
+        }
+        match self.apply_share(share_from_request(&req)).await {
+            Ok(()) => Ok(Response::new(Ack {
+                ok: true,
+                error: String::new(),
+            })),
+            Err(ApplyError::Invalid(e)) => Err(Status::invalid_argument(e)),
+            Err(ApplyError::Refused(error)) => Ok(Response::new(Ack { ok: false, error })),
+        }
+    }
+
+    /// An ordered chain of checks; the first one to fail goes into `blocker`,
+    /// so that the operator sees "what to fix", not just "not ready".
+    async fn ensure_ready(&self, _req: Request<Empty>) -> Result<Response<Readiness>, Status> {
+        Ok(Response::new(self.readiness().await))
+    }
+
+    async fn status(&self, _req: Request<Empty>) -> Result<Response<StatusReply>, Status> {
+        Ok(Response::new(self.status_reply().await))
     }
 
     /// Wait until everything accepted so far reached the receiver and was fsynced there.
     async fn drain(&self, req: Request<DrainRequest>) -> Result<Response<DrainReply>, Status> {
         let timeout = std::time::Duration::from_secs(req.into_inner().timeout_sec.max(1) as u64);
-        #[cfg(feature = "backend-grpc")]
-        if let Some(b) = &self.backend {
-            let (drained, remaining_bytes) = b.drain(timeout).await;
-            return Ok(Response::new(DrainReply {
-                drained,
-                remaining_bytes,
-            }));
-        }
-        let _ = timeout;
-        Ok(Response::new(DrainReply {
-            drained: true,
-            remaining_bytes: 0,
-        }))
+        Ok(Response::new(self.drain_for(timeout).await))
     }
 
     async fn quiesce(&self, _req: Request<Empty>) -> Result<Response<Ack>, Status> {

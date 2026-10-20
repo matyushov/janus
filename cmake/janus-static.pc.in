@@ -1,0 +1,10 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: janus-static
+Description: janus client SDK (static library). macOS mounting helper needs: @JANUS_PC_MOUNT_LIBS@
+Version: @PROJECT_VERSION@
+# The archive is named by path so that a shared libjanus next to it is never picked instead.
+Libs: ${libdir}/libjanus.a@JANUS_PC_PRIVATE_LIBS@
+Cflags: -I${includedir}

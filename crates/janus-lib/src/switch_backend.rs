@@ -38,6 +38,9 @@ pub struct SwitchBackend {
     old: Mutex<Vec<(u16, Arc<GrpcBackend>)>>,
     next_gen: Mutex<u16>,
     gate: Option<Arc<WriteGate>>,
+    /// `Some` = the state directory is given explicitly (possibly absent); `None` = taken from
+    /// the environment (`janus-smbd`).
+    state_dir: Option<Option<std::path::PathBuf>>,
 }
 
 impl SwitchBackend {
@@ -51,6 +54,20 @@ impl SwitchBackend {
         self
     }
 
+    /// Resolve the default journal directory against `dir` instead of the environment.
+    pub fn with_state_dir(mut self, dir: Option<std::path::PathBuf>) -> Self {
+        self.state_dir = Some(dir);
+        self
+    }
+
+    /// The journal directory of `share` (explicit state dir, else the environment's).
+    pub fn journal_dir_of(&self, share: &ShareConfig) -> Option<std::path::PathBuf> {
+        match &self.state_dir {
+            Some(d) => share.journal.resolve_dir_in(d.as_deref()),
+            None => share.journal.resolve_dir(),
+        }
+    }
+
     /// Install a backend built from `remote` and the share configuration (quota, journal).
     /// Fails if the journal cannot be opened, or if it still holds unuploaded bytes for a
     /// different destination (another endpoint or client certificate: those bytes belong to
@@ -62,9 +79,8 @@ impl SwitchBackend {
         let backend = GrpcBackend::from_remote(remote, share.quota_bytes)
             .with_destination(destination.clone());
         let backend = if share.journal.enabled {
-            let dir = share
-                .journal
-                .resolve_dir()
+            let dir = self
+                .journal_dir_of(share)
                 .ok_or_else(|| std::io::Error::other("no journal directory (set HOME)"))?;
             let settings = JournalSettings {
                 max_backlog: share.journal.max_backlog(),

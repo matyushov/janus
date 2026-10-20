@@ -7,11 +7,6 @@ publish.workspace = true
 license.workspace = true
 
 [dependencies]
-smb-core = { path = "../smb-core" }
+janus-client = { path = "../janus-client" }
 janus-lib = { path = "../janus-lib", features = ["backend-grpc"] }
-janus-proto = { path = "../janus-proto" }
-smb-wire = { path = "../smb-wire" }
-tokio = { workspace = true }
-tokio-stream = { version = "0.1", features = ["net"] }
-tonic = { workspace = true }
 # TODO: launchd check-in (raw fd), tracing

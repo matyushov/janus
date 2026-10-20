@@ -1,0 +1,21 @@
+[package]
+name = "janus-client"
+description = "The janus client core: the local SMB endpoint, the journal and the mTLS link to the receiver, as a library that runs inside any process. janus-smbd and the janus-ffi SDK are thin wrappers over it."
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+license.workspace = true
+
+[dependencies]
+smb-core = { path = "../smb-core" }
+janus-lib = { path = "../janus-lib", features = ["backend-grpc"] }
+janus-proto = { path = "../janus-proto" }
+tokio = { workspace = true }
+tokio-stream = { version = "0.1", features = ["net"] }
+tonic = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
+janus-proto = { path = "../janus-proto" }
+tonic = { workspace = true }

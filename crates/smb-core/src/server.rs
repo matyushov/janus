@@ -117,12 +117,15 @@ impl<B: StorageBackend> DevServer<B> {
             async_cfg: AsyncConfig::default(),
             pending: Arc::default(),
             shared: Arc::default(),
-            trace: match std::env::var("JANUS_SMB_TRACE").as_deref() {
-                Ok("1") => 1,
-                Ok("2") => 2,
-                _ => 0,
-            },
+            trace: 0,
         }
+    }
+
+    /// Trace level (0 = off, 1 = commands and statuses, 2 = also request hex). The caller reads
+    /// `JANUS_SMB_TRACE` if it wants it; the library does not look at the environment.
+    pub fn with_trace(mut self, level: u8) -> Self {
+        self.trace = level.min(2);
+        self
     }
 
     /// Timing of the interim STATUS_PENDING path (see `AsyncConfig`).

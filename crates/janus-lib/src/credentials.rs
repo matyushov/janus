@@ -83,23 +83,21 @@ impl CredentialStore {
             .clone()
     }
 
-    /// If there is no pair, generate a random one and save it to the file (0600).
+    /// If there is no pair, generate a random one and save it to the file (0600), or keep it in
+    /// memory when the store has no file.
     /// `Ok(true)` means a new one was created, `Ok(false)` that it already existed.
     pub fn ensure_generated(&self) -> std::io::Result<bool> {
         if self.get().is_some() {
             return Ok(false);
         }
-        let path = self.path.as_deref().ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "credentials file path unknown",
-            )
-        })?;
         let creds = SmbCredentials {
             user: GENERATED_USER.to_owned(),
             password: random_password()?,
         };
-        write_file(path, &creds)?;
+        // Without a file the pair lives in memory only (the embedding SDK).
+        if let Some(path) = self.path.as_deref() {
+            write_file(path, &creds)?;
+        }
         *self.current.write().expect("credentials lock poisoned") = Some(creds);
         Ok(true)
     }

@@ -59,6 +59,12 @@ const META_MAX_STATS: usize = 4096;
 const META_MAX_LISTINGS: usize = 64;
 /// Larger directories are not cached (a band directory can hold tens of thousands of files).
 const META_MAX_LISTING_LEN: usize = 2048;
+/// A stat that the receiver has not answered after this long is served from the last known
+/// answer for the path, if there is one. Without it a durable reconnect (DH2C) and every
+/// QUERY_INFO would wait for a dead receiver, and the macOS client gives up reconnecting after
+/// ~60 s (docs/macos-smb-client-timeouts.md). Only a content change keeps the old answer
+/// (the journal overlay is applied on top of it); delete and rename drop it.
+const STALE_STAT_AFTER: Duration = Duration::from_secs(2);
 
 /// Short-lived cache of `stat` and `list` answers. macOS opens the same few paths (the
 /// AppleDouble `._name`, the parent directory) dozens of times per copied file, and each
@@ -69,6 +75,8 @@ struct MetaCache {
     /// `None` = the path was absent.
     stats: HashMap<String, (Instant, Option<FileStat>)>,
     lists: HashMap<String, (Instant, Vec<FileStat>)>,
+    /// The last stat the receiver gave for a path, whatever its age (see `STALE_STAT_AFTER`).
+    stale: HashMap<String, FileStat>,
 }
 
 #[derive(Default)]
@@ -98,6 +106,7 @@ impl Meta {
         let mut m = self.cache.lock().expect("meta cache poisoned");
         m.stats.clear();
         m.lists.clear();
+        m.stale.clear();
     }
 }
 
@@ -154,6 +163,9 @@ pub(crate) struct Link {
     /// When a call last timed out (a silent peer); cleared by the next success. Errors the receiver
     /// or the network report promptly (refused connection, `UNAVAILABLE`) do not set it.
     degraded: Mutex<Option<Instant>>,
+    /// When the current outage began: the first transport failure since the last success of any
+    /// call (the uploader's included). Read by `rpc_fg` to know when to stop being patient.
+    down_since: Mutex<Option<Instant>>,
 }
 
 impl Link {
@@ -169,6 +181,7 @@ impl Link {
             retry: RetryPolicy::default(),
             timeouts: Timeouts::default(),
             degraded: Mutex::new(None),
+            down_since: Mutex::new(None),
         }
     }
 
@@ -216,7 +229,14 @@ impl Link {
 
     /// Bound a whole backend operation (possibly several RPCs) by the time budget.
     async fn within<T>(&self, op: impl Future<Output = Result<T>>) -> Result<T> {
-        tokio::time::timeout(self.timeouts.budget, op)
+        // With patience the calls inside carry their own limits; this only stops an operation
+        // that never ends.
+        let limit = if self.timeouts.patience.is_some() {
+            self.timeouts.barrier
+        } else {
+            self.timeouts.budget
+        };
+        tokio::time::timeout(limit, op)
             .await
             .unwrap_or(Err(BackendError::RemoteUnavailable))
     }
@@ -269,10 +289,11 @@ impl Link {
                 };
             match outcome {
                 Ok(r) => {
-                    *self.degraded.lock().expect("degraded poisoned") = None;
+                    self.note_success();
                     return Ok(r.into_inner());
                 }
                 Err(s) if attempt < attempts && is_transport_failure(&s) => {
+                    self.note_failure();
                     let left = deadline.saturating_duration_since(Instant::now());
                     if left < delay + MIN_ATTEMPT {
                         return Err(map_status(&s));
@@ -281,9 +302,118 @@ impl Link {
                     delay = delay.saturating_mul(2);
                     attempt += 1;
                 }
-                Err(s) => return Err(map_status(&s)),
+                Err(s) => {
+                    if is_transport_failure(&s) {
+                        self.note_failure();
+                    }
+                    return Err(map_status(&s));
+                }
             }
         }
+    }
+
+    fn note_success(&self) {
+        *self.degraded.lock().expect("degraded poisoned") = None;
+        *self.down_since.lock().expect("down_since poisoned") = None;
+    }
+
+    fn note_failure(&self) {
+        self.down_since
+            .lock()
+            .expect("down_since poisoned")
+            .get_or_insert_with(Instant::now);
+    }
+
+    /// How long the receiver has been failing continuously, if it is.
+    fn down_for(&self) -> Option<Duration> {
+        (*self.down_since.lock().expect("down_since poisoned")).map(|t| t.elapsed())
+    }
+
+    /// `rpc` for a call that a client is waiting for. With `Timeouts::patience` set, a transport
+    /// failure is not the end: the call is repeated (single attempts, no fail-fast) until it
+    /// succeeds or the receiver has been down for `patience`. `retry` says whether repeating the
+    /// call is allowed (idempotent, or the caller can tell a repeated success); otherwise the
+    /// call is made once, after waiting until the receiver answers a ping.
+    async fn rpc_fg<T, F, Fut>(&self, retry: bool, bulk: bool, call: F) -> Result<T>
+    where
+        F: Fn(BandTransportClient<Channel>) -> Fut,
+        Fut: Future<Output = std::result::Result<tonic::Response<T>, Status>>,
+    {
+        let Some(patience) = self.timeouts.patience else {
+            return self.rpc(retry, bulk, call).await;
+        };
+        if !retry {
+            self.wait_reachable(patience).await?;
+            return self.rpc(false, bulk, call).await;
+        }
+        let per_attempt = if bulk {
+            self.timeouts.bulk_request
+        } else {
+            self.timeouts.request
+        };
+        let mut delay = Duration::from_millis(250);
+        loop {
+            let degraded = self.degraded.lock().expect("degraded poisoned").is_some();
+            let limit = if degraded {
+                per_attempt.min(self.timeouts.degraded_probe)
+            } else {
+                per_attempt
+            };
+            let outcome = match tokio::time::timeout(limit, call(self.pick_client())).await {
+                Ok(r) => r,
+                Err(_) => {
+                    self.mark_degraded();
+                    Err(Status::unavailable("transport error: request timed out"))
+                }
+            };
+            match outcome {
+                Ok(r) => {
+                    self.note_success();
+                    return Ok(r.into_inner());
+                }
+                Err(s) if is_transport_failure(&s) => {
+                    self.note_failure();
+                    let down = self.down_for().unwrap_or_default();
+                    if down >= patience {
+                        return Err(map_status(&s));
+                    }
+                    tokio::time::sleep(delay.min(patience - down)).await;
+                    delay = (delay * 2).min(Duration::from_secs(2));
+                }
+                Err(s) => {
+                    // The receiver answered, with an error that is not about the transport.
+                    self.note_success();
+                    return Err(map_status(&s));
+                }
+            }
+        }
+    }
+
+    /// Wait until the receiver answers a ping, for at most `patience` of continuous failure.
+    /// Returns at once when nothing is known to be wrong.
+    async fn wait_reachable(&self, patience: Duration) -> Result<()> {
+        let mut delay = Duration::from_millis(250);
+        while self.down_for().is_some()
+            || self.degraded.lock().expect("degraded poisoned").is_some()
+        {
+            let mut c = self.pick_client();
+            let ping = c.ping(pb::PingRequest {
+                client_version: env!("CARGO_PKG_VERSION").to_string(),
+            });
+            let limit = self.timeouts.request.min(self.timeouts.degraded_probe);
+            if matches!(tokio::time::timeout(limit, ping).await, Ok(Ok(_))) {
+                self.note_success();
+                return Ok(());
+            }
+            self.note_failure();
+            let down = self.down_for().unwrap_or_default();
+            if down >= patience {
+                return Err(BackendError::RemoteUnavailable);
+            }
+            tokio::time::sleep(delay.min(patience - down)).await;
+            delay = (delay * 2).min(Duration::from_secs(2));
+        }
+        Ok(())
     }
 
     async fn fsync_remote(&self, path: Option<&str>) -> Result<()> {
@@ -694,7 +824,7 @@ impl GrpcBackend {
         F: Fn(BandTransportClient<Channel>) -> Fut,
         Fut: Future<Output = std::result::Result<tonic::Response<T>, Status>>,
     {
-        self.link.rpc(idempotent, bulk, call).await
+        self.link.rpc_fg(idempotent, bulk, call).await
     }
 
     async fn within<T>(&self, op: impl Future<Output = Result<T>>) -> Result<T> {
@@ -714,12 +844,39 @@ impl GrpcBackend {
             bundle_op_request::Op::Delete(_) | bundle_op_request::Op::Rename(_) => Some(None),
             _ => None,
         };
-        let outcome = self
-            .rpc(idempotent, false, |mut c| {
+        // Create and Delete can be repeated: if the first try did land (the reply was lost),
+        // the repeat finds the result already there, which is what the caller wanted.
+        let repeatable = idempotent
+            || (self.link.timeouts.patience.is_some()
+                && matches!(
+                    op,
+                    bundle_op_request::Op::Create(_) | bundle_op_request::Op::Delete(_)
+                ));
+        let tries = std::sync::atomic::AtomicU32::new(0);
+        let mut outcome = self
+            .rpc(repeatable, false, |mut c| {
+                tries.fetch_add(1, Ordering::SeqCst);
                 let op = op.clone();
                 async move { c.bundle_op(pb::BundleOpRequest { op: Some(op) }).await }
             })
             .await;
+        if !idempotent && tries.load(Ordering::SeqCst) > 1 {
+            let landed = matches!(
+                (&op, &outcome),
+                (
+                    bundle_op_request::Op::Create(_),
+                    Err(BackendError::AlreadyExists)
+                ) | (
+                    bundle_op_request::Op::Delete(_),
+                    Err(BackendError::NotFound | BackendError::PathNotFound)
+                )
+            );
+            if landed {
+                outcome = Ok(pb::BundleOpReply {
+                    result: Some(bundle_op_reply::Result::Ok(true)),
+                });
+            }
+        }
         match touched {
             Some(Some(p)) => self.invalidate(&[&p]),
             Some(None) => self.meta.invalidate_all(),
@@ -772,7 +929,44 @@ impl GrpcBackend {
             None => {}
         }
         let epoch = self.meta.mutations.load(Ordering::SeqCst);
-        let fetched = self.stat_path_uncached(rel).await;
+        let last_known = self
+            .meta
+            .cache
+            .lock()
+            .expect("meta cache poisoned")
+            .stale
+            .get(rel)
+            .cloned();
+        let fetched = match last_known {
+            Some(old) => {
+                match tokio::time::timeout(STALE_STAT_AFTER, self.stat_path_uncached(rel)).await {
+                    Ok(r) => r,
+                    Err(_) => {
+                        // The receiver is not answering: use what it said last. Not cached.
+                        return Ok(old);
+                    }
+                }
+            }
+            None => self.stat_path_uncached(rel).await,
+        };
+        match &fetched {
+            Ok(s) => {
+                let mut m = self.meta.cache.lock().expect("meta cache poisoned");
+                if m.stale.len() >= META_MAX_STATS {
+                    m.stale.clear();
+                }
+                m.stale.insert(rel.to_owned(), s.clone());
+            }
+            Err(BackendError::NotFound) => {
+                self.meta
+                    .cache
+                    .lock()
+                    .expect("meta cache poisoned")
+                    .stale
+                    .remove(rel);
+            }
+            Err(_) => {}
+        }
         let entry = match &fetched {
             Ok(s) => Some(Some(s.clone())),
             Err(BackendError::NotFound) => Some(None),

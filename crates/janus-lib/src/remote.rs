@@ -79,6 +79,14 @@ pub struct Timeouts {
     /// reported instead of being waited for until `barrier`. Must exceed the longest freeze
     /// that should be ridden out silently.
     pub barrier_down_after: Duration,
+    /// How long a call that a client is waiting for (open, stat, list, read, create, delete,
+    /// truncate, ...) keeps trying while the receiver is unreachable, counted from the first
+    /// failure of the current outage: `None` fails such a call after `budget` (or at once while
+    /// the peer is degraded); `Some` keeps retrying until the receiver has been down for that
+    /// long. The SMB layer turns the wait into an interim STATUS_PENDING and, at `drop_after`,
+    /// into a dropped connection (see docs/macos-smb-client-timeouts.md). The uploader's own
+    /// calls are not affected.
+    pub patience: Option<Duration>,
     /// HTTP/2 PING interval (also while idle, so a silent peer is noticed).
     pub keepalive_interval: Duration,
     /// How long to wait for the PING ack before the connection is declared dead.
@@ -96,6 +104,7 @@ impl Default for Timeouts {
             budget: DEFAULT_OPERATION_BUDGET,
             barrier: DEFAULT_BARRIER_BUDGET,
             barrier_down_after: DEFAULT_BARRIER_DOWN_AFTER,
+            patience: Some(DEFAULT_BARRIER_DOWN_AFTER),
             keepalive_interval: DEFAULT_KEEPALIVE_INTERVAL,
             keepalive_timeout: DEFAULT_KEEPALIVE_TIMEOUT,
         }
@@ -113,7 +122,7 @@ pub const DEFAULT_CONNECTIONS: usize = 4;
 const MAX_CALLS_PER_CONNECTION: usize = 128;
 pub const DEFAULT_OPERATION_BUDGET: Duration = Duration::from_secs(18);
 /// See `Timeouts::barrier`.
-pub const DEFAULT_BARRIER_BUDGET: Duration = Duration::from_secs(600);
+pub const DEFAULT_BARRIER_BUDGET: Duration = Duration::from_secs(300);
 /// See `Timeouts::barrier_down_after`.
 pub const DEFAULT_BARRIER_DOWN_AFTER: Duration = Duration::from_secs(120);
 pub const DEFAULT_KEEPALIVE_INTERVAL: Duration = Duration::from_secs(5);
@@ -151,6 +160,7 @@ impl RemoteConfig {
                 }
                 if let Some(d) = cfg.smb_wait.down_after() {
                     t.barrier_down_after = d;
+                    t.patience = Some(d);
                 }
                 t
             },

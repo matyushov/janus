@@ -9,6 +9,7 @@
 //! signature are rejected and replies are signed.
 
 use janus_lib::jlog;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
@@ -113,6 +114,35 @@ pub fn system_random(buf: &mut [u8]) {
     getrandom::fill(buf).expect("system random number generator unavailable");
 }
 
+/// See `Dispatcher::chain_info`.
+pub(crate) struct ChainInfo {
+    /// Request headers of the packet, related session/tree identifiers resolved.
+    heads: Vec<Header>,
+    /// Signing keys of the sessions the packet uses.
+    keys: HashMap<u64, [u8; 16]>,
+}
+
+impl ChainInfo {
+    pub(crate) fn command(&self, index: usize) -> Command {
+        self.heads[index].command
+    }
+
+    pub(crate) fn message_id(&self, index: usize) -> u64 {
+        self.heads[index].message_id
+    }
+
+    pub(crate) fn len(&self) -> usize {
+        self.heads.len()
+    }
+
+    pub(crate) fn keys(&self) -> &HashMap<u64, [u8; 16]> {
+        &self.keys
+    }
+}
+
+/// The replies of one packet before assembly (see `Dispatcher::run_chain`).
+pub(crate) struct ChainReply(Vec<Element>);
+
 /// One reply before assembly: header + body + the key to sign with.
 struct Element {
     header: Header,
@@ -145,6 +175,7 @@ pub(crate) struct DeferredSlow {
     pub(crate) job: files::SlowJob,
 }
 
+#[derive(Clone)]
 pub(crate) struct IoMeta {
     header: Header,
     key: [u8; 16],
@@ -178,6 +209,20 @@ impl Dispatcher {
         if payload.len() >= 4 && payload[..4] == SMB2_TRANSFORM_MAGIC {
             return Err(WireError::Malformed("encryption not negotiated"));
         }
+        Ok(Reply::Now(assemble(
+            Self::run_chain(payload, conn, ctx, backend).await?.0,
+        )))
+    }
+
+    /// The body of `handle` for SMB2 packets: every element of the chain is processed in order
+    /// and the unassembled replies are returned. The connection loop uses this directly so that
+    /// it can split the replies when one command of the chain went asynchronous.
+    pub(crate) async fn run_chain<B: StorageBackend>(
+        payload: &[u8],
+        conn: &mut ConnState,
+        ctx: &ServerCtx<'_>,
+        backend: &B,
+    ) -> Result<ChainReply, WireError> {
         let parts = split_compound(payload)?;
         let compound = parts.len() > 1;
 
@@ -185,7 +230,8 @@ impl Dispatcher {
         let (mut prev_session, mut prev_tree) = (0u64, 0u32);
         let mut create_error: Option<u32> = None;
         conn.compound_file = None;
-        for raw in parts {
+        for (index, raw) in parts.into_iter().enumerate() {
+            conn.progress.store(index, Ordering::Relaxed);
             let mut msg = Message::decode_single(raw)?;
             if msg.header.flags & flags::SERVER_TO_REDIR != 0 {
                 return Err(WireError::Malformed("response instead of request"));
@@ -229,7 +275,7 @@ impl Dispatcher {
             }
             elements.push(element);
         }
-        Ok(Reply::Now(assemble(elements)))
+        Ok(ChainReply(elements))
     }
 
     /// Fast path for pipelining: if `payload` is a plain, valid READ or WRITE, do everything
@@ -306,6 +352,36 @@ impl Dispatcher {
     /// Build the signed reply of a deferred READ/WRITE once its backend call has finished.
     pub(crate) fn finish_io(meta: &IoMeta, out: Out, conn: &mut ConnState) -> Vec<u8> {
         let elem = reply(&meta.header, conn, out.status, out.body, Some(meta.key));
+        assemble(vec![elem])
+    }
+
+    /// The interim STATUS_PENDING for a pipelined READ/WRITE that has been waiting long enough:
+    /// built from the request alone (no credits, unsigned), see `chain_interim`.
+    pub(crate) fn io_interim(meta: &IoMeta, async_id: u64) -> Vec<u8> {
+        let mut header = Header::response_to(&meta.header, status::PENDING);
+        header.credit_req_grant = 0;
+        header.flags |= flags::ASYNC_COMMAND;
+        header.async_id = async_id;
+        header.tree_id = 0;
+        assemble(vec![Element {
+            header,
+            body: error_body(),
+            sign_key: None,
+        }])
+    }
+
+    /// Like `finish_io`, for a READ/WRITE the client was told is asynchronous: the reply carries
+    /// the async header and the credits the interim response left out.
+    pub(crate) fn finish_io_async(
+        meta: &IoMeta,
+        out: Out,
+        async_id: u64,
+        conn: &mut ConnState,
+    ) -> Vec<u8> {
+        let mut elem = reply(&meta.header, conn, out.status, out.body, Some(meta.key));
+        elem.header.flags |= flags::ASYNC_COMMAND;
+        elem.header.async_id = async_id;
+        elem.header.tree_id = 0;
         assemble(vec![elem])
     }
 
@@ -457,6 +533,205 @@ impl Dispatcher {
         };
         elem.sign_key = Some(meta.key);
         assemble(vec![elem])
+    }
+
+    // --- Foreground operations: any packet that may wait for the backend ------------------
+    //
+    // Measured behaviour of the macOS client (docs/macos-smb-client-timeouts.md): a request the
+    // server leaves silent is given up on after 45 s (READ, WRITE) to 98 s, CREATE/CLOSE then
+    // unmount the share; with an interim STATUS_PENDING the client waits about 120 s.
+
+    /// A snapshot of what the connection loop needs while `run_chain` holds the connection
+    /// state: the request headers of the packet and the signing keys of its sessions. `None`
+    /// when the packet is not one that goes through the foreground path.
+    pub(crate) fn chain_info(payload: &[u8], conn: &ConnState) -> Option<ChainInfo> {
+        conn.dialect?;
+        if smb_wire::messages::is_smb1(payload)
+            || (payload.len() >= 4 && payload[..4] == SMB2_TRANSFORM_MAGIC)
+        {
+            return None;
+        }
+        let mut heads = Vec::new();
+        let (mut prev_session, mut prev_tree) = (0u64, 0u32);
+        for raw in split_compound(payload).ok()? {
+            let mut h = Header::decode(&mut Reader::new(raw)).ok()?;
+            if h.flags & flags::SERVER_TO_REDIR != 0 {
+                return None;
+            }
+            if h.flags & flags::RELATED_OPERATIONS != 0 {
+                if h.session_id == u64::MAX {
+                    h.session_id = prev_session;
+                }
+                if h.tree_id == u32::MAX {
+                    h.tree_id = prev_tree;
+                }
+            }
+            (prev_session, prev_tree) = (h.session_id, h.tree_id);
+            if !matches!(
+                h.command,
+                Command::Create
+                    | Command::Close
+                    | Command::Flush
+                    | Command::Read
+                    | Command::Write
+                    | Command::QueryInfo
+                    | Command::QueryDirectory
+                    | Command::SetInfo
+            ) {
+                return None;
+            }
+            heads.push(h);
+        }
+        (!heads.is_empty()).then_some(ChainInfo {
+            heads,
+            keys: Self::session_keys(conn),
+        })
+    }
+
+    /// Signing keys of the established sessions, by SessionId. A snapshot for answering ECHO and
+    /// CANCEL while the connection state is held by a running handler.
+    pub(crate) fn session_keys(conn: &ConnState) -> HashMap<u64, [u8; 16]> {
+        conn.sessions
+            .iter()
+            .filter_map(|(id, s)| s.signing_key().map(|k| (*id, k)))
+            .collect()
+    }
+
+    /// The reply to a lone, correctly signed ECHO, built without the connection state. Clients
+    /// send ECHO as a keepalive and drop a connection that does not answer it (the macOS client
+    /// gave up after ~93 s of silence while a CREATE was pending), so it has to be answered also
+    /// while a handler is waiting for the backend. It spends and grants the same one credit
+    /// (CreditCharge or 1), so the credit window is unchanged.
+    pub(crate) fn echo_reply(payload: &[u8], keys: &HashMap<u64, [u8; 16]>) -> Option<Vec<u8>> {
+        let (h, raw) = single_request(payload)?;
+        if h.command != Command::Echo || h.flags & flags::RELATED_OPERATIONS != 0 {
+            return None;
+        }
+        let key = keys.get(&h.session_id)?;
+        if h.flags & flags::SIGNED == 0 || !crypto::verify(key, raw, &h.signature) {
+            return None;
+        }
+        let mut header = Header::response_to(&h, status::SUCCESS);
+        header.credit_req_grant = h.credit_charge.max(1);
+        Some(assemble(vec![Element {
+            header,
+            body: simple_body(),
+            sign_key: Some(*key),
+        }]))
+    }
+
+    /// The interim STATUS_PENDING for element `index` of a packet whose handler is still running
+    /// (MS-SMB2 §3.3.4.2). Built from the request alone, because the connection state belongs to
+    /// the handler: it grants no credits (the final reply grants them as a synchronous reply
+    /// would) and, like every interim response, it is not signed. `None` when the session has no
+    /// signing key yet.
+    pub(crate) fn chain_interim(info: &ChainInfo, index: usize, async_id: u64) -> Option<Vec<u8>> {
+        let h = info.heads.get(index)?;
+        info.keys.get(&h.session_id)?;
+        let mut header = Header::response_to(h, status::PENDING);
+        header.credit_req_grant = 0;
+        header.flags |= flags::ASYNC_COMMAND;
+        header.async_id = async_id;
+        header.tree_id = 0;
+        Some(assemble(vec![Element {
+            header,
+            body: error_body(),
+            sign_key: None,
+        }]))
+    }
+
+    /// The final reply messages of a packet. Without an interim response it is the ordinary
+    /// (possibly compound) reply. After an interim for element `k`, the replies of the elements
+    /// before it go out together, element `k` goes out alone with the async header (MS-SMB2
+    /// §3.3.4.1.1: the final response of an asynchronous request carries the AsyncId) and the
+    /// elements after it follow one by one, in chain order, each signed on its own.
+    pub(crate) fn chain_final(reply: ChainReply, announced: Option<(usize, u64)>) -> Vec<Vec<u8>> {
+        let Some((k, async_id)) = announced else {
+            return vec![assemble(reply.0)];
+        };
+        let mut out = Vec::new();
+        let mut head = Vec::new();
+        for (i, mut e) in reply.0.into_iter().enumerate() {
+            if i < k {
+                head.push(e);
+                continue;
+            }
+            if !head.is_empty() {
+                out.push(assemble(std::mem::take(&mut head)));
+            }
+            if i == k {
+                e.header.flags |= flags::ASYNC_COMMAND;
+                e.header.async_id = async_id;
+                e.header.tree_id = 0;
+            }
+            out.push(assemble(vec![e]));
+        }
+        if !head.is_empty() {
+            out.push(assemble(head));
+        }
+        out
+    }
+
+    /// Error replies for every element of a packet whose handler was abandoned (the client
+    /// cancelled or the wait ceiling passed). Elements after `pending` were never started, so the
+    /// credits they spent are charged here. `async_id` marks the first reply as the final answer
+    /// of an operation the client was told is asynchronous.
+    pub(crate) fn chain_failure(
+        info: &ChainInfo,
+        conn: &mut ConnState,
+        pending: usize,
+        status: u32,
+        async_id: Option<u64>,
+    ) -> Vec<Vec<u8>> {
+        let mut out = Vec::new();
+        for (i, h) in info.heads.iter().enumerate() {
+            if i > pending {
+                let _ = conn.credits.charge(h.credit_charge);
+            }
+            let mut e = reply(
+                h,
+                conn,
+                status,
+                error_body(),
+                info.keys.get(&h.session_id).copied(),
+            );
+            if i == pending
+                && let Some(id) = async_id
+            {
+                e.header.flags |= flags::ASYNC_COMMAND;
+                e.header.async_id = id;
+                e.header.tree_id = 0;
+            }
+            out.push(assemble(vec![e]));
+        }
+        out
+    }
+
+    /// Whether `payload` is a signed SMB2 CANCEL. `Some(true)` when it names the running packet
+    /// (by AsyncId once the interim response has gone out, else by MessageId), `Some(false)` for
+    /// a CANCEL of anything else or one that fails verification (ignored, MS-SMB2 §3.3.5.16).
+    pub(crate) fn cancel_of_chain(
+        payload: &[u8],
+        info: &ChainInfo,
+        async_id: Option<u64>,
+    ) -> Option<bool> {
+        let (h, raw) = single_request(payload)?;
+        if h.command != Command::Cancel {
+            return None;
+        }
+        let Some(key) = info.keys.get(&h.session_id) else {
+            return Some(false);
+        };
+        if h.flags & flags::SIGNED == 0 || !crypto::verify(key, raw, &h.signature) {
+            return Some(false);
+        }
+        Some(if h.flags & flags::ASYNC_COMMAND != 0 {
+            async_id == Some(h.async_id)
+        } else {
+            info.heads
+                .iter()
+                .any(|x| x.message_id == h.message_id && x.session_id == h.session_id)
+        })
     }
 
     // --- SMB1 multi-protocol NEGOTIATE ---------------------------------------

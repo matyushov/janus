@@ -122,6 +122,7 @@ fn timeouts() -> Timeouts {
         budget: MS(1500),
         barrier: MS(1500),
         barrier_down_after: MS(1500),
+        patience: None,
         keepalive_interval: MS(200),
         keepalive_timeout: MS(300),
     }

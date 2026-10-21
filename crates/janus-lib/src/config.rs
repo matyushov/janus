@@ -98,7 +98,7 @@ impl JournalConfig {
 pub struct SmbWaitConfig {
     /// After this long a still-running operation gets an interim STATUS_PENDING (default 1500).
     pub interim_after_ms: u32,
-    /// The ceiling: the client is then answered with an error (default 600).
+    /// The ceiling: the client is then answered with an error (default 300).
     pub max_wait_sec: u32,
     /// A receiver failing continuously this long ends the wait early with an error (default 120).
     pub down_after_sec: u32,

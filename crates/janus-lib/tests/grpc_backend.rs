@@ -26,9 +26,15 @@ fn req(d: Disposition) -> OpenRequest {
     }
 }
 
+/// These tests cover the budget-bound mode (`patience: None`); the patient mode is in
+/// `patience.rs`.
 fn backend_for(addr: std::net::SocketAddr) -> GrpcBackend {
     let remote = RemoteClient::connect_lazy(&RemoteConfig {
         endpoint: addr.to_string(),
+        timeouts: janus_lib::remote::Timeouts {
+            patience: None,
+            ..Default::default()
+        },
         ..Default::default()
     })
     .unwrap();

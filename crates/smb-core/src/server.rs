@@ -30,7 +30,8 @@ use tokio::sync::Mutex;
 
 use crate::conn::{AUTH_TIMEOUT, AsyncConfig, ConnState};
 use crate::dispatch::{
-    DeferredSlow, Dispatcher, IoMeta, Out, Reply, ServerCtx, status, system_random,
+    ChainInfo, ChainReply, DeferredSlow, Dispatcher, IoMeta, Out, Reply, ServerCtx, status,
+    system_random,
 };
 use crate::files::Post;
 use crate::shared::{Push, Shared};
@@ -45,6 +46,12 @@ pub struct ConnId(pub u64);
 const MAX_INFLIGHT_IO: usize = 8;
 /// Packets queued behind pending operations before the loop stops reading.
 const MAX_HELD: usize = 256;
+/// AsyncIds of foreground operations start here, far above the ones the pending-operation
+/// registry hands out, so that the two kinds never collide on one connection.
+const FG_ASYNC_ID_BASE: u64 = 1 << 40;
+
+/// Packets from the reader task: `Ok(None)` is the end of the stream.
+type PacketRx = tokio::sync::mpsc::Receiver<std::io::Result<Option<Vec<u8>>>>;
 
 /// Aborts the reader task when the connection loop ends (otherwise it would hold the socket).
 struct AbortOnDrop(tokio::task::JoinHandle<()>);
@@ -212,7 +219,7 @@ impl<B: StorageBackend> DevServer<B> {
         mut push_rx: tokio::sync::mpsc::UnboundedReceiver<Push>,
     ) -> std::io::Result<()> {
         let (mut rd, wr) = stream.into_split();
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<std::io::Result<Option<Vec<u8>>>>(2);
+        let (tx, mut rx): (_, PacketRx) = tokio::sync::mpsc::channel(2);
         let _reader = AbortOnDrop(tokio::spawn(async move {
             loop {
                 let r = read_message(&mut rd).await;
@@ -230,11 +237,29 @@ impl<B: StorageBackend> DevServer<B> {
             held: VecDeque::new(),
             pending_tokens: HashMap::new(),
             pending_stats: Arc::clone(&self.pending),
+            next_fg_id: 0,
+            io_wait: HashMap::new(),
+            interim_after: self.async_cfg.interim_after,
+            drop_after: self.async_cfg.drop_after,
         };
         loop {
+            // Packets that queued up behind a foreground operation run first, in arrival order.
+            if io.slow.is_empty()
+                && let Some(raw) = io.held.pop_front()
+            {
+                if self
+                    .process(&mut io, conn, conn_id, raw, true, &mut rx)
+                    .await?
+                    .is_break()
+                {
+                    break;
+                }
+                continue;
+            }
             // While authentication is in progress, wait for the next packet only for a bounded time.
             let auth_wait = conn.has_pending_auth() && io.inflight.is_empty() && io.slow.is_empty();
             let interim_due = conn.pending_async.next_interim_due();
+            let io_timer = io.next_io_timer();
             let next = tokio::select! {
                 biased;
                 Some((async_id, end)) = io.slow.next(), if !io.slow.is_empty() => {
@@ -242,7 +267,7 @@ impl<B: StorageBackend> DevServer<B> {
                     // Pending operations are over: run what queued up behind them.
                     while io.slow.is_empty() {
                         let Some(raw) = io.held.pop_front() else { break };
-                        if self.process(&mut io, conn, conn_id, raw, true).await?.is_break() {
+                        if self.process(&mut io, conn, conn_id, raw, true, &mut rx).await?.is_break() {
                             return Ok(());
                         }
                     }
@@ -255,7 +280,13 @@ impl<B: StorageBackend> DevServer<B> {
                     continue;
                 }
                 Some((meta, out, raw)) = io.inflight.next(), if !io.inflight.is_empty() => {
-                    self.send_io_reply(&mut io.wr, conn, conn_id, meta, out, raw).await?;
+                    self.send_io_reply(&mut io, conn, conn_id, meta, out, raw).await?;
+                    continue;
+                }
+                _ = tokio::time::sleep_until(io_timer.unwrap_or_else(Instant::now).into()), if io_timer.is_some() => {
+                    if self.inflight_timers(&mut io, conn_id).await? {
+                        break;
+                    }
                     continue;
                 }
                 _ = tokio::time::sleep_until(interim_due.unwrap_or_else(Instant::now).into()), if interim_due.is_some() => {
@@ -273,7 +304,7 @@ impl<B: StorageBackend> DevServer<B> {
             };
             let Some(raw) = next else { break };
             if self
-                .process(&mut io, conn, conn_id, raw, false)
+                .process(&mut io, conn, conn_id, raw, false, &mut rx)
                 .await?
                 .is_break()
             {
@@ -291,6 +322,7 @@ impl<B: StorageBackend> DevServer<B> {
         conn_id: ConnId,
         raw: Vec<u8>,
         from_held: bool,
+        rx: &mut PacketRx,
     ) -> std::io::Result<std::ops::ControlFlow<()>> {
         use std::ops::ControlFlow::{Break, Continue};
         let backend = &*self.backend;
@@ -310,6 +342,17 @@ impl<B: StorageBackend> DevServer<B> {
                 && let Some((meta, job)) = Dispatcher::try_defer_io(&raw, conn, &self.backend)
             {
                 let keep = (self.trace > 0).then_some(raw);
+                let now = Instant::now();
+                io.io_wait.insert(
+                    meta.header().message_id,
+                    IoWait {
+                        meta: meta.clone(),
+                        started: now,
+                        due: now + io.interim_after,
+                        drop_at: now + io.drop_after,
+                        async_id: None,
+                    },
+                );
                 io.inflight.push(Box::pin(
                     async move { (meta, job.run(backend).await, keep) },
                 ));
@@ -323,9 +366,33 @@ impl<B: StorageBackend> DevServer<B> {
         if !urgent {
             conn.io_epoch += 1; // anything but plain READ/WRITE may change what readahead holds
             // Barrier: finish the I/O in flight before anything else is looked at.
-            while let Some((meta, out, raw)) = io.inflight.next().await {
-                self.send_io_reply(&mut io.wr, conn, conn_id, meta, out, raw)
-                    .await?;
+            let keys = Dispatcher::session_keys(conn);
+            while !io.inflight.is_empty() {
+                let timer = io.next_io_timer();
+                tokio::select! {
+                    biased;
+                    Some((meta, out, raw)) = io.inflight.next() => {
+                        self.send_io_reply(io, conn, conn_id, meta, out, raw).await?;
+                    }
+                    // Keepalives are answered while the barrier waits; everything else queues
+                    // behind the packet being processed, in order.
+                    m = rx.recv(), if io.held.len() < MAX_HELD => match m {
+                        Some(Ok(Some(pkt))) => {
+                            if let Some(bytes) = Dispatcher::echo_reply(&pkt, &keys) {
+                                write_message(&mut io.wr, &bytes).await?;
+                            } else {
+                                io.held.push_back(pkt);
+                            }
+                        }
+                        Some(Err(e)) => return Err(e),
+                        _ => return Ok(Break(())),
+                    },
+                    _ = tokio::time::sleep_until(timer.unwrap_or_else(Instant::now).into()), if timer.is_some() => {
+                        if self.inflight_timers(io, conn_id).await? {
+                            return Ok(Break(()));
+                        }
+                    }
+                }
             }
         }
 
@@ -351,6 +418,7 @@ impl<B: StorageBackend> DevServer<B> {
                             .interim_after()
                             .unwrap_or(self.async_cfg.interim_after),
                         max_wait: s.smb_wait.max_wait().unwrap_or(self.async_cfg.max_wait),
+                        drop_after: self.async_cfg.drop_after,
                     },
                 ),
                 None => (
@@ -361,6 +429,8 @@ impl<B: StorageBackend> DevServer<B> {
                 ),
             }
         };
+        io.interim_after = async_cfg.interim_after;
+        io.drop_after = async_cfg.drop_after;
         let credentials = self
             .credentials
             .get()
@@ -415,6 +485,16 @@ impl<B: StorageBackend> DevServer<B> {
             return Ok(Continue(()));
         }
 
+        if !urgent && let Some(info) = Dispatcher::chain_info(&raw, conn) {
+            return match self
+                .run_foreground(io, conn, conn_id, &raw, &ctx, &async_cfg, info, rx)
+                .await?
+            {
+                Foreground::Replied => Ok(Continue(())),
+                Foreground::Closed => Ok(Break(())),
+            };
+        }
+
         let result = Dispatcher::handle(&raw, conn, &ctx, backend).await;
         if self.trace > 0 {
             trace_exchange(conn_id, &raw, &result);
@@ -432,6 +512,160 @@ impl<B: StorageBackend> DevServer<B> {
             return Ok(Break(()));
         }
         Ok(Continue(()))
+    }
+
+    /// Runs a packet that may wait for the backend (CREATE, QUERY_INFO, QUERY_DIRECTORY, READ,
+    /// WRITE and the rest of the file commands, alone or in a compound chain) and keeps the
+    /// connection alive while it waits:
+    ///
+    /// * after `interim_after` the client gets an interim `STATUS_PENDING` for the command that
+    ///   is running; the final reply follows with the async header (MS-SMB2 §3.3.4.2);
+    /// * a signed CANCEL for the packet ends the wait (`STATUS_CANCELLED`);
+    /// * everything else that arrives meanwhile queues in `held` and runs afterwards, in order;
+    /// * once the wait reaches `drop_after` (or `max_wait` if that is shorter) the TCP connection
+    ///   is dropped, so that the client reconnects and sends the request again. Measured: the
+    ///   macOS client gives up on a request after ~120 s even if the server keeps it pending,
+    ///   but it re-sends over a fresh connection without limit (READ, WRITE, FLUSH) or once
+    ///   (CREATE, CLOSE); see docs/macos-smb-client-timeouts.md. With `max_wait` not above
+    ///   `drop_after` the wait ends with an error reply instead.
+    #[allow(clippy::too_many_arguments)]
+    async fn run_foreground<'a>(
+        &'a self,
+        io: &mut ConnIo<'a>,
+        conn: &mut ConnState,
+        conn_id: ConnId,
+        raw: &[u8],
+        ctx: &ServerCtx<'_>,
+        cfg: &AsyncConfig,
+        info: ChainInfo,
+        rx: &mut PacketRx,
+    ) -> std::io::Result<Foreground> {
+        enum End {
+            Done(Result<ChainReply, smb_wire::WireError>),
+            Cancelled,
+            Deadline,
+            Gone(Option<std::io::Error>),
+        }
+        let progress = Arc::clone(&conn.progress);
+        let started = Instant::now();
+        let mut interim_sleep = Box::pin(tokio::time::sleep_until(
+            (started + cfg.interim_after).into(),
+        ));
+        let mut deadline = Box::pin(tokio::time::sleep_until(
+            (started + cfg.max_wait.min(cfg.drop_after)).into(),
+        ));
+        let drop_at_deadline = cfg.drop_after < cfg.max_wait;
+        let mut interim_done = false;
+        let mut announced: Option<(usize, u64)> = None;
+        let end = {
+            let mut run = Box::pin(Dispatcher::run_chain(raw, conn, ctx, &*self.backend));
+            loop {
+                tokio::select! {
+                    biased;
+                    r = &mut run => break End::Done(r),
+                    _ = &mut interim_sleep, if !interim_done => {
+                        interim_done = true;
+                        let k = progress.load(std::sync::atomic::Ordering::Relaxed).min(info.len() - 1);
+                        io.next_fg_id += 1;
+                        let id = FG_ASYNC_ID_BASE + io.next_fg_id;
+                        if let Some(bytes) = Dispatcher::chain_interim(&info, k, id) {
+                            jlog!(
+                                Info,
+                                "smb",
+                                "conn {conn_id:?} {:?} mid={} now asynchronous (async_id={id}); interim STATUS_PENDING sent",
+                                info.command(k),
+                                info.message_id(k)
+                            );
+                            io.pending_tokens.insert(id, self.pending.begin(started));
+                            write_message(&mut io.wr, &bytes).await?;
+                            announced = Some((k, id));
+                        }
+                    }
+                    _ = &mut deadline => break End::Deadline,
+                    m = rx.recv(), if io.held.len() < MAX_HELD => match m {
+                        Some(Ok(Some(pkt))) => {
+                            match Dispatcher::cancel_of_chain(&pkt, &info, announced.map(|a| a.1)) {
+                                Some(true) => break End::Cancelled,
+                                Some(false) => {}
+                                None => {
+                                    if let Some(bytes) = Dispatcher::echo_reply(&pkt, info.keys()) {
+                                        write_message(&mut io.wr, &bytes).await?;
+                                    } else {
+                                        io.held.push_back(pkt);
+                                    }
+                                }
+                            }
+                        }
+                        Some(Err(e)) => break End::Gone(Some(e)),
+                        _ => break End::Gone(None),
+                    },
+                }
+            }
+        };
+        let pending_index = progress
+            .load(std::sync::atomic::Ordering::Relaxed)
+            .min(info.len() - 1);
+        let async_id = announced.map(|a| a.1);
+        if let Some(id) = async_id
+            && let Some(t) = io.pending_tokens.remove(&id)
+        {
+            self.pending.end(t);
+        }
+        let waited = started.elapsed();
+        let (what, replies) = match end {
+            End::Done(Err(e)) => {
+                jlog!(Warn, "smb", "conn {conn_id:?} protocol error: {e}; closing");
+                return Ok(Foreground::Closed);
+            }
+            End::Done(Ok(chain)) => ("completed", Dispatcher::chain_final(chain, announced)),
+            End::Gone(Some(e)) => return Err(e),
+            End::Gone(None) => return Ok(Foreground::Closed),
+            End::Cancelled | End::Deadline => {
+                let cancelled = matches!(end, End::Cancelled);
+                if (!cancelled && drop_at_deadline) || pending_index != 0 {
+                    jlog!(
+                        Warn,
+                        "smb",
+                        "conn {conn_id:?} {:?} mid={} still waiting after {waited:?}; dropping the connection so that the client reconnects",
+                        info.command(pending_index),
+                        info.message_id(pending_index)
+                    );
+                    return Ok(Foreground::Closed);
+                }
+                let (status, what) = if cancelled {
+                    (status::CANCELLED, "cancelled by the client")
+                } else {
+                    (status::UNEXPECTED_NETWORK_ERROR, "gave up waiting")
+                };
+                (
+                    what,
+                    Dispatcher::chain_failure(&info, conn, pending_index, status, async_id),
+                )
+            }
+        };
+        let level = if announced.is_none() {
+            Level::Debug
+        } else if what == "completed" {
+            Level::Info
+        } else {
+            Level::Warn
+        };
+        janus_lib::log::emit(
+            level,
+            "smb",
+            format!(
+                "conn {conn_id:?} {:?} mid={} {what} after {waited:?}",
+                info.command(pending_index),
+                info.message_id(pending_index)
+            ),
+        );
+        for bytes in replies {
+            if self.trace > 0 {
+                trace_exchange(conn_id, raw, &Ok(Reply::Now(bytes.clone())));
+            }
+            write_message(&mut io.wr, &bytes).await?;
+        }
+        Ok(Foreground::Replied)
     }
 
     /// Interim STATUS_PENDING for every operation that has been waiting long enough.
@@ -534,6 +768,37 @@ struct ConnIo<'a> {
     /// `PendingOps` tokens of the operations the client has been told about.
     pending_tokens: HashMap<u64, u64>,
     pending_stats: Arc<janus_lib::observability::PendingOps>,
+    /// Last AsyncId handed to a foreground operation (see `FG_ASYNC_ID_BASE`).
+    next_fg_id: u64,
+    /// Pipelined READ/WRITE in flight, by MessageId: when they started and what the client has
+    /// been told.
+    io_wait: HashMap<u64, IoWait>,
+    /// Thresholds of the latest packet that read the share configuration.
+    interim_after: std::time::Duration,
+    drop_after: std::time::Duration,
+}
+
+/// A pipelined READ/WRITE that may have to wait for the backend.
+struct IoWait {
+    meta: IoMeta,
+    started: Instant,
+    /// When the interim response is due, and when the connection is dropped.
+    due: Instant,
+    drop_at: Instant,
+    async_id: Option<u64>,
+}
+
+impl ConnIo<'_> {
+    /// The earliest moment `inflight_timers` has something to do.
+    fn next_io_timer(&self) -> Option<Instant> {
+        self.io_wait
+            .values()
+            .map(|w| match w.async_id {
+                None => w.due.min(w.drop_at),
+                Some(_) => w.drop_at,
+            })
+            .min()
+    }
 }
 
 impl Drop for ConnIo<'_> {
@@ -550,6 +815,14 @@ type IoDone = (IoMeta, Out, Option<Vec<u8>>);
 
 type BoxFuture<'a, T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'a>>;
 
+/// How `run_foreground` ended.
+enum Foreground {
+    /// The reply (or an error reply) was written.
+    Replied,
+    /// The connection has to be closed (dropped on purpose, protocol error, client gone).
+    Closed,
+}
+
 /// How a pending operation ended.
 enum SlowEnd {
     Done(Out),
@@ -560,18 +833,73 @@ enum SlowEnd {
 impl<B: StorageBackend> DevServer<B> {
     async fn send_io_reply(
         &self,
-        wr: &mut tokio::net::tcp::OwnedWriteHalf,
+        io: &mut ConnIo<'_>,
         conn: &mut ConnState,
         conn_id: ConnId,
         meta: IoMeta,
         out: crate::dispatch::Out,
         raw: Option<Vec<u8>>,
     ) -> std::io::Result<()> {
-        let bytes = Dispatcher::finish_io(&meta, out, conn);
+        let announced = io
+            .io_wait
+            .remove(&meta.header().message_id)
+            .and_then(|w| w.async_id);
+        let bytes = match announced {
+            Some(id) => {
+                if let Some(t) = io.pending_tokens.remove(&id) {
+                    self.pending.end(t);
+                }
+                Dispatcher::finish_io_async(&meta, out, id, conn)
+            }
+            None => Dispatcher::finish_io(&meta, out, conn),
+        };
         if let Some(raw) = raw {
             trace_exchange(conn_id, &raw, &Ok(Reply::Now(bytes.clone())));
         }
-        write_message(wr, &bytes).await
+        write_message(&mut io.wr, &bytes).await
+    }
+
+    /// Timers of the pipelined READ/WRITE: an interim STATUS_PENDING for each one that has been
+    /// waiting `interim_after`, and `true` (close the connection, the client reconnects and
+    /// repeats) once one has waited `drop_after`. See `run_foreground`.
+    async fn inflight_timers(&self, io: &mut ConnIo<'_>, conn_id: ConnId) -> std::io::Result<bool> {
+        let now = Instant::now();
+        if let Some(w) = io.io_wait.values().find(|w| now >= w.drop_at) {
+            jlog!(
+                Warn,
+                "smb",
+                "conn {conn_id:?} {:?} mid={} still waiting after {:?}; dropping the connection so that the client reconnects",
+                w.meta.header().command,
+                w.meta.header().message_id,
+                w.started.elapsed()
+            );
+            return Ok(true);
+        }
+        let mut due: Vec<u64> = io
+            .io_wait
+            .iter()
+            .filter(|(_, w)| w.async_id.is_none() && now >= w.due)
+            .map(|(mid, _)| *mid)
+            .collect();
+        due.sort_unstable();
+        for mid in due {
+            io.next_fg_id += 1;
+            let id = FG_ASYNC_ID_BASE + io.next_fg_id;
+            let Some(w) = io.io_wait.get_mut(&mid) else {
+                continue;
+            };
+            w.async_id = Some(id);
+            let (bytes, started) = (Dispatcher::io_interim(&w.meta, id), w.started);
+            jlog!(
+                Info,
+                "smb",
+                "conn {conn_id:?} {:?} mid={mid} now asynchronous (async_id={id}); interim STATUS_PENDING sent",
+                w.meta.header().command
+            );
+            io.pending_tokens.insert(id, self.pending.begin(started));
+            write_message(&mut io.wr, &bytes).await?;
+        }
+        Ok(false)
     }
 }
 

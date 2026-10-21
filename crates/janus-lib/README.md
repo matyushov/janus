@@ -50,7 +50,7 @@ Machine must not think a backup is done while the data exists only on the laptop
   unuploaded data wait until the data reached the receiver and was fsynced there. The SMB layer
   answers the client with an interim `STATUS_PENDING` after ~1.5 s and keeps waiting, so a slow
   or briefly frozen receiver does not fail the call. If the receiver has been failing for
-  `barrier_down_after` (120 s), or the wait reaches the ceiling (`barrier`, 600 s), they fail (the
+  `barrier_down_after` (120 s), or the wait reaches the ceiling (`barrier`, 300 s), they fail (the
   backup aborts and is retried in the next cycle); they never report a false success.
 - **`LOCAL_JOURNAL` (off by default, UNSAFE for backups).** `flush` returns after an fsync of the
   journal; the network catches up later. A lost laptop or disk means lost "durable" data, and Time
@@ -87,16 +87,23 @@ upload error and the time of the last acknowledgement; `drain` waits for an empt
 
 #### Time limits (`remote::Timeouts`)
 
-A frozen receiver (TCP alive, no replies) must not hold an ordinary SMB request longer than the
-macOS client is willing to wait (`max_resp_timeout`, 30 s by default). The limits are therefore one
-shared deadline per backend operation, not "timeout x attempts". Barriers (flush / close / rename of
-a file with unuploaded data) are the exception: the SMB layer sends an interim `STATUS_PENDING`
-for them, which stops the client's 30 s clock, so they wait much longer:
+A frozen receiver (TCP alive, no replies) must not hold an SMB request without the client being
+told. The macOS client gives up on a silent request after 45 s (READ, WRITE) to ~98 s (the rest;
+CREATE and CLOSE then unmount the share); an interim `STATUS_PENDING` extends that to about 120 s,
+and a request re-sent over a new connection is waited for again (see
+[docs/macos-smb-client-timeouts.md](../../docs/macos-smb-client-timeouts.md)). So every request
+that waits for the receiver (open, stat, list, read, write, create, rename, delete, flush, close)
+gets an interim `STATUS_PENDING` after 1.5 s, and the backend does not give up on it after the
+operation budget: with `Timeouts::patience` (default: `barrier_down_after`, 120 s) a call keeps
+retrying until the receiver has been down for that long. The gateway drops the TCP connection of
+a request that is still waiting after 100 s, and the client repeats it over a new one. The
+uploader's own calls keep the short budget and the fail-fast logic below.
 
 | Limit | Default | Why |
 |---|---|---|
-| operation budget | 18 s | all attempts and backoff of one operation; leaves ~12 s of margin to 30 s |
-| barrier (journal mode) | 600 s | ceiling for a flush / close / rename of a file with unuploaded data; the client is kept waiting by the interim response |
+| operation budget | 18 s | all attempts and backoff of one operation, for callers without patience and for the uploader |
+| patience | 120 s | how long a call a client waits for keeps retrying while the receiver is down; Create and Delete are repeated too (a repeated Create that finds the file is a success), Rename waits until the receiver answers a ping and is then tried once |
+| barrier (journal mode) | 300 s | ceiling for a flush / close / rename of a file with unuploaded data; the client is kept waiting by the interim response |
 | barrier down-after | 120 s | the barrier fails early once the receiver has had no successful upload or fsync for this long ("stably unavailable"); must exceed the freezes that should be ridden out |
 | request attempt | 6 s | far above a healthy RTT + disk fsync, short enough for 2-3 attempts |
 | bulk attempt (`ReadRange`/`WriteRange`) | 10 s | up to 1 MiB per call on a slow link; still < budget |

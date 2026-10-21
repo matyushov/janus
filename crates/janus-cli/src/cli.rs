@@ -166,10 +166,13 @@ Commands (client only):
                             --max-backlog = unuploaded data the journal may hold (default 1024);
                             local-journal = fsync only syncs the journal: UNSAFE for backups
             [--interim-after <ms>] [--max-wait <sec>] [--down-after <sec>]
-                            how long a FLUSH/CLOSE/RENAME may keep the SMB client waiting for the
-                            server: interim (still working) reply after <ms> (default 1500); an
-                            error after <sec> (600); an error early if the server has been
-                            failing for <sec> (120)
+                            how long any SMB request (CREATE, READ, WRITE, QUERY_*, FLUSH, CLOSE,
+                            RENAME, ...) may keep the SMB client waiting for the server: interim
+                            (still working) reply after <ms> (default 1500); an error after <sec>
+                            (300); an error early if the server has been failing for <sec> (120).
+                            The macOS client gives up on a request after about 120 s, so a request
+                            still waiting after 100 s makes the gateway drop the connection and
+                            the client repeats it over a new one.
   logs [-f] [-n <N>] [--level debug|info|warn|error] [--component <a,b>] [--grep <text>]
                             the daemon log, like tail: the last N lines (default 100) and with
                             -f new ones as they appear; components: smb, daemon, backend, control

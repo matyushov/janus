@@ -132,6 +132,7 @@ async fn rig(max_wait: Duration) -> Rig {
         .with_async_config(AsyncConfig {
             interim_after: INTERIM,
             max_wait,
+            ..AsyncConfig::default()
         }),
     );
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

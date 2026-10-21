@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::AtomicUsize;
 use std::time::{Duration, Instant};
 
 use smb_wire::frame::Dialect;
@@ -43,6 +44,10 @@ pub struct ConnState {
     pub io_epoch: u64,
     /// ClientGuid from NEGOTIATE (durable handles are reclaimed by the same client only).
     pub client_guid: [u8; 16],
+    /// Index of the element of the current packet that `Dispatcher::handle` is working on. The
+    /// connection loop reads it while the handler waits for the backend, to know which command of
+    /// a compound chain to send the interim `STATUS_PENDING` for.
+    pub progress: Arc<AtomicUsize>,
 }
 
 impl Default for ConnState {
@@ -59,6 +64,7 @@ impl Default for ConnState {
             compound_file: None,
             io_epoch: 0,
             client_guid: [0; 16],
+            progress: Arc::default(),
         }
     }
 }
@@ -141,18 +147,29 @@ pub struct AsyncConfig {
     /// An operation still running after this long is answered with an error. Only the wait is
     /// abandoned: the backend call (and the journal behind it) carries on.
     pub max_wait: Duration,
+    /// A packet that is still waiting for the backend after this long (counted from its arrival)
+    /// makes the server drop the TCP connection, so that the client reconnects and sends it
+    /// again. The macOS client gives up on a pending request after ~120 s; see
+    /// `DEFAULT_DROP_AFTER`.
+    pub drop_after: Duration,
 }
 
 /// Default for `AsyncConfig::interim_after`: well below the 30 s the macOS client waits.
 pub const DEFAULT_INTERIM_AFTER: Duration = Duration::from_millis(1500);
-/// Default for `AsyncConfig::max_wait`.
-pub const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(600);
+/// Default for `AsyncConfig::max_wait`: five minutes.
+pub const DEFAULT_MAX_WAIT: Duration = Duration::from_secs(300);
+/// Default for `AsyncConfig::drop_after`. Measured on macOS (docs/macos-smb-client-timeouts.md):
+/// with an interim response and ECHO answered, the client waits ~122 s for a READ or a listing
+/// and then fails the call; a request re-sent over a new connection is waited for again. So the
+/// connection is dropped at 100 s, with a margin below that.
+pub const DEFAULT_DROP_AFTER: Duration = Duration::from_secs(100);
 
 impl Default for AsyncConfig {
     fn default() -> Self {
         AsyncConfig {
             interim_after: DEFAULT_INTERIM_AFTER,
             max_wait: DEFAULT_MAX_WAIT,
+            drop_after: DEFAULT_DROP_AFTER,
         }
     }
 }

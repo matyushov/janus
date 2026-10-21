@@ -937,8 +937,10 @@ impl GrpcBackend {
             .stale
             .get(rel)
             .cloned();
+        // Only for callers that wait for the receiver (patience): without patience an
+        // unreachable receiver is an error, as it always was.
         let fetched = match last_known {
-            Some(old) => {
+            Some(old) if self.link.timeouts.patience.is_some() => {
                 match tokio::time::timeout(STALE_STAT_AFTER, self.stat_path_uncached(rel)).await {
                     Ok(r) => r,
                     Err(_) => {
@@ -947,7 +949,7 @@ impl GrpcBackend {
                     }
                 }
             }
-            None => self.stat_path_uncached(rel).await,
+            _ => self.stat_path_uncached(rel).await,
         };
         match &fetched {
             Ok(s) => {

@@ -8,6 +8,7 @@ license.workspace = true
 
 [dependencies]
 janus-proto = { path = "../janus-proto" }
+janus-version = { path = "../janus-version" }
 tonic = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { version = "0.1", features = ["net"] }

@@ -29,6 +29,7 @@
       <a href="#embed">Embed</a>
       <a href="#security">Security</a>
       <a href="#status">Status</a>
+      <a href="roadmap.html">Roadmap</a>
       <a class="gh" href="https://github.com/matyushov/janus">GitHub</a>
     </nav>
   </div>
@@ -365,6 +366,21 @@ client.stop();                                             <span class="c">// st
         </ul>
       </div>
     </div>
+    <h3 style="margin-top:32px">Reporting a vulnerability</h3>
+    <p>
+      Please do not open a public issue for a security problem. Use GitHub's private reporting:
+      <a href="https://github.com/matyushov/janus/security/advisories/new">report a vulnerability</a>.
+      Include what you found, how to reproduce it, the version and the platform. If the form is not available,
+      open a public <a href="https://github.com/matyushov/janus/issues/new">issue</a> that says only that you have a
+      security report and wants a private channel; do not put the details in it. This is a one-person open source
+      project, so there are no guaranteed response times; only the latest release receives fixes while janus is pre-1.0.
+    </p>
+    <p>
+      In scope: the SMB server (parser flaws, authentication or signing bypass, resource exhaustion triggered by a
+      client), the receiver and its link (bypassing mutual TLS, reading or writing another machine's store, path
+      traversal), and the journal and credential files (permissions, secrets in logs). The limits listed above are
+      documented behaviour, not vulnerabilities.
+    </p>
   </div>
 </section>
 
@@ -394,6 +410,7 @@ client.stop();                                             <span class="c">// st
       <strong>Known limits.</strong> Tested on macOS 26. An outage longer than about two minutes aborts a
       Time Machine run, which is Time Machine's own limit. There is no packaging or installer yet.
     </div>
+    <p style="margin-top:18px">What comes next, version by version, is on the <a href="roadmap.html">roadmap</a>.</p>
   </div>
 </section>
 
@@ -432,6 +449,7 @@ source /tmp/janus-demo/env.sh
       MIT licensed · © 2026 Alexander Matyushov
     </div>
     <div>
+      <a href="roadmap.html">Roadmap</a> ·
       <a href="https://github.com/matyushov/janus">Source</a> ·
       <a href="https://github.com/matyushov/janus/tree/develop/examples">Examples</a> ·
       <a href="https://github.com/matyushov/janus/blob/develop/docs/macos-smb-client-timeouts.md">macOS SMB timeouts</a> ·

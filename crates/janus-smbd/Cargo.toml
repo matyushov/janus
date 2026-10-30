@@ -9,4 +9,5 @@ license.workspace = true
 [dependencies]
 janus-client = { path = "../janus-client" }
 janus-lib = { path = "../janus-lib", features = ["backend-grpc"] }
+janus-version = { path = "../janus-version" }
 # TODO: launchd check-in (raw fd), tracing

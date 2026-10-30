@@ -140,3 +140,21 @@ footer .wrap { display: flex; gap: 14px 30px; flex-wrap: wrap; justify-content: 
 .chip.research { background: var(--bg-soft); color: var(--ink-soft); border: 1px solid var(--line); }
 .usecase { display: flex; flex-direction: column; gap: 10px; }
 .usecase .chip { align-self: flex-start; }
+
+/* roadmap page */
+.ver { position: relative; background: var(--surface); border: 1px solid var(--line); border-left: 5px solid var(--line); border-radius: var(--radius); padding: 24px 26px; margin: 22px 0; box-shadow: var(--shadow); }
+.ver.now { border-left-color: var(--teal); }
+.ver.next { border-left-color: var(--amber); }
+.ver header { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: baseline; margin-bottom: 6px; }
+.ver h3 { margin: 0; font-size: 1.3rem; }
+.ver .vnum { font: 700 1.05rem/1 ui-monospace, Menlo, monospace; color: var(--ink-soft); }
+.ver .theme { color: var(--ink-soft); margin: 0 0 12px; }
+.ver h4 { margin: 16px 0 6px; font-size: .78rem; text-transform: uppercase; letter-spacing: .09em; color: var(--ink-soft); }
+.ver ul { margin: 0; padding-left: 20px; }
+.ver li { margin: 6px 0; }
+.ver .exit { margin-top: 14px; padding: 12px 14px; background: var(--bg-soft); border: 1px solid var(--line); border-radius: 10px; font-size: .96rem; }
+.ver .exit b { color: var(--ink); }
+.ver .limits { margin-top: 14px; font-size: .95rem; color: var(--ink-soft); }
+.jump { display: flex; gap: 8px 14px; flex-wrap: wrap; margin: 18px 0 0; padding: 0; list-style: none; }
+.jump a { display: inline-block; padding: 6px 12px; border: 1px solid var(--line); border-radius: 999px; text-decoration: none; color: var(--ink-soft); font: 600 .85rem/1.2 ui-monospace, Menlo, monospace; background: var(--surface); }
+.jump a:hover { color: var(--ink); border-color: var(--ink-soft); }

@@ -263,3 +263,19 @@ fn twenty_cycles_do_not_leak_threads() {
         );
     }
 }
+
+#[test]
+fn the_library_reports_the_one_workspace_version() {
+    let v = unsafe { CStr::from_ptr(janus_client_version()) }
+        .to_str()
+        .unwrap();
+    assert_eq!(v, janus_version::VERSION);
+    // Cargo.toml is the single source of the release version; nothing else keeps a copy.
+    let manifest =
+        std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../Cargo.toml")).unwrap();
+    let line = manifest
+        .lines()
+        .find(|l| l.starts_with("version = \""))
+        .expect("workspace version line");
+    assert_eq!(line, format!("version = \"{v}\""));
+}

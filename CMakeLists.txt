@@ -12,7 +12,15 @@
 #   janus::client_shared  libjanus.dylib / .so / .dll + headers
 #   janus::mount_macos    (macOS only) frameworks for <janus/mount_macos.hpp>
 cmake_minimum_required(VERSION 3.20)
-project(janus VERSION 0.1.0 LANGUAGES C CXX)
+# The release version has ONE source: [workspace.package] in Cargo.toml (the first line that starts
+# with `version = "`). CMake, the installed CMake package and the .pc files follow it.
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/Cargo.toml" _janus_version_lines REGEX "^version = \"[0-9]+\\.[0-9]+\\.[0-9]+")
+list(GET _janus_version_lines 0 _janus_version_line)
+string(REGEX REPLACE "^version = \"([0-9]+\\.[0-9]+\\.[0-9]+).*" "\\1" JANUS_VERSION "${_janus_version_line}")
+if(NOT JANUS_VERSION MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
+  message(FATAL_ERROR "cannot read the version from Cargo.toml (got '${JANUS_VERSION}')")
+endif()
+project(janus VERSION ${JANUS_VERSION} LANGUAGES C CXX)
 
 include(GNUInstallDirs)
 include(CMakePackageConfigHelpers)

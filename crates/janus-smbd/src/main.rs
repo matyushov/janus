@@ -52,6 +52,10 @@ fn main() {
     for arg in &args {
         match arg.as_str() {
             "--dev" => dev = true,
+            "-V" | "--version" => {
+                println!("{}", janus_version::long("janus-smbd"));
+                return;
+            }
             "-h" | "--help" => {
                 print_usage();
                 return;
@@ -71,7 +75,8 @@ fn print_usage() {
     eprintln!(
         "janus-smbd — janus SMB gateway.\n\n\
          Usage: janus-smbd [--dev]\n\n  \
-         --dev    foreground debug mode (verbose output)\n\n\
+         --dev        foreground debug mode (verbose output)\n  \
+         -V, --version  print the version and exit\n\n\
          The daemon awaits instructions on {CONTROL_ADDR}. Setup:\n  \
          janus-cli client configure --endpoint <host:port> --client-cert <pem> \\\n    \
          --client-key <pem> --ca <pem> [--share <name>] [--port <n>]\n\n\
@@ -118,6 +123,7 @@ fn config_from_env() -> ClientConfig {
 
 /// The exit code of the process.
 fn run(dev: bool) -> i32 {
+    jlog!(Info, "daemon", "{}", janus_version::long("janus-smbd"));
     let client = match Client::start(config_from_env()) {
         Ok(c) => c,
         Err(e) => {

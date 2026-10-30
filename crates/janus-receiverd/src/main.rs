@@ -54,6 +54,10 @@ fn main() -> ExitCode {
                 dev = true;
                 i += 1;
             }
+            "-V" | "--version" => {
+                println!("{}", janus_version::long("janus-receiverd"));
+                return ExitCode::SUCCESS;
+            }
             "-h" | "--help" => {
                 print_usage();
                 return ExitCode::SUCCESS;
@@ -85,6 +89,7 @@ fn main() -> ExitCode {
         }
     }
 
+    eprintln!("{}", janus_version::long("janus-receiverd"));
     if dev {
         eprintln!("janus-receiverd: dev mode (foreground, no mTLS)");
     }
@@ -177,7 +182,8 @@ fn print_usage() {
          --store   storage directory (default {DEFAULT_STORE}, env {STORE_ENV}); in production the\n            \
                    parent of the per-machine store subdirectories\n  \
          --quota   limit in bytes, 0 = unlimited (env {QUOTA_ENV}); in production the default for\n            \
-                   machines without their own quota\n\n\
+                   machines without their own quota\n  \
+         -V, --version  print the version and exit\n\n\
          Production mode (no --dev) requires, from the environment:\n  \
          {TLS_CERT_ENV}   server certificate (PEM)\n  \
          {TLS_KEY_ENV}    server private key (PEM, keep it 0600)\n  \

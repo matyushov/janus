@@ -1,0 +1,246 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>janus roadmap — version by version</title>
+<meta name="description" content="Where janus is going, version by version: what each release adds, what it must prove before it ships, and what is deliberately not planned.">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/style.css">
+<meta property="og:type" content="website">
+<meta property="og:title" content="janus roadmap — version by version">
+<meta property="og:description" content="What each janus release adds, what it must prove before it ships, and what is not planned.">
+<meta property="og:url" content="https://matyushov.github.io/janus/roadmap.html">
+</head>
+<body>
+
+<header class="bar">
+  <div class="wrap">
+    <a class="brand" href="index.html" aria-label="janus, back to the home page">
+      <svg viewBox="0 0 64 64" aria-hidden="true"><path d="M32 8v48" stroke="currentColor" stroke-opacity=".45" stroke-width="2" stroke-dasharray="3 4"/><path d="M26 20a13 13 0 0 0 0 24" fill="none" stroke="#2dd4bf" stroke-width="6" stroke-linecap="round"/><path d="M38 20a13 13 0 0 1 0 24" fill="none" stroke="#f5a524" stroke-width="6" stroke-linecap="round"/></svg>
+      janus
+    </a>
+    <nav aria-label="Sections">
+      <a href="index.html">Overview</a>
+      <a href="#versioning">Versioning</a>
+      <a href="#versions">Versions</a>
+      <a href="#not-planned">Not planned</a>
+      <a class="gh" href="https://github.com/matyushov/janus">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+
+<section class="hero" style="padding-bottom:48px">
+  <div class="wrap">
+    <span class="eyebrow">Roadmap and releases</span>
+    <h1 style="max-width:20ch">Where janus is going, <em>version by version</em>.</h1>
+    <p class="lede">
+      Order matters; dates are not promised. A version ships when its exit criteria are met, and each
+      one has criteria that can be checked. The project is a one-person open source effort, so the plan
+      favours a few things done properly over many things half done.
+    </p>
+    <ul class="jump" aria-label="Jump to a version">
+      <li><a href="#v0-1-0">v0.1.0</a></li>
+      <li><a href="#v0-2-0">v0.2.0</a></li>
+      <li><a href="#v0-3-0">v0.3.0</a></li>
+      <li><a href="#v0-4-0">v0.4.0</a></li>
+      <li><a href="#v0-5-0">v0.5.0</a></li>
+      <li><a href="#v1-0-0">v1.0.0</a></li>
+    </ul>
+  </div>
+</section>
+
+<!-- ======================================================= versioning -->
+<section id="versioning">
+  <div class="wrap">
+    <span class="eyebrow">Versioning</span>
+    <h2>Three numbers, on purpose</h2>
+    <p class="lede">
+      janus is pre-1.0: minor versions may change behaviour, and every change is listed in the release notes
+      on <a href="https://github.com/matyushov/janus/releases">GitHub Releases</a>. Three version numbers exist and move independently.
+    </p>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Number</th><th>Where you see it</th><th>What it means</th></tr></thead>
+        <tbody>
+          <tr><td><strong>Release version</strong> <code>0.x.y</code></td><td>the workspace version, the git tag <code>v0.x.y</code></td><td>The software as a whole. Semantic Versioning without exceptions from 1.0.</td></tr>
+          <tr><td><strong>C ABI version</strong></td><td><code>janus_client_abi_version()</code>, currently <code>1</code></td><td>Changes only when the C interface of <code>libjanus</code> breaks.</td></tr>
+          <tr><td><strong>Wire protocol revision</strong></td><td><code>proto_rev</code> in the receiver's reply, currently <code>2</code></td><td>The gRPC contract between the client and the receiver. Additions stay compatible; a bump means an older peer may be refused.</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      Releases are <strong>source-only</strong> until binaries can be signed (v0.2.0): an unsigned command-line
+      binary downloaded in a browser is quarantined by macOS, and it is not something to hand to users.
+      Every release is marked <em>pre-release</em> until 1.0.
+    </p>
+  </div>
+</section>
+
+<!-- ======================================================= versions -->
+<section id="versions">
+  <div class="wrap">
+    <span class="eyebrow">Versions</span>
+    <h2>From a working core to a stable 1.0</h2>
+
+    <!-- v0.1.0 -->
+    <article class="ver now" id="v0-1-0">
+      <header>
+        <span class="vnum">v0.1.0</span>
+        <h3>Preview</h3>
+        <span class="chip works">current state</span>
+      </header>
+      <p class="theme">A working core, proven with the hardest client, built from source.</p>
+      <h4>What it contains</h4>
+      <ul>
+        <li>An SMB 3.1.1 server in Rust: signing required, NTLMv2, no guests, durable handles V2, lease V2, interim <code>STATUS_PENDING</code> and <code>CANCEL</code>, Apple extensions, <code>F_FULLFSYNC</code>.</li>
+        <li>macOS Time Machine as the first verified client: full and incremental backups, file restore, a killed client and receiver outages up to about two minutes survived.</li>
+        <li>A receiver over gRPC with mutual TLS 1.3, one store and quota per machine, zstd on the wire.</li>
+        <li>A write-ahead journal with an honest <code>fsync</code> and background upload.</li>
+        <li>An embeddable client: a C library with eleven functions, a header-only C++ wrapper, a CMake package, five examples.</li>
+        <li>Command-line control, live status and logs, this site.</li>
+      </ul>
+      <p class="limits"><strong>Known limits.</strong> Tested on macOS 26 only. An outage longer than about two minutes aborts a
+      Time Machine run (Time Machine's own limit). Linux and Windows SMB clients are not supported. There is no installer
+      or background service; the daemon runs from a shell. No certificate revocation. No external security review.</p>
+    </article>
+
+    <!-- v0.2.0 -->
+    <article class="ver next" id="v0-2-0">
+      <header>
+        <span class="vnum">v0.2.0</span>
+        <h3>Installable and trustworthy</h3>
+        <span class="chip planned">next</span>
+      </header>
+      <p class="theme">A stranger can install it from the documentation, and has reasons to trust it.</p>
+      <h4>Scope</h4>
+      <ul>
+        <li><strong>Packaging.</strong> A reproducible <code>.deb</code> for the receiver built in CI from a script in the repository. A documented, signed way to run the client on macOS: an unsigned command-line binary does not get the Local Network permission under <code>launchd</code>, so the answer is an app host with a stable signature or another route.</li>
+        <li><strong>A Time Machine setup helper.</strong> <code>tmutil setdestination</code> stores the password with no access for the system's network authentication agent, so <code>backupd</code> cannot read it; the helper creates the keychain entry correctly and explains each step.</li>
+        <li><strong>Certificate lifecycle.</strong> Enrolling a machine without hand-editing JSON, listing, expiry warnings and a real way to revoke a client.</li>
+        <li><strong>Fail fast on a rejected certificate.</strong> A client whose certificate is refused currently retries for the whole two-minute patience before reporting an error; telling an authentication failure from an unreachable network makes it an immediate, clear error.</li>
+        <li><strong>Hardening.</strong> Fuzz targets for the SMB codec and the authentication parsers running in CI, a dependency audit in CI, a written threat model.</li>
+        <li><strong>Native <code>launchd</code> socket activation</strong>, receiver logs, an install guide.</li>
+        <li><strong>Dogfooding.</strong> The maintainer's own Mac backs up through janus for several weeks before the tag.</li>
+      </ul>
+      <div class="exit"><b>Exit criteria.</b> A fresh Mac and a fresh Linux server go from nothing to a completed Time Machine backup in under thirty minutes using only the documentation; the fuzzers ran for a meaningful time without a crash; revoking a client works.</div>
+    </article>
+
+    <!-- v0.3.0 -->
+    <article class="ver" id="v0-3-0">
+      <header>
+        <span class="vnum">v0.3.0</span>
+        <h3>Recoverable</h3>
+        <span class="chip research">later</span>
+      </header>
+      <p class="theme">Getting a whole machine back, not just files.</p>
+      <h4>Scope</h4>
+      <ul>
+        <li><strong>Restore from macOS Recovery, verified end to end.</strong> The daemon runs in Recovery and the restore wizard lists the backups today; the path through Migration Assistant after a reinstall is not verified. Turn the lab procedure into documentation, or document exactly where the boundary is.</li>
+        <li><strong>Credential delivery for Recovery</strong> without copying a private key by hand (short-lived credentials), if the threat model allows it; otherwise a documented manual procedure.</li>
+        <li><strong>Resume after an interrupted backup.</strong> Measure what Time Machine does on the next run after a long outage; only if it starts over, build the metadata mirror that lets a backup survive longer outages.</li>
+        <li><strong>Snapshot browsing on the server</strong> (a read-only mount of a snapshot), including how it interacts with encryption.</li>
+        <li><strong>Encryption and key ownership.</strong> Decide and document who holds the key and what janus does and does not protect; no unspecified behaviour.</li>
+      </ul>
+      <div class="exit"><b>Exit criteria.</b> A tested, written procedure restores a machine from an empty disk, or there is a documented list of what cannot be done and why.</div>
+    </article>
+
+    <!-- v0.4.0 -->
+    <article class="ver" id="v0-4-0">
+      <header>
+        <span class="vnum">v0.4.0</span>
+        <h3>More clients</h3>
+        <span class="chip research">later</span>
+      </header>
+      <p class="theme">"Any SMB client" becomes a verified matrix.</p>
+      <h4>Scope</h4>
+      <ul>
+        <li><strong>Linux.</strong> Fix session setup for <code>cifs.ko</code> (it appears to send a bare NTLMSSP token where the server expects SPNEGO); verify the POSIX profile with <code>cifs.ko</code> and <code>smbclient</code>.</li>
+        <li><strong>Windows.</strong> Verify the Windows profile with Explorer, <code>robocopy</code> and File History, including signing.</li>
+        <li><strong>Client tests in CI.</strong> Linux <code>cifs</code> in a container at least, plus a documented manual matrix for macOS and Windows.</li>
+        <li>Byte-range locks and share modes, if a verified client needs them.</li>
+      </ul>
+      <div class="exit"><b>Exit criteria.</b> A published client matrix in which every "works" is backed by a test or a recorded run.</div>
+    </article>
+
+    <!-- v0.5.0 -->
+    <article class="ver" id="v0-5-0">
+      <header>
+        <span class="vnum">v0.5.0</span>
+        <h3>More backends</h3>
+        <span class="chip research">later</span>
+      </header>
+      <p class="theme">Object storage behind the same share.</p>
+      <h4>Scope</h4>
+      <ul>
+        <li><strong>S3-compatible storage</strong> (AWS S3, MinIO, Wasabi, R2, Ceph) behind the receiver. Time Machine's 256&nbsp;MiB sparse bands make "one file, one object" impractical, so the choice between a chunked layout and multipart upload with server-side copy follows measurements: the write profile of the backup client first, then a prototype against MinIO.</li>
+        <li>Guidance for bucket policies: versioning and Object Lock conflict with Time Machine's thinning of old backups.</li>
+        <li>The backend interface is frozen and every backend must pass the same contract tests.</li>
+      </ul>
+      <div class="exit"><b>Exit criteria.</b> A Time Machine backup completes to MinIO, and the costs and trade-offs are documented.</div>
+    </article>
+
+    <!-- v1.0.0 -->
+    <article class="ver" id="v1-0-0">
+      <header>
+        <span class="vnum">v1.0.0</span>
+        <h3>Stable</h3>
+        <span class="chip research">goal</span>
+      </header>
+      <p class="theme">Promises that can be kept.</p>
+      <ul>
+        <li>The C ABI is frozen and its compatibility policy is written down.</li>
+        <li>The wire protocol has a stated policy: what an old client and a new receiver may do.</li>
+        <li>Signed binaries for the supported platforms.</li>
+        <li>A structured security review (external if possible) and a clean fuzzing history.</li>
+        <li>Months of real use without data-loss reports, complete documentation, triaged issues.</li>
+        <li>From here on, Semantic Versioning without exceptions.</li>
+      </ul>
+    </article>
+  </div>
+</section>
+
+<!-- ======================================================= not planned -->
+<section id="not-planned">
+  <div class="wrap">
+    <span class="eyebrow">Not planned</span>
+    <h2>What janus will not become</h2>
+    <div class="grid">
+      <article class="card">
+        <h3>An iSCSI initiator or a kernel extension</h3>
+        <p>Block devices need drivers the platform vendors gate and change; that is a different project.</p>
+      </article>
+      <article class="card">
+        <h3>A bundled Samba</h3>
+        <p>The point is a small, strict SMB server written for this job, with nothing borrowed from a general-purpose one.</p>
+      </article>
+      <article class="card">
+        <h3>SMB on the network</h3>
+        <p>A server-side SMB listener would undo the reason janus exists: SMB never leaves the client machine.</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <div>
+      <strong>janus</strong> — a local SMB share backed by storage you control.<br>
+      MIT licensed · © 2026 Alexander Matyushov
+    </div>
+    <div>
+      <a href="index.html">Overview</a> ·
+      <a href="https://github.com/matyushov/janus">Source</a> ·
+      <a href="https://github.com/matyushov/janus/releases">Releases</a> ·
+      <a href="https://github.com/matyushov/janus/issues">Issues</a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

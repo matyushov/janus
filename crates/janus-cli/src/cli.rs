@@ -141,6 +141,7 @@ pub const USAGE: &str = "\
 janus-cli — janus daemon management
 
 Usage: janus-cli <client|server> <command> [options]
+       janus-cli --version
 
 Sides:
   client     janus-smbd — SMB gateway (127.0.0.1:50051)

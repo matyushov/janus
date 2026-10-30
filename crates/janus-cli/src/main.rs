@@ -24,6 +24,13 @@ mod exit {
 }
 
 fn main() {
+    if matches!(
+        std::env::args().nth(1).as_deref(),
+        Some("-V" | "--version" | "version")
+    ) {
+        println!("{}", janus_version::long("janus-cli"));
+        return;
+    }
     let cli = match cli::parse(std::env::args().skip(1)) {
         Ok(cli) => cli,
         Err(ParseError(msg)) => {

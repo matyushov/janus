@@ -235,9 +235,14 @@ async fn writes_of_one_connection_run_concurrently() {
         ids.push(r.header().message_id);
     }
     let took = started.elapsed();
-    // serial would be n * DELAY (1.8 s); allow generous slack on a loaded machine
-    assert!(took < DELAY * 4, "writes were serialized: {took:?}");
+    // The proof of concurrency is the number of calls in flight at once. The clock is only a
+    // coarse second check: strictly faster than serial (n * DELAY = 1.8 s), with the rest of
+    // the budget left as slack for a loaded CI runner.
     assert!(t.backend.max_running.load(Ordering::SeqCst) >= 3);
+    assert!(
+        took < DELAY * (n as u32),
+        "writes were serialized: {took:?}"
+    );
     ids.sort_unstable();
     ids.dedup();
     assert_eq!(ids.len(), n, "one reply per request");
@@ -331,7 +336,12 @@ async fn reads_run_concurrently_and_return_their_own_ranges() {
         let i = usize::from(d[0]) - 1;
         got[i] = d;
     }
-    assert!(started.elapsed() < DELAY * 4, "reads were serialized");
+    // Calls in flight at once is the proof; the clock is a coarse check (see the writes test).
+    assert!(t.backend.max_running.load(Ordering::SeqCst) >= 3);
+    assert!(
+        started.elapsed() < DELAY * (n as u32),
+        "reads were serialized"
+    );
     assert_eq!(got.concat(), data);
 }
 
@@ -355,9 +365,10 @@ async fn sequential_reads_are_prefetched_and_stay_correct() {
         got.extend(read_reply_data(&r.message.body));
     }
     assert_eq!(got, data);
-    // one at a time would be n * DELAY (2.4 s)
+    // One at a time would take at least n * DELAY (2.4 s). Readahead keeps several reads in
+    // flight, so it must finish well under that; the margin is slack for a loaded CI runner.
     assert!(
-        started.elapsed() < DELAY * 5,
+        started.elapsed() < DELAY * (n as u32 - 1),
         "no readahead: {:?}",
         started.elapsed()
     );

@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use janus_lib::grpc_backend::{GrpcBackend, RetryPolicy};
-use janus_lib::remote::{RemoteClient, RemoteConfig, RemoteError};
+use janus_lib::remote::{RemoteClient, RemoteConfig, RemoteError, Timeouts};
 use janus_lib::vfs::{BackendError, Disposition, Kind, OpenRequest, StorageBackend};
 use janus_receiverd::certs::{ClientIdentity, TestPki};
 use janus_receiverd::identity::IdentityMap;
@@ -83,6 +83,12 @@ impl Rig {
             ca_pem: self.pki.ca_pem.clone().into_bytes(),
             client_cert_path: cert,
             client_key_path: key,
+            // A refused certificate must fail at once here. The default `patience` (two minutes
+            // of retrying for a client that is waiting) would make these tests last that long.
+            timeouts: Timeouts {
+                patience: None,
+                ..Timeouts::default()
+            },
             ..Default::default()
         }
     }

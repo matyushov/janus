@@ -123,6 +123,7 @@
         <li><strong>Certificate lifecycle.</strong> Enrolling a machine without hand-editing JSON, listing, expiry warnings and a real way to revoke a client.</li>
         <li><strong>Fail fast on a rejected certificate.</strong> A client whose certificate is refused currently retries for the whole two-minute patience before reporting an error; telling an authentication failure from an unreachable network makes it an immediate, clear error.</li>
         <li><strong>Hardening.</strong> Fuzz targets for the SMB codec and the authentication parsers running in CI, a dependency audit in CI, a written threat model.</li>
+        <li><strong>Upload throttling.</strong> A bandwidth limit for the background upload that can be changed while janus runs (<code>janus-cli client throttle 5MB/s</code>, <code>off</code>, <code>pause</code>, <code>resume</code>), so a backup does not take the whole uplink of a laptop on Wi-Fi or a VPN. It only slows the upload down and never drops or reorders data; clients that wait for a flush are still answered honestly. Schedules and metered-network detection follow if the basic limit proves useful.</li>
         <li><strong>Native <code>launchd</code> socket activation</strong>, receiver logs, an install guide.</li>
         <li><strong>Dogfooding.</strong> The maintainer's own Mac backs up through janus for several weeks before the tag.</li>
       </ul>

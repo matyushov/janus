@@ -1,0 +1,444 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>janus — a local SMB share backed by storage you control</title>
+<meta name="description" content="janus serves a local SMB 3.1.1 share on 127.0.0.1 for any SMB client and sends what is written to it to the storage you choose over a secure channel. SMB never leaves the machine. Open source, written in Rust.">
+<meta name="color-scheme" content="light dark">
+<link rel="icon" href="assets/favicon.svg" type="image/svg+xml">
+<link rel="stylesheet" href="assets/style.css">
+<meta property="og:type" content="website">
+<meta property="og:title" content="janus — a local SMB share backed by storage you control">
+<meta property="og:description" content="Any SMB client gets a local share; the data goes to your own storage over mutual TLS. No Samba, no kernel extension, no SMB on your network.">
+<meta property="og:url" content="https://matyushov.github.io/janus/">
+</head>
+<body>
+
+<header class="bar">
+  <div class="wrap">
+    <a class="brand" href="#top" aria-label="janus, back to the top">
+      <svg viewBox="0 0 64 64" aria-hidden="true"><path d="M32 8v48" stroke="currentColor" stroke-opacity=".45" stroke-width="2" stroke-dasharray="3 4"/><path d="M26 20a13 13 0 0 0 0 24" fill="none" stroke="#2dd4bf" stroke-width="6" stroke-linecap="round"/><path d="M38 20a13 13 0 0 1 0 24" fill="none" stroke="#f5a524" stroke-width="6" stroke-linecap="round"/></svg>
+      janus
+    </a>
+    <nav aria-label="Sections">
+      <a href="#idea">Idea</a>
+      <a href="#uses">Use cases</a>
+      <a href="#how">How it works</a>
+      <a href="#proof">Proof</a>
+      <a href="#embed">Embed</a>
+      <a href="#security">Security</a>
+      <a href="#status">Status</a>
+      <a class="gh" href="https://github.com/matyushov/janus">GitHub</a>
+    </nav>
+  </div>
+</header>
+
+<main id="top">
+
+<!-- ======================================================= hero -->
+<section class="hero">
+  <div class="wrap">
+    <span class="eyebrow">Open source · Rust · MIT</span>
+    <h1>Give any app a <em>local SMB share</em> backed by storage you control.</h1>
+    <p class="lede">
+      janus serves SMB&nbsp;3.1.1 on <code>127.0.0.1</code> and sends everything written to it to the
+      backend you choose, over a secure channel. The client sees an ordinary disk. The network sees one
+      authenticated stream. No Samba, no kernel extension, no SMB port open on your network.
+    </p>
+    <div class="cta">
+      <a class="btn primary" href="https://github.com/matyushov/janus">View the source</a>
+      <a class="btn" href="#uses">What it is for</a>
+      <a class="btn" href="#start">Try it locally</a>
+    </div>
+    <ul class="facts">
+      <li>SMB 3.1.1 only, signing required, no guests</li>
+      <li>Proven with the most demanding client first: macOS Time Machine</li>
+      <li>480+ automated tests, CI on Linux, macOS and Windows</li>
+    </ul>
+  </div>
+</section>
+
+<!-- ======================================================= idea -->
+<section id="idea">
+  <div class="wrap">
+    <span class="eyebrow">The idea</span>
+    <h2>SMB is everywhere. It is also built for a trusted LAN.</h2>
+    <p class="lede">
+      Operating systems, backup tools and plenty of legacy software know how to write to a network
+      drive, and the network drive speaks SMB. Exposing an SMB service to reach remote storage means an
+      attack surface, legacy authentication and protocol quirks. janus keeps the convenient half of SMB
+      and drops the dangerous half.
+    </p>
+    <div class="grid">
+      <article class="card">
+        <span class="tag teal">face one</span>
+        <h3>Clients see an ordinary share</h3>
+        <p>Anything that can mount <code>smb://127.0.0.1/…</code> works with files as usual. janus adapts
+        to each client's expectations with a per-share <em>profile</em>, so a client's quirks stay out of the core.</p>
+      </article>
+      <article class="card">
+        <span class="tag amber">face two</span>
+        <h3>The storage is a plug-in</h3>
+        <p>Behind the share sits a backend: your own receiver over mutual TLS today, a plain folder for
+        development, object storage under study. The network carries one authenticated stream and no SMB at all.</p>
+      </article>
+      <article class="card">
+        <span class="tag teal">the name</span>
+        <h3>Janus, the god of doors</h3>
+        <p>One face looks at the SMB client, the other at the storage. The code that stands between them
+        is the whole project.</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- ======================================================= uses -->
+<section id="uses">
+  <div class="wrap">
+    <span class="eyebrow">Use cases</span>
+    <h2>One transport, several jobs</h2>
+    <p class="lede">
+      Time Machine is the first client janus fully supports, because it is the hardest one: if it
+      works, plain file copies are easy. It is a mode of the project, not its purpose. Every card below
+      says honestly how far along it is.
+    </p>
+    <div class="grid">
+      <article class="card usecase">
+        <span class="chip works">works</span>
+        <h3>Backups from macOS to your own server</h3>
+        <p>Time Machine writes into the loopback share; janus carries the sparsebundle to a server you
+        run. Full and incremental backups, file restore and short outages are verified end to end.</p>
+      </article>
+      <article class="card usecase">
+        <span class="chip works">works</span>
+        <h3>Storage for your own application</h3>
+        <p>Start the client inside your C++ program through a small C library, mount the share and use
+        plain files, with the journal and the secure link taken care of. See <a href="#embed">Embed</a>.</p>
+      </article>
+      <article class="card usecase">
+        <span class="chip works">works with macOS clients</span>
+        <h3>Remote storage for SMB-only software</h3>
+        <p>Programs that only know "save to a network drive" get a remote, authenticated destination without
+        an SMB service on the network. File copies through <code>mount_smbfs</code> and NetFS are verified byte for byte.</p>
+      </article>
+      <article class="card usecase">
+        <span class="chip planned">planned</span>
+        <h3>Windows clients</h3>
+        <p>File History, <code>robocopy</code>, <code>wbadmin</code>. A compatibility profile exists in the code;
+        it has not been tested against real Windows clients yet.</p>
+      </article>
+      <article class="card usecase">
+        <span class="chip planned">planned</span>
+        <h3>Linux clients</h3>
+        <p><code>cifs.ko</code> and <code>smbclient</code>. There is a known gap in session setup that must be
+        closed first.</p>
+      </article>
+      <article class="card usecase">
+        <span class="chip research">researching</span>
+        <h3>S3, MinIO and similar backends</h3>
+        <p>The backend interface is ready for them. Large sparse files make "one file, one object" a poor fit,
+        so a chunked layout is being evaluated. Nothing ships yet.</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- ======================================================= how -->
+<section id="how">
+  <div class="wrap">
+    <span class="eyebrow">How it works</span>
+    <h2>A strict SMB server on one side, a careful uploader on the other</h2>
+    <p class="lede">
+      <code>janus-smbd</code> runs next to the client, on the same machine. <code>janus-receiverd</code> runs where the data
+      is kept. Everything on the left of the dashed line stays on the client's machine.
+    </p>
+
+    <figure class="diagram">
+      <svg viewBox="0 0 960 300" role="img" aria-labelledby="dt dd">
+        <title id="dt">Data path through janus</title>
+        <desc id="dd">An SMB client on the same machine writes over SMB to janus-smbd. janus-smbd writes to a local journal and uploads over mutual TLS to janus-receiverd, which stores the data per machine in a storage backend.</desc>
+
+        <text x="24" y="30" class="lab-t">stays on this machine</text>
+        <text x="610" y="30" class="lab-a">crosses the network</text>
+        <line x1="585" y1="44" x2="585" y2="262" class="fence"/>
+        <text x="585" y="282" text-anchor="middle" class="sub">your network</text>
+
+        <rect x="24" y="108" width="172" height="86" rx="12" class="box"/>
+        <text x="110" y="140" text-anchor="middle" font-weight="700">Any SMB client</text>
+        <text x="110" y="160" text-anchor="middle" class="sub">Time Machine · Finder</text>
+        <text x="110" y="176" text-anchor="middle" class="sub">your own app</text>
+
+        <rect x="288" y="64" width="258" height="158" rx="14" class="box t"/>
+        <text x="417" y="92" text-anchor="middle" font-weight="700">janus-smbd</text>
+        <rect x="308" y="108" width="218" height="40" rx="8" class="box"/>
+        <text x="417" y="133" text-anchor="middle">SMB 3.1.1 server (signed)</text>
+        <rect x="308" y="160" width="218" height="40" rx="8" class="box"/>
+        <text x="417" y="185" text-anchor="middle">write-ahead journal</text>
+
+        <rect x="636" y="96" width="170" height="102" rx="12" class="box a"/>
+        <text x="721" y="132" text-anchor="middle" font-weight="700">janus-receiverd</text>
+        <text x="721" y="152" text-anchor="middle" class="sub">identity from the</text>
+        <text x="721" y="168" text-anchor="middle" class="sub">client certificate</text>
+
+        <path d="M830 120h92v54h-92z" class="box"/>
+        <text x="876" y="144" text-anchor="middle">backend</text>
+        <text x="876" y="162" text-anchor="middle" class="sub">disk today</text>
+
+        <path d="M196 151h82" class="wire-t"/><polygon points="278,144 292,151 278,158" class="arrow-t"/>
+        <text x="237" y="136" text-anchor="middle" class="sub">SMB</text>
+        <text x="237" y="176" text-anchor="middle" class="sub">127.0.0.1</text>
+
+        <path d="M546 151h80" class="wire-a"/><polygon points="626,144 640,151 626,158" class="arrow-a"/>
+        <text x="590" y="136" text-anchor="middle" class="sub">mTLS 1.3</text>
+        <text x="590" y="176" text-anchor="middle" class="sub">gRPC + zstd</text>
+
+        <path d="M806 151h14" stroke="var(--ink-soft)" stroke-width="2" fill="none"/>
+      </svg>
+    </figure>
+
+    <ol class="steps">
+      <li><b>The client writes into a loopback share.</b>
+        janus-smbd is a purpose-built SMB 3.1.1 server, written from scratch in Rust. It requires signing
+        and accepts no guests. A per-share profile switches on only the behaviour a given client needs.</li>
+      <li><b>Every write lands in a local journal first.</b>
+        The write is acknowledged as soon as it is safe on the local disk, so the speed of the client is
+        not tied to the round trip to the server.</li>
+      <li><b>An uploader moves the journal to the receiver.</b>
+        Writes are idempotent (they carry offsets), so a retry after a dropped connection is always safe.
+        Ranges overwritten before upload are merged, so the network carries the final bytes only.</li>
+      <li><b>The receiver files everything under the client's identity.</b>
+        The certificate decides which machine you are, which directory you may touch and how much quota
+        you have. A client never names a path outside its own store.</li>
+      <li><b><code>fsync</code> stays honest.</b>
+        When a client asks for a full flush, janus does not answer until the data has really reached the
+        receiver. "Saved" never means "still only on this machine".</li>
+    </ol>
+  </div>
+</section>
+
+<!-- ======================================================= features -->
+<section id="features">
+  <div class="wrap">
+    <span class="eyebrow">What is inside</span>
+    <h2>The parts that make it a dependable destination</h2>
+    <div class="grid">
+      <article class="card">
+        <h3>An SMB server of its own</h3>
+        <p>SMB 3.1.1 with signing, NTLMv2, durable handles V2 that survive a daemon restart, lease V2
+        with break acknowledgements, interim <code>STATUS_PENDING</code> and <code>CANCEL</code>.
+        Nothing is borrowed from Samba.</p>
+      </article>
+      <article class="card">
+        <h3>Client profiles</h3>
+        <p>Behaviour is chosen by capabilities, never by operating system: <code>TIME_MACHINE</code> today,
+        <code>WINDOWS_GENERIC</code> and <code>POSIX_GENERIC</code> next. Apple's extensions are on only where they are needed.</p>
+      </article>
+      <article class="card">
+        <h3>Pluggable storage backends</h3>
+        <p>One small interface (open, read, write, flush, rename, list, free space). The same contract tests run
+        against a local folder and against the gRPC receiver, so backends behave alike.</p>
+      </article>
+      <article class="card">
+        <h3>Survives a dead server, for a while</h3>
+        <p>Slow or missing replies become interim responses instead of errors, so a stalled receiver does not
+        break the client's I/O. Time Machine, the strictest client we tried, tolerates about two minutes.</p>
+      </article>
+      <article class="card">
+        <h3>Many machines, one receiver</h3>
+        <p>Each client certificate maps to its own store and quota. One machine cannot read, list or write
+        another's files, not even with <code>..</code> or absolute paths.</p>
+      </article>
+      <article class="card">
+        <h3>Embeddable and observable</h3>
+        <p>A C library with a header-only C++ wrapper runs the client in-process.
+        <code>janus-cli client status --watch</code> and <code>client logs -f</code> show backlog, errors and waiting operations.</p>
+      </article>
+    </div>
+  </div>
+</section>
+
+<!-- ======================================================= proof -->
+<section id="proof">
+  <div class="wrap">
+    <span class="eyebrow">Proof</span>
+    <h2>The hardest client first, tested against the real thing</h2>
+    <p class="lede">
+      macOS Time Machine is picky: Apple's SMB extensions, durable handles, leases and full-flush semantics
+      that no open, non-GPL SMB server offers. The numbers below come from a real <code>backupd</code> in a
+      macOS 26 virtual machine writing through janus to a Linux receiver on another machine. Throughput was
+      measured over home Wi-Fi, so read it as "the link is the limit", not as a benchmark.
+    </p>
+
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Scenario</th><th>Result</th></tr></thead>
+        <tbody>
+          <tr><td>Full Time Machine backup, 1.68 GB, 43,870 items</td><td class="ok">completes; files restored with <code>tmutil restore</code> match byte for byte</td></tr>
+          <tr><td><code>kill -9</code> of the client in the middle of a backup</td><td class="ok">backup still finishes, all files match</td></tr>
+          <tr><td>Receiver frozen for 15, 45 and 121 seconds during a backup</td><td class="ok">backup finishes; three data sets (626 files) match</td></tr>
+          <tr><td>Receiver restarted during a backup</td><td class="ok">backup finishes</td></tr>
+          <tr><td>Receiver gone for 150 s or 300 s</td><td class="no">Time Machine gives up by itself after about two minutes without progress</td></tr>
+          <tr><td>256 MB written through the share to a remote receiver over Wi-Fi</td><td>12–20 MB/s, at or above <code>scp</code> over the same link that day</td></tr>
+          <tr><td>The same on loopback (CPU and protocol cost only)</td><td>≈ 75–80 MB/s</td></tr>
+          <tr><td>Automated tests</td><td>480+, green on Linux, macOS and Windows</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p>
+      How long macOS waits for a silent SMB server, and what it does when the server stays quiet, was
+      measured separately and is written up in
+      <a href="https://github.com/matyushov/janus/blob/develop/docs/macos-smb-client-timeouts.md">docs/macos-smb-client-timeouts.md</a>.
+    </p>
+  </div>
+</section>
+
+<!-- ======================================================= embed -->
+<section id="embed">
+  <div class="wrap">
+    <span class="eyebrow">Use it in your own application</span>
+    <h2>Start the client inside any C++ program</h2>
+    <p class="lede">
+      libjanus exposes eleven C functions and a header-only C++ wrapper. Your application starts
+      the client in its own process, mounts the loopback share and works with plain files.
+    </p>
+    <ol class="steps">
+      <li><b>Link it.</b> <code>find_package(janus CONFIG REQUIRED)</code>, then <code>janus::client_static</code> or <code>janus::client_shared</code>; <code>pkg-config</code> files are installed too.</li>
+      <li><b>Describe the share.</b> Where the receiver is, which certificate identifies this machine, where to keep state.</li>
+      <li><b>Start.</b> The loopback SMB endpoint, the journal and the TLS link come up inside your process.</li>
+      <li><b>Mount.</b> <code>mount_info()</code> returns the URL and credentials; on macOS a helper mounts it through NetFS.</li>
+      <li><b>Stop.</b> Optionally wait until the journal has reached the receiver.</li>
+    </ol>
+<pre><code><span class="c">// C++17, header only wrapper over the C ABI</span>
+#include &lt;janus/janus.hpp&gt;
+
+janus::Config config;
+config.state_dir = "/var/lib/myapp/janus";                 <span class="c">// journal, credentials</span>
+config.share.appliance_endpoint = "backup.example.org:7443";
+config.share.client_cert_path   = "client.pem";
+config.share.client_key_path    = "client.key";
+config.share.ca_pem             = read_file("ca.pem");
+
+janus::Client client = janus::Client::start(config);       <span class="c">// runs inside your process</span>
+janus::MountInfo info = client.mount_info();               <span class="c">// smb://127.0.0.1:&lt;port&gt;/backup, user, password</span>
+
+<span class="c">// mount info.url (macOS: &lt;janus/mount_macos.hpp&gt;), then use ordinary files</span>
+
+client.stop();                                             <span class="c">// stop(timeout) first waits for the upload</span></code></pre>
+    <p>
+      Five runnable examples live in
+      <a href="https://github.com/matyushov/janus/tree/develop/examples">examples/</a>:
+      the life cycle, mounting and copying with a checksum, watching the journal drain, an
+      exception-free API and configuring later. The library rules (threads, memory ownership, error codes)
+      are in the <a href="https://github.com/matyushov/janus/blob/develop/crates/janus-ffi/README.md">janus-ffi README</a>.
+    </p>
+  </div>
+</section>
+
+<!-- ======================================================= security -->
+<section id="security">
+  <div class="wrap">
+    <span class="eyebrow">Security model</span>
+    <h2>What is protected, and what is not</h2>
+    <p class="lede">A transport that over-promises is worse than none. This is the honest list.</p>
+    <div class="cols">
+      <div class="card yes">
+        <h3>Protected</h3>
+        <ul>
+          <li>SMB is served on loopback only and never reaches the network.</li>
+          <li>The network link is TLS 1.3 with mandatory client certificates; plain gRPC is refused at start-up outside development mode.</li>
+          <li>SMB messages are signed; guest access does not exist.</li>
+          <li>Each machine is confined to its own store and quota on the receiver.</li>
+          <li>Journal and credential files are private to the user (mode 0600/0700).</li>
+          <li>An interrupted upload resumes without duplicates or holes, even after <code>kill -9</code>.</li>
+        </ul>
+      </div>
+      <div class="card nope">
+        <h3>Not protected (yet)</h3>
+        <ul>
+          <li>janus does not encrypt file contents itself. Use the client's own encryption (for Time Machine, its backup encryption) and full-disk encryption on the receiver.</li>
+          <li>The journal on the client machine is plaintext at rest.</li>
+          <li>There is no certificate revocation: removing a machine means editing the receiver's machine list.</li>
+          <li>The development PKI scripts are for development only; keeping a CA key safe is your job.</li>
+          <li>Anyone who owns the receiver owns the stored data.</li>
+          <li>No independent security audit has been done.</li>
+        </ul>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ======================================================= status -->
+<section id="status">
+  <div class="wrap">
+    <span class="eyebrow">Status</span>
+    <h2>Where the project stands</h2>
+    <div class="tablewrap">
+      <table>
+        <thead><tr><th>Area</th><th>Item</th><th>State</th><th>Notes</th></tr></thead>
+        <tbody>
+          <tr><td rowspan="5">Clients</td><td>macOS Time Machine</td><td><span class="chip works">works</span></td><td>full and incremental backups, restore of files; tested on macOS 26</td></tr>
+          <tr><td>macOS Finder / <code>mount_smbfs</code> / NetFS</td><td><span class="chip works">works</span></td><td>file copies verified by checksum</td></tr>
+          <tr><td>Your application (C/C++ SDK)</td><td><span class="chip works">works</span></td><td>five examples, tests on three platforms</td></tr>
+          <tr><td>Windows clients</td><td><span class="chip planned">planned</span></td><td>profile exists, untested</td></tr>
+          <tr><td>Linux clients</td><td><span class="chip planned">planned</span></td><td>known gap in session setup</td></tr>
+          <tr><td rowspan="3">Backends</td><td>Own receiver over mTLS (gRPC)</td><td><span class="chip works">works</span></td><td>many machines, per-machine quota, journal</td></tr>
+          <tr><td>Local folder</td><td><span class="chip works">works</span></td><td>for development and tests</td></tr>
+          <tr><td>S3-compatible object storage</td><td><span class="chip research">researching</span></td><td>chunked layout under study</td></tr>
+          <tr><td rowspan="2">Operations</td><td>Restoring a whole machine from macOS Recovery</td><td><span class="chip planned">in progress</span></td><td>daemon runs in Recovery and the wizard lists backups; the Migration Assistant path is not verified</td></tr>
+          <tr><td>Running as a background service</td><td><span class="chip planned">planned</span></td><td>from a shell today; macOS gives an unsigned command-line binary no Local Network permission under launchd</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="note">
+      <strong>Known limits.</strong> Tested on macOS 26. An outage longer than about two minutes aborts a
+      Time Machine run, which is Time Machine's own limit. There is no packaging or installer yet.
+    </div>
+  </div>
+</section>
+
+<!-- ======================================================= start -->
+<section id="start">
+  <div class="wrap">
+    <span class="eyebrow">Get started</span>
+    <h2>Try the whole path on one machine</h2>
+    <p class="lede">
+      You need Rust (the repository pins the version), CMake and a C++ compiler. This starts a throw-away
+      receiver with a throw-away certificate authority, then mounts a share through the embedded client and
+      copies a file with a checksum.
+    </p>
+<pre><code><span class="c"># terminal 1: a receiver on 127.0.0.1 with a development PKI</span>
+examples/run-local-receiver.sh /tmp/janus-demo
+
+<span class="c"># terminal 2: build the examples and run the mount-and-copy one</span>
+cmake -S examples -B build/examples
+cmake --build build/examples
+source /tmp/janus-demo/env.sh
+./build/examples/02_mount_and_copy</code></pre>
+    <p>
+      For a complete Time Machine lab (a macOS guest, a receiver on another machine, restore from Recovery) see
+      <a href="https://github.com/matyushov/janus/blob/develop/tools/lab/README.md">tools/lab</a>.
+      The lab scripts change Time Machine settings; read them before running them on a machine whose backups you care about.
+    </p>
+  </div>
+</section>
+
+</main>
+
+<footer>
+  <div class="wrap">
+    <div>
+      <strong>janus</strong> — a local SMB share backed by storage you control.<br>
+      MIT licensed · © 2026 Alexander Matyushov
+    </div>
+    <div>
+      <a href="https://github.com/matyushov/janus">Source</a> ·
+      <a href="https://github.com/matyushov/janus/tree/develop/examples">Examples</a> ·
+      <a href="https://github.com/matyushov/janus/blob/develop/docs/macos-smb-client-timeouts.md">macOS SMB timeouts</a> ·
+      <a href="https://github.com/matyushov/janus/issues">Issues</a>
+    </div>
+  </div>
+</footer>
+
+</body>
+</html>

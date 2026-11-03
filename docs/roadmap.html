@@ -171,17 +171,21 @@
     <article class="ver" id="v0-5-0">
       <header>
         <span class="vnum">v0.5.0</span>
-        <h3>More backends</h3>
+        <h3>Replication to object storage</h3>
         <span class="chip research">later</span>
       </header>
-      <p class="theme">Object storage behind the same share.</p>
+      <p class="theme">A second copy of the backups in S3-compatible storage, without S3 in the write path.</p>
       <h4>Scope</h4>
       <ul>
-        <li><strong>S3-compatible storage</strong> (AWS S3, MinIO, Wasabi, R2, Ceph) behind the receiver. Time Machine's 256&nbsp;MiB sparse bands make "one file, one object" impractical, so the choice between a chunked layout and multipart upload with server-side copy follows measurements: the write profile of the backup client first, then a prototype against MinIO.</li>
-        <li>Guidance for bucket policies: versioning and Object Lock conflict with Time Machine's thinning of old backups.</li>
-        <li>The backend interface is frozen and every backend must pass the same contract tests.</li>
+        <li><strong>The receiver keeps writing to its local disk</strong> (fast, sparse, random writes) and a replicator on the server copies <em>only the files that changed</em> to a bucket. Object storage never sees a client's write, so its limits (no writes at an offset, no rename, higher latency) do not touch the backup.</li>
+        <li><strong>Change tracking, not scanning.</strong> The receiver already knows which paths it wrote, so it keeps a dirty set; a local manifest (path, size, time, content hash, ETag) is reconciled with the bucket through bulk listings. The hash is stored with the object and verified, not kept in object tags, which cannot be listed in bulk.</li>
+        <li><strong>A consistent replica.</strong> Copying files at different moments in the middle of a backup can produce a sparsebundle that does not open. The replicator copies from a point-in-time snapshot of the store (or from a quiet moment), uploads the bands first and the small index files last, and delays deletions so that Time Machine's thinning does not erase the replica's history at once.</li>
+        <li><strong>Measure before choosing the granularity.</strong> Whole files are simple and keep the bucket readable (restore without janus), but one 64&nbsp;KiB change re-uploads a 256&nbsp;MiB band. How many bands change between two Time Machine runs decides whether blocks with their own hashes are worth it.</li>
+        <li><strong>Resumable and polite.</strong> Large files go up as multipart uploads that continue after an interruption; the upload throttle of v0.2.0 applies; the replication lag and errors show in <code>status</code>.</li>
+        <li><strong>Portable by design.</strong> The replicator talks to a small storage-target interface (put, ranged get, head, list, delete, multipart) with an S3 implementation first and a compatibility suite run against several servers. "Works with X" appears in the documentation only for servers that passed it.</li>
+        <li>Guidance for bucket policies: versioning and Object Lock conflict with the thinning of old backups.</li>
       </ul>
-      <div class="exit"><b>Exit criteria.</b> A Time Machine backup completes to MinIO, and the costs and trade-offs are documented.</div>
+      <div class="exit"><b>Exit criteria.</b> A Time Machine backup is replicated to MinIO and to Hidden S3, the replica restores (the sparsebundle downloaded from the bucket attaches and verifies), the cost of an incremental run is measured and documented, and the compatibility matrix is published.</div>
     </article>
 
     <!-- v1.0.0 -->
